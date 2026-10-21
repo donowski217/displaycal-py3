@@ -956,15 +956,74 @@ def test_display_change_invalidates_per_user_profiles_cache(monkeypatch):
     pl._display_changed_event = False
     pl._next = False
     try:
-        util_win.per_user_profiles_isenabled(devicekey="key0")
-        util_win.per_user_profiles_isenabled(devicekey="key0")
-        pl._process_display_changed()
-        util_win.per_user_profiles_isenabled(devicekey="key0")
+        with util_win.cached_per_user_profiles():
+            util_win.per_user_profiles_isenabled(devicekey="key0")
+            util_win.per_user_profiles_isenabled(devicekey="key0")
+            pl._process_display_changed()
+            util_win.per_user_profiles_isenabled(devicekey="key0")
     finally:
         util_win.invalidate_per_user_profiles_cache()
 
     assert queries == ["key0", "key0"]
     assert pl._display_changed_event is True
+
+
+def test_apply_profiles_command_invalidates_per_user_profiles_cache(monkeypatch):
+    """E.g. DisplayCAL asking the loader to re-check after a change."""
+    invalidations = []
+    monkeypatch.setattr(
+        profile_loader,
+        "invalidate_per_user_profiles_cache",
+        lambda devicekey=None: invalidations.append(devicekey),
+    )
+    monkeypatch.setattr(profile_loader, "lang", _FakeLang(), raising=False)
+    frame = profile_loader.PLFrame.__new__(profile_loader.PLFrame)
+    frame.pl = pl = _make_pl()
+    pl._calibration_management_isenabled = lambda: True
+
+    assert frame.process_data(["apply-profiles"]) == "calibration.load.handled_by_os"
+    assert frame.process_data(["notify", "hello", "silent", "sticky", "x"]) == (
+        "invalid"
+    )
+    assert invalidations == [None]
+
+
+def test_profile_association_polling_reuses_per_user_profiles_flag(monkeypatch):
+    """Only the 3-s association poll opts in to the per-user flag cache."""
+    from DisplayCAL import util_win
+
+    queries = []
+
+    class FakeWCSManager:
+        @staticmethod
+        def get_use_per_user_profiles(devicekey):
+            queries.append(devicekey)
+            return True
+
+    # Never start a real WCS worker process from this test
+    monkeypatch.setattr(util_win, "mscms", FakeWCSManager())
+    monkeypatch.setattr(profile_loader, "lang", _FakeLang(), raising=False)
+
+    def get_display_profile(display_no=0, path_only=False, devicekey=None):
+        # What the real one does first (then it reads the association)
+        util_win.per_user_profiles_isenabled(devicekey=devicekey)
+        raise IndexError("stop after the per-user profiles flag lookup")
+
+    monkeypatch.setattr(profile_loader, "get_display_profile", get_display_profile)
+    pl = _make_pl()
+    pl._next = False
+    pl._should_apply_profiles = lambda *args, **kwargs: False
+    pl.monitors = [("Display 1", None, {"Device": r"\\.\DISPLAY1"}, _FakeDevice("k"))]
+    util_win.invalidate_per_user_profiles_cache()
+    try:
+        for _ in range(3):
+            pl._check_profile_associations(True, True, set(), None, [], [])
+        # Elsewhere (e.g. before writing an association), it is read live
+        util_win.per_user_profiles_isenabled(devicekey="k")
+    finally:
+        util_win.invalidate_per_user_profiles_cache()
+
+    assert queries == ["k", "k"]
 
 
 # --- GraphicsDrivers\Configuration registry key not accessible --------------

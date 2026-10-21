@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import _ctypes
+import contextlib
 import ctypes
 import platform
 import struct
@@ -28,15 +29,23 @@ from DisplayCAL.win_structs import UNICODE_STRING
 mscms = WCSManagerProxy()
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from _win32typing import PyDISPLAY_DEVICE
 
-#: How long (seconds) a per-user profiles flag queried from WCS is reused.
-#: WcsGetUsePerUserProfiles leaks one handle per call in the WCS worker
-#: process, and the profile loader needs the flag for every display every three
-#: seconds, which forced a worker restart every ~37 minutes with 4 displays.
+#: How long (seconds) a per-user profiles flag queried from WCS is reused
+#: inside a :func:`cached_per_user_profiles` block. WcsGetUsePerUserProfiles
+#: leaks one handle per call in the WCS worker process, and the profile loader
+#: needs the flag for every display every three seconds, which forced a worker
+#: restart every ~37 minutes with 4 displays.
 PER_USER_PROFILES_CACHE_TTL = 60.0
 _per_user_profiles_cache: dict[str, tuple[float, bool]] = {}
 _per_user_profiles_cache_lock = threading.Lock()
+# Incremented by every invalidation, so a query that was already under way
+# when the cache was invalidated does not store its (possibly stale) result
+_per_user_profiles_cache_generation = 0
+# Per thread: how old a cached flag may be (0 = always query, the default)
+_per_user_profiles_cache_scope = threading.local()
 
 
 if sys.getwindowsversion() >= (6,):
@@ -520,28 +529,64 @@ def invalidate_per_user_profiles_cache(devicekey: None | str = None) -> None:
         devicekey (None | str): Only forget the flag of this device key.
             Defaults to None (forget all).
     """
+    global _per_user_profiles_cache_generation
     with _per_user_profiles_cache_lock:
+        _per_user_profiles_cache_generation += 1
         if devicekey is None:
             _per_user_profiles_cache.clear()
         else:
             _per_user_profiles_cache.pop(devicekey, None)
 
 
+@contextlib.contextmanager
+def cached_per_user_profiles(max_age: None | float = None) -> Iterator[None]:
+    """Let per_user_profiles_isenabled reuse cached flags in this thread.
+
+    Opt-in for callers that poll the flag (the profile loader checks every
+    display's profile association every few seconds). Everywhere else,
+    including outside such a block in the same process and in other threads,
+    the flag is always queried, so profile associations are never read or
+    written in a stale scope (another process, e.g. the Windows Color
+    Management control panel, may have changed the flag).
+
+    Args:
+        max_age (None | float, optional): How old (in seconds) a cached flag
+            may be. Defaults to None (``PER_USER_PROFILES_CACHE_TTL``).
+
+    Yields:
+        None
+    """
+    if max_age is None:
+        max_age = PER_USER_PROFILES_CACHE_TTL
+    previous = getattr(_per_user_profiles_cache_scope, "max_age", 0.0)
+    _per_user_profiles_cache_scope.max_age = max_age
+    try:
+        yield
+    finally:
+        _per_user_profiles_cache_scope.max_age = previous
+
+
 def per_user_profiles_isenabled(
-    display_no: int = 0, devicekey: None | str = None
+    display_no: int = 0, devicekey: None | str = None, max_age: None | float = None
 ) -> bool:
     """Check if per user profiles is enabled under Vista/Windows 7.
 
-    The flag is cached per device key for ``PER_USER_PROFILES_CACHE_TTL``
-    seconds, because the underlying WcsGetUsePerUserProfiles call leaks a
-    handle in the WCS worker process. Changes made with
-    :func:`enable_per_user_profiles` update the cache; use
-    :func:`invalidate_per_user_profiles_cache` when the flag may have been
-    changed elsewhere.
+    The underlying WcsGetUsePerUserProfiles call leaks a handle in the WCS
+    worker process, so pollers may reuse a recently queried flag: inside a
+    :func:`cached_per_user_profiles` block (or with ``max_age``), a flag
+    cached for the device key is returned if it is younger than the allowed
+    age. Otherwise (the default), the flag is queried, and the result also
+    refreshes the cache. Changes made with :func:`enable_per_user_profiles`
+    update the cache; use :func:`invalidate_per_user_profiles_cache` when the
+    flag may have been changed elsewhere.
 
     Args:
         display_no (int): The display number.
         devicekey (str): The device key.
+        max_age (None | float, optional): How old (in seconds) a cached flag
+            may be; 0 always queries it. Defaults to None (the age allowed by
+            an enclosing :func:`cached_per_user_profiles` block in this
+            thread, otherwise 0).
 
     Raises:
         WindowsError: If an error occurs while querying the registry.
@@ -558,14 +603,20 @@ def per_user_profiles_isenabled(
             devicekey = device.DeviceKey
     if not devicekey:
         return None
+    if max_age is None:
+        max_age = getattr(_per_user_profiles_cache_scope, "max_age", 0.0)
     now = time.monotonic()
     with _per_user_profiles_cache_lock:
         cached = _per_user_profiles_cache.get(devicekey)
-    if cached is not None and 0 <= now - cached[0] < PER_USER_PROFILES_CACHE_TTL:
+        generation = _per_user_profiles_cache_generation
+    if cached is not None and 0 <= now - cached[0] < max_age:
         return cached[1]
     enabled = mscms.get_use_per_user_profiles(devicekey)
     with _per_user_profiles_cache_lock:
-        _per_user_profiles_cache[devicekey] = (now, enabled)
+        # Don't store the result if the cache was invalidated meanwhile (e.g.
+        # by a display configuration change): it may predate the change
+        if generation == _per_user_profiles_cache_generation:
+            _per_user_profiles_cache[devicekey] = (now, enabled)
     return enabled
 
 

@@ -409,44 +409,110 @@ def util_win_cache(monkeypatch):
 def test_per_user_profiles_flag_is_cached_per_device(util_win_cache):
     util_win, fake = util_win_cache
 
-    for _ in range(20):
-        for devicekey in ("key0", "key1"):
-            assert util_win.per_user_profiles_isenabled(devicekey=devicekey) is True
+    with util_win.cached_per_user_profiles():
+        for _ in range(20):
+            for devicekey in ("key0", "key1"):
+                assert util_win.per_user_profiles_isenabled(devicekey=devicekey)
 
     assert sorted(fake.get_calls) == ["key0", "key1"]
+
+
+def test_per_user_profiles_flag_is_queried_outside_a_cache_block(util_win_cache):
+    """Callers that did not opt in (e.g. set_display_profile) read it live."""
+    util_win, fake = util_win_cache
+
+    for _ in range(3):
+        assert util_win.per_user_profiles_isenabled(devicekey="key0") is True
+    assert fake.get_calls == ["key0"] * 3
+
+    # A live read also refreshes the cache for pollers
+    with util_win.cached_per_user_profiles():
+        assert util_win.per_user_profiles_isenabled(devicekey="key0") is True
+    assert fake.get_calls == ["key0"] * 3
+
+    # The cache block has ended
+    util_win.per_user_profiles_isenabled(devicekey="key0")
+    assert fake.get_calls == ["key0"] * 4
+
+
+def test_per_user_profiles_cache_block_is_per_thread(util_win_cache):
+    util_win, fake = util_win_cache
+
+    def read_in_other_thread():
+        thread = threading.Thread(
+            target=util_win.per_user_profiles_isenabled,
+            kwargs={"devicekey": "key0"},
+        )
+        thread.start()
+        thread.join(5)
+
+    with util_win.cached_per_user_profiles():
+        util_win.per_user_profiles_isenabled(devicekey="key0")
+        read_in_other_thread()
+        read_in_other_thread()
+        util_win.per_user_profiles_isenabled(devicekey="key0")
+
+    assert fake.get_calls == ["key0"] * 3
 
 
 def test_per_user_profiles_cache_expires(util_win_cache, monkeypatch):
     util_win, fake = util_win_cache
     monkeypatch.setattr(util_win, "PER_USER_PROFILES_CACHE_TTL", 0)
 
-    for _ in range(3):
-        util_win.per_user_profiles_isenabled(devicekey="key0")
+    with util_win.cached_per_user_profiles():
+        for _ in range(3):
+            util_win.per_user_profiles_isenabled(devicekey="key0")
 
     assert fake.get_calls == ["key0"] * 3
 
 
 def test_per_user_profiles_cache_invalidation(util_win_cache):
     util_win, fake = util_win_cache
-    util_win.per_user_profiles_isenabled(devicekey="key0")
-    util_win.per_user_profiles_isenabled(devicekey="key1")
-    util_win.invalidate_per_user_profiles_cache("key0")
-    util_win.per_user_profiles_isenabled(devicekey="key0")
-    util_win.per_user_profiles_isenabled(devicekey="key1")
-    util_win.invalidate_per_user_profiles_cache()
-    util_win.per_user_profiles_isenabled(devicekey="key1")
+    with util_win.cached_per_user_profiles():
+        util_win.per_user_profiles_isenabled(devicekey="key0")
+        util_win.per_user_profiles_isenabled(devicekey="key1")
+        util_win.invalidate_per_user_profiles_cache("key0")
+        util_win.per_user_profiles_isenabled(devicekey="key0")
+        util_win.per_user_profiles_isenabled(devicekey="key1")
+        util_win.invalidate_per_user_profiles_cache()
+        util_win.per_user_profiles_isenabled(devicekey="key1")
 
     assert fake.get_calls == ["key0", "key1", "key0", "key1"]
 
 
+def test_invalidation_during_a_query_is_not_overwritten(util_win_cache):
+    """E.g. a display change on another thread while the query is under way."""
+    util_win, fake = util_win_cache
+    answers = iter([True, False])
+
+    def get_use_per_user_profiles(devicekey):
+        fake.get_calls.append(devicekey)
+        answer = next(answers)
+        if answer:
+            # The display configuration changes while WCS answers
+            util_win.invalidate_per_user_profiles_cache()
+        return answer
+
+    fake.get_use_per_user_profiles = get_use_per_user_profiles
+
+    with util_win.cached_per_user_profiles():
+        assert util_win.per_user_profiles_isenabled(devicekey="key0") is True
+        # The pre-change answer was not cached
+        assert util_win.per_user_profiles_isenabled(devicekey="key0") is False
+
+    assert fake.get_calls == ["key0", "key0"]
+
+
 def test_enable_per_user_profiles_updates_cache(util_win_cache):
     util_win, fake = util_win_cache
-    assert util_win.per_user_profiles_isenabled(devicekey="key0") is True
+    with util_win.cached_per_user_profiles():
+        assert util_win.per_user_profiles_isenabled(devicekey="key0") is True
 
-    util_win.enable_per_user_profiles(False, devicekey="key0")
+        util_win.enable_per_user_profiles(False, devicekey="key0")
+
+        assert util_win.per_user_profiles_isenabled(devicekey="key0") is False
 
     assert fake.set_calls == [("key0", False)]
-    assert util_win.per_user_profiles_isenabled(devicekey="key0") is False
     assert fake.get_calls == ["key0"]
 
 
@@ -454,9 +520,10 @@ def test_per_user_profiles_errors_are_not_cached(util_win_cache):
     util_win, fake = util_win_cache
     fake.answer = TimeoutError("timed out")
 
-    for _ in range(2):
-        with pytest.raises(TimeoutError):
-            util_win.per_user_profiles_isenabled(devicekey="key0")
+    with util_win.cached_per_user_profiles():
+        for _ in range(2):
+            with pytest.raises(TimeoutError):
+                util_win.per_user_profiles_isenabled(devicekey="key0")
 
     assert fake.get_calls == ["key0", "key0"]
 
