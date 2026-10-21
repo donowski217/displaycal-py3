@@ -41,6 +41,7 @@ def _make_pl():
     pl._shutdown = False
     pl.monitoring = True
     pl._hwnds_pids = set()
+    pl._program_pids = set()
     pl._ProfileLoader__other_component = (None, None, 0)
     pl._known_window_classes = {"CalClient.exe"}
     pl._known_apps = set()
@@ -2091,3 +2092,212 @@ def test_registry_access_denied_uses_fallback_without_warning(
     assert len(open_calls) == 1
     assert not [w for w in recwarn if "Registry access failed" in str(w.message)]
     assert capsys.readouterr().out.count("is not accessible") == 1
+
+
+# -- Re-applying calibration when programs launch or exit --------------------
+#
+# With profile_loader.track_other_processes (default on), a change in the set
+# of tracked processes forces the calibration of every display to be
+# re-applied. All processes used to be tracked, so background churn (console
+# hosts, shells, services) re-applied it every few seconds. Only programs,
+# i.e. processes with a visible, unowned, non-tool top-level window, are
+# tracked now.
+
+TOOLWINDOW = 0x00000080  # win32con.WS_EX_TOOLWINDOW
+APPWINDOW = 0x00040000  # win32con.WS_EX_APPWINDOW
+
+
+class _FakeWindows:
+    """Stand-in for the win32gui/win32process window functions."""
+
+    def __init__(self):
+        # hwnd -> (pid, visible, owner, exstyle, class name)
+        self.windows = {}
+
+    def add(self, hwnd, pid, visible=True, owner=0, exstyle=0, cls="AppWindow"):
+        self.windows[hwnd] = (pid, visible, owner, exstyle, cls)
+
+    def enum_windows(self, callback, extra):
+        for hwnd in list(self.windows):
+            callback(hwnd, extra)
+
+    def install(self, monkeypatch):
+        win32gui = profile_loader.win32gui
+        monkeypatch.setattr(win32gui, "EnumWindows", self.enum_windows)
+        monkeypatch.setattr(
+            win32gui, "IsWindowVisible", lambda hwnd: self.windows[hwnd][1]
+        )
+        monkeypatch.setattr(
+            win32gui, "GetWindow", lambda hwnd, cmd: self.windows[hwnd][2]
+        )
+        monkeypatch.setattr(
+            win32gui, "GetWindowLong", lambda hwnd, index: self.windows[hwnd][3]
+        )
+        monkeypatch.setattr(
+            win32gui, "GetClassName", lambda hwnd: self.windows[hwnd][4]
+        )
+        monkeypatch.setattr(
+            profile_loader.win32process,
+            "GetWindowThreadProcessId",
+            lambda hwnd: (1, self.windows[hwnd][0]),
+        )
+
+
+def _set_processes(monkeypatch, processes):
+    """processes: list of (pid, basename)."""
+    monkeypatch.setattr(
+        profile_loader.win32ts,
+        "WTSEnumerateProcesses",
+        lambda: [(1, pid, name, "S-1-5-21-1") for pid, name in processes],
+    )
+
+
+@pytest.mark.parametrize(
+    ("visible", "owner", "exstyle", "expected"),
+    [
+        (True, 0, 0, True),
+        (False, 0, 0, False),  # hidden window, e.g. a background helper
+        (True, 4711, 0, False),  # owned window, e.g. a dialog or popup
+        (True, 0, TOOLWINDOW, False),  # tool window, e.g. the taskbar
+        # Main window owned by a hidden window but marked as an app window
+        (True, 4711, APPWINDOW, True),
+        (False, 4711, APPWINDOW, False),
+    ],
+)
+def test_is_program_window(monkeypatch, visible, owner, exstyle, expected):
+    windows = _FakeWindows()
+    windows.add(100, 42, visible=visible, owner=owner, exstyle=exstyle)
+    windows.install(monkeypatch)
+
+    assert ProfileLoader._is_program_window(100) is expected
+
+
+def test_is_program_window_real_windows():
+    """The real Win32 calls work: the desktop is one, the taskbar is not."""
+    import win32gui
+
+    assert ProfileLoader._is_program_window(win32gui.GetDesktopWindow()) is True
+    taskbar = win32gui.FindWindow("Shell_TrayWnd", None)
+    if taskbar:
+        # A tool window
+        assert ProfileLoader._is_program_window(taskbar) is False
+
+
+def test_enumerate_windows_callback_records_program_pids(monkeypatch):
+    pl = _make_pl()
+    windows = _FakeWindows()
+    windows.add(100, 42)  # a program
+    windows.add(101, 43, visible=False)  # a hidden background window
+    windows.add(102, pl._pid)  # the loader's own window (e.g. a notification)
+    windows.install(monkeypatch)
+
+    for hwnd in (100, 101, 102):
+        pl._enumerate_windows_callback(hwnd, None)
+
+    assert pl._program_pids == {42}
+    # Not a known window class: nothing else is recorded
+    assert pl._hwnds_pids == set()
+
+
+def test_enumerate_windows_callback_skips_window_vanishing_while_checked(monkeypatch):
+    pl = _make_pl()
+    windows = _FakeWindows()
+    windows.add(100, 42)
+    windows.install(monkeypatch)
+
+    def get_window(hwnd, cmd):
+        raise pywintypes.error(1400, "GetWindow", "Invalid window handle.")
+
+    monkeypatch.setattr(profile_loader.win32gui, "GetWindow", get_window)
+
+    pl._enumerate_windows_callback(100, None)
+
+    assert pl._program_pids == set()
+    assert pl._hwnds_pids == set()
+
+
+def test_only_programs_are_tracked(monkeypatch):
+    pl = _make_pl()
+    pl._program_pids = {300}
+    _set_processes(
+        monkeypatch,
+        [(100, "conhost.exe"), (101, "python.exe"), (300, "Game.exe")],
+    )
+
+    pl._look_for_known_processes((None, None, 0))
+
+    assert pl._hwnds_pids == {("Game.exe", 300)}
+
+
+def test_windowless_known_app_is_still_detected(monkeypatch):
+    """Only change tracking is limited to programs, not app detection."""
+    pl = _make_pl()
+    pl._program_pids = set()
+    pl._known_apps = {"dispcal.exe"}
+    _set_processes(monkeypatch, [(500, "dispcal.exe")])
+    monkeypatch.setattr(
+        profile_loader, "get_process_filename", lambda pid: r"C:\Argyll\dispcal.exe"
+    )
+
+    pl._look_for_known_processes((None, None, 0))
+
+    assert pl._hwnds_pids == set()
+    assert pl._ProfileLoader__other_component == (r"C:\Argyll\dispcal.exe", None, 0)
+
+
+def _tracked_after_scan(pl, monkeypatch, windows, processes):
+    windows.install(monkeypatch)
+    _set_processes(monkeypatch, processes)
+    pl._is_other_running(True)
+    return pl._hwnds_pids
+
+
+def test_background_process_churn_does_not_trigger_reapply(monkeypatch):
+    """The churn measured on the user's machine: console hosts and shells."""
+    monkeypatch.setattr(profile_loader, "getcfg", lambda name: 1)
+    pl = _make_pl()
+    windows = _FakeWindows()
+    windows.add(100, 300)  # Firefox's window
+    base = [(300, "firefox.exe"), (400, "svchost.exe")]
+
+    previous = _tracked_after_scan(pl, monkeypatch, windows, base)
+    _tracked_after_scan(
+        pl,
+        monkeypatch,
+        windows,
+        [*base, (501, "conhost.exe"), (502, "python.exe"), (503, "bash.exe")],
+    )
+
+    assert pl._track_process_changes(previous) is False
+
+
+def test_program_launch_and_exit_trigger_reapply(monkeypatch):
+    """E.g. a game that resets the video card gamma table when it exits."""
+    monkeypatch.setattr(profile_loader, "getcfg", lambda name: 1)
+    pl = _make_pl()
+    windows = _FakeWindows()
+    windows.add(100, 300)
+    base = [(300, "firefox.exe")]
+
+    before = _tracked_after_scan(pl, monkeypatch, windows, base)
+    windows.add(200, 600)  # the game's window appears
+    running = _tracked_after_scan(pl, monkeypatch, windows, [*base, (600, "Game.exe")])
+    assert pl._track_process_changes(before) is True
+
+    del windows.windows[200]  # the game exits
+    _tracked_after_scan(pl, monkeypatch, windows, base)
+    assert pl._track_process_changes(running) is True
+
+
+def test_new_window_of_running_program_does_not_trigger_reapply(monkeypatch):
+    monkeypatch.setattr(profile_loader, "getcfg", lambda name: 1)
+    pl = _make_pl()
+    windows = _FakeWindows()
+    windows.add(100, 300)
+    base = [(300, "firefox.exe")]
+
+    previous = _tracked_after_scan(pl, monkeypatch, windows, base)
+    windows.add(101, 300)  # a second Firefox window
+    _tracked_after_scan(pl, monkeypatch, windows, base)
+
+    assert pl._track_process_changes(previous) is False

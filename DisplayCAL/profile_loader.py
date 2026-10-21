@@ -99,6 +99,7 @@ if sys.platform == "win32":
 
     import pywintypes
     import win32api
+    import win32con
     import win32gui
     import win32process
     import win32ts
@@ -2138,6 +2139,10 @@ class ProfileLoader:
         self._component_name = None
         self._app_detection_msg = None
         self._hwnds_pids = set()
+        # PIDs of programs, i.e. processes with a visible, unowned top-level
+        # window, at the last window enumeration (see
+        # _enumerate_windows_callback)
+        self._program_pids = set()
         # (pid, error code) pairs of known processes whose filename could not
         # be read at the last check (see _look_for_known_processes)
         self._process_filename_errors = set()
@@ -4930,6 +4935,10 @@ class ProfileLoader:
             extra (object): Extra parameter (not used).
         """
         try:
+            if self._is_program_window(hwnd):
+                pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+                if pid != self._pid:
+                    self._program_pids.add(pid)
             cls = win32gui.GetClassName(hwnd)
             if not (cls == "madHcNetQueueWindow" or self._is_known_window_class(cls)):
                 return
@@ -4945,6 +4954,31 @@ class ProfileLoader:
         basename = os.path.basename(filename)
         if basename.lower() != "madhcctrl.exe" and pid != self._pid:
             self.__other_component = filename, cls, 0
+
+    @staticmethod
+    def _is_program_window(hwnd: int) -> bool:
+        """Check if a top-level window is the window of a program.
+
+        Uses the rule of the Windows taskbar: a visible window that either has
+        the WS_EX_APPWINDOW style, or has no owner and is not a tool window.
+        This is what an application or game that may change the video card
+        gamma table shows, while background processes (console hosts, shells,
+        services, helpers) have none.
+
+        Args:
+            hwnd (int): Handle to the top-level window.
+
+        Returns:
+            bool: True if the window would get a taskbar button.
+        """
+        if not win32gui.IsWindowVisible(hwnd):
+            return False
+        exstyle = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        if exstyle & win32con.WS_EX_APPWINDOW:
+            return True
+        if exstyle & win32con.WS_EX_TOOLWINDOW:
+            return False
+        return not win32gui.GetWindow(hwnd, win32con.GW_OWNER)
 
     def _is_known_window_class(self, cls: type) -> bool:
         """Check if the window class is known and should be monitored.
@@ -5019,6 +5053,7 @@ class ProfileLoader:
                 # Look for known window classes
                 # Performance on C2D 3.16 GHz (Win7 x64, ~ 90 processes): ~ 1ms
                 self._hwnds_pids = set()
+                self._program_pids = set()
                 try:
                     win32gui.EnumWindows(self._enumerate_windows_callback, None)
                 except Exception as exception:
@@ -5069,10 +5104,17 @@ class ProfileLoader:
         # while it keeps failing (this runs every three seconds)
         filename_errors = set()
         logged_filename_errors = self._process_filename_errors
+        program_pids = self._program_pids
         for _session_id, pid, basename, user_security_id in processes:
             name_lower = basename.lower()
-            if name_lower != "madhcctrl.exe":
-                # Add all processes except madVR Home Cinema Control
+            if name_lower != "madhcctrl.exe" and pid in program_pids:
+                # Track programs (processes with a visible top-level window,
+                # except madVR Home Cinema Control) launching or exiting, as
+                # these may change the video card gamma table without the
+                # change being visible through GetDeviceGammaRamp. Background
+                # processes (console hosts, shells, services) come and go every
+                # few seconds; tracking them made the loader re-apply the
+                # calibration of every display that often.
                 self._hwnds_pids.add((basename, pid))
             if skip or not user_security_id:
                 # Skip detection if other component already detected
@@ -6135,7 +6177,8 @@ def display_help_message() -> None:
                 "quantize_bits": "Quantize video card gamma table to <n> bits",
                 "reset_gamma_ramps": "Reset video card gamma table to linear",
                 "track_other_processes": (
-                    "Reapply calibration state when other processes launch or exit"
+                    "Reapply calibration state when other programs (processes "
+                    "with a visible window) launch or exit"
                 ),
                 "tray_icon_animation_quality": "Tray icon animation quality, 0 = off",
             }.get(key)
