@@ -782,6 +782,9 @@ _last_app_record = 0
 # and the mark of a repeat summary (which gets no number)
 _RECORD_NUMBER_ATTR = "displaycal_app_log_number"
 _REPEAT_SUMMARY_ATTR = "displaycal_repeat_summary"
+# (weakref to StdioToLog, text) of each partial line that a thread left
+# behind when it ended without writing a line ending (see _LineBuffer)
+_ORPHANED_LINES: collections.deque[tuple[weakref.ref, str]] = collections.deque()
 
 
 def _app_file_handlers() -> list[logging.FileHandler]:
@@ -964,13 +967,78 @@ def log_error(text: str) -> bool:
     return False
 
 
-class _LineBuffer:
-    """Pending partial line of one thread for one StdioToLog stream."""
+class _PendingText:
+    """The text of a _LineBuffer, kept apart so that it outlives the buffer."""
 
-    __slots__ = ("__weakref__", "pending")
+    __slots__ = ("value",)
 
     def __init__(self) -> None:
-        self.pending = ""
+        self.value = ""
+
+
+class _LineBuffer:
+    """Pending partial line of one thread for one StdioToLog stream.
+
+    Only the thread-local storage of its stream holds the buffer, so it is
+    collected when its thread ends. A partial line still pending then is
+    queued (see _orphan_partial_line) and logged by the next write to a
+    redirected stream or at exit, instead of being lost with the thread.
+
+    Args:
+        stream (StdioToLog): The stream the buffer belongs to.
+    """
+
+    __slots__ = ("__weakref__", "_text")
+
+    def __init__(self, stream: StdioToLog) -> None:
+        self._text = _PendingText()
+        finalizer = weakref.finalize(
+            self, _orphan_partial_line, weakref.ref(stream), self._text
+        )
+        # A live buffer's partial line is logged by flush_pending() at exit
+        finalizer.atexit = False
+
+    @property
+    def pending(self) -> str:
+        """str: The partial line (text after the last line ending)."""
+        return self._text.value
+
+    @pending.setter
+    def pending(self, text: str) -> None:
+        self._text.value = text
+
+
+def _orphan_partial_line(stream_ref: weakref.ref, text: _PendingText) -> None:
+    """Queue the partial line of a line buffer that has been collected.
+
+    Runs wherever the buffer happens to be collected: normally while its
+    thread ends, but possibly within a garbage collection on any thread, even
+    in the middle of a stream's bookkeeping. So this only appends to a deque
+    (atomic: it takes no lock and emits nothing), and _log_orphaned_lines()
+    logs the text later.
+
+    Args:
+        stream_ref (weakref.ref): Weak reference to the buffer's stream.
+        text (_PendingText): The buffer's text.
+    """
+    pending, text.value = text.value, ""
+    if pending.strip():
+        _ORPHANED_LINES.append((stream_ref, pending))
+
+
+def _log_orphaned_lines() -> None:
+    """Log the partial lines of threads that ended without a line ending.
+
+    Must be called while the calling thread holds no StdioToLog lock.
+    """
+    for _ in range(_MAX_DEFERRED_WRITES):
+        try:
+            stream_ref, text = _ORPHANED_LINES.popleft()
+        except IndexError:
+            break
+        stream = stream_ref()
+        if stream is not None:
+            stream._log_text(text.rstrip(), whole_line=True)
 
 
 def _begin_bookkeeping() -> None:
@@ -1025,6 +1093,9 @@ class StdioToLog:
     the repetition goes on, so the log keeps showing that the process was
     alive. A line is never collapsed with a copy that is separated from it by
     other records (see _AppRecordSequencer).
+
+    A partial line left behind by a thread that ends without writing a line
+    ending is logged by the next write to a redirected stream, or at exit.
 
     Like py2exe's Blackhole, this deliberately has no ``isatty()`` and no
     ``fileno()``: e.g. Worker.exec_cmd checks ``hasattr(sys.stdout,
@@ -1100,6 +1171,8 @@ class StdioToLog:
                 # This interrupted a stream's bookkeeping on this thread
                 _BOOKKEEPING.deferred.append((self, text))
                 return len(text)
+            if _ORPHANED_LINES:
+                _log_orphaned_lines()
             self._log_text(text)
             _log_deferred_writes()
         except Exception:
@@ -1125,7 +1198,8 @@ class StdioToLog:
     def flush_pending(self) -> None:
         """Log every thread's pending partial line and any repeat summary.
 
-        Called at exit, so the last words of the process are not lost.
+        Called at exit, so the last words of the process are not lost. This
+        includes the partial lines of threads that have ended already.
         """
         try:
             if (
@@ -1135,6 +1209,7 @@ class StdioToLog:
                 or not _app_file_handlers()
             ):
                 return
+            _log_orphaned_lines()
             _begin_bookkeeping()
             try:
                 with self._lock:
@@ -1163,18 +1238,21 @@ class StdioToLog:
             with contextlib.suppress(Exception):
                 original.write(text)
 
-    def _log_text(self, text: str) -> None:
+    def _log_text(self, text: str, whole_line: bool = False) -> None:
         """Send the whole lines of text to the log (without passthrough).
 
         Must be called while the calling thread holds no StdioToLog lock.
 
         Args:
             text (str): The text to add to the calling thread's buffer.
+            whole_line (bool, optional): Log text as one line, bypassing the
+                calling thread's buffer.
         """
         _begin_bookkeeping()
         try:
             with self._lock:
-                messages = self._collapse(self._take_lines(text), time())
+                lines = [text] if whole_line else self._take_lines(text)
+                messages = self._collapse(lines, time())
         finally:
             _BOOKKEEPING.active = False
         self._emit_messages(messages)
@@ -1229,7 +1307,7 @@ class StdioToLog:
         """
         buffer = getattr(self._local, "buffer", None)
         if buffer is None:
-            buffer = self._local.buffer = _LineBuffer()
+            buffer = self._local.buffer = _LineBuffer(self)
             self._buffers.add(buffer)
         text = (buffer.pending + text).replace("\r\n", "\n").replace("\r", "\n")
         *lines, pending = text.split("\n")

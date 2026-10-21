@@ -9,6 +9,7 @@ private logger with a UTF-8 file handler for the duration of each test.
 from __future__ import annotations
 
 import codecs
+import collections
 import contextlib
 import faulthandler
 import gc
@@ -19,6 +20,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import types
 import uuid
@@ -226,8 +228,10 @@ def stdio_env(app_log, monkeypatch):
     """Isolate the stdio redirection state of the log module."""
     registered = []
     monkeypatch.setattr(log, "_STDIO_LOG_STREAMS", [])
-    # Streams left over by other tests must not show up in this test's log
+    # Streams and partial lines of finished threads left over by other tests
+    # must not show up in this test's log
     monkeypatch.setattr(log, "_ALL_STDIO_LOG_STREAMS", weakref.WeakSet())
+    monkeypatch.setattr(log, "_ORPHANED_LINES", collections.deque())
     monkeypatch.setattr(
         log,
         "atexit",
@@ -604,6 +608,93 @@ def test_stdio_to_log_record_interrupting_bookkeeping_with_pending_summary(
         "Acquired lock",
         "Display configuration changed",
     ]
+
+
+def _print_partial_line(text: str) -> None:
+    print(text, end="")
+
+
+def _run_threads_leaving_partial_lines(
+    texts: list[str], logger: logging.Logger
+) -> None:
+    """Run one thread per text that prints it without a line ending and ends.
+
+    Returns once every thread has ended and its partial line has been queued
+    (or logged already, by another thread's write).
+    """
+    threads = [
+        threading.Thread(target=_print_partial_line, args=(text,)) for text in texts
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert not [thread for thread in threads if thread.is_alive()]
+
+    def settled() -> bool:
+        logged = [m for _, m in _messages(logger) if m in texts]
+        return len(log._ORPHANED_LINES) + len(logged) >= len(texts)
+
+    # CPython drops a thread's thread-local data before join() returns; wait
+    # anyway, so the tests do not depend on that
+    deadline = time.monotonic() + 10
+    while not settled() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def test_stdio_to_log_logs_partial_line_of_finished_thread(
+    stdio_env: types.SimpleNamespace,
+) -> None:
+    """A thread that ends without a line ending does not lose its last words."""
+    with _stdio(stdio_env.blackhole, stdio_env.shim):
+        log.redirect_stdio_to_log()
+        _run_threads_leaving_partial_lines(
+            ["partial line of a finished thread"], stdio_env.logger
+        )
+        print("next line of the main thread")
+
+    assert _messages(stdio_env.logger) == [
+        (logging.INFO, "partial line of a finished thread"),
+        (logging.INFO, "next line of the main thread"),
+    ]
+
+
+def test_stdio_to_log_writes_partial_line_of_finished_thread_at_exit(
+    stdio_env: types.SimpleNamespace,
+) -> None:
+    """At exit, also the partial lines of finished threads are written."""
+    with _stdio(stdio_env.blackhole, stdio_env.shim):
+        log.redirect_stdio_to_log()
+        _run_threads_leaving_partial_lines(
+            ["partial line of a finished thread"], stdio_env.logger
+        )
+    assert _messages(stdio_env.logger) == []
+
+    stdio_env.atexit_registered[0]()
+    assert _messages(stdio_env.logger) == [
+        (logging.INFO, "partial line of a finished thread")
+    ]
+
+
+def test_stdio_to_log_logs_partial_lines_of_many_finished_threads(
+    stdio_env: types.SimpleNamespace,
+) -> None:
+    """Partial lines of threads that end while others write are all logged."""
+    texts = [f"partial line of thread {i}" for i in range(20)]
+    with _stdio(stdio_env.blackhole, stdio_env.shim):
+        log.redirect_stdio_to_log()
+        writer = threading.Thread(
+            target=lambda: [print("writer line", i) for i in range(200)]
+        )
+        writer.start()
+        _run_threads_leaving_partial_lines(texts, stdio_env.logger)
+        writer.join(10)
+        print("next line of the main thread")
+
+    messages = [m for _, m in _messages(stdio_env.logger)]
+    assert sorted(m for m in messages if m.startswith("partial")) == sorted(texts)
+    assert {f"writer line {i}" for i in range(200)} <= set(messages)
+    assert messages[-1] == "next line of the main thread"
 
 
 def test_stdio_to_log_writes_partial_line_at_exit(stdio_env):
