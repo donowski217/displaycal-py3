@@ -6,8 +6,6 @@ styles.
 
 from wx import xrc
 
-from DisplayCAL.log import safe_print
-
 try:
     from DisplayCAL.wx_windows import BetterStaticFancyText as StaticFancyText
 except ImportError:
@@ -55,7 +53,7 @@ class StaticFancyTextCtrlXmlHandler(xrc.XmlResourceHandler):
         )
 
         self.SetupWindow(w)
-        if self.GetBool("hidden") and w.Shown:
-            safe_print(f"{self.Name} should have been hidden")
+        # <hidden> is only applied by C++ handlers (XRC_MAKE_INSTANCE); hide manually
+        if self.GetBool("hidden"):
             w.Hide()
         return w
