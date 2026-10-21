@@ -49,6 +49,7 @@ from typing import (
     Any,
     Callable,
     Literal,
+    NoReturn,
     TextIO,
     TypeVar,
     Union,
@@ -145,6 +146,7 @@ class _DispatchToLogger(logging.Handler):
             record (logging.LogRecord): The record received from the worker.
         """
         logging.getLogger(record.name).handle(record)
+
 
 check_handles_call_num = 100  # check leaking handles every <num> of calls
 open_handles_threshold = 3000  # worker process open handle limit
@@ -655,8 +657,7 @@ class WCSManager:
 
         if num_handles > self.handle_threshold:
             self._restart_worker(
-                "Open handle number exceeded: "
-                f"{num_handles}>{self.handle_threshold}"
+                f"Open handle number exceeded: {num_handles}>{self.handle_threshold}"
             )
         else:
             logger.debug(f"Current child process open handles: {num_handles}")
@@ -749,11 +750,7 @@ class WCSManager:
         )
     )
     def _call_wcs_method(self, method_name: str, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
-        if self._shutdown_event.is_set():
-            if self._restarting.is_set() and not self._closing.is_set():
-                raise WCSManagerRestartingError("WCSWorker process is restarting")
-            raise WCSManagerShutdownError("WCSManager is set to shut down")
-
+        self._check_accepting_calls()
         self._ensure_worker_alive()
 
         request_id = str(uuid.uuid4())
@@ -763,7 +760,49 @@ class WCSManager:
             "args": args,
             "kwargs": kwargs,
         }
+        event, worker, request_queue = self._send_request(request)
 
+        # Waiting for an answer to be received
+        outcome = self._wait_for_response(event, worker, request_queue)
+        with self._lock:
+            req_data = self._pending_requests.pop(request_id, {})
+            logger.debug(
+                f"Request ID {request_id} removed from pending requests: "
+                + ("success" if outcome == "response" else outcome)
+            )
+        if outcome != "response":
+            self._raise_for_outcome(outcome, worker, request_id)
+        return self._response_result(req_data)
+
+    def _check_accepting_calls(self) -> None:
+        """Raise if no call can be made to the worker process now.
+
+        Raises:
+            WCSManagerRestartingError: If the worker process is being
+                restarted (retried).
+            WCSManagerShutdownError: If the manager is shutting down.
+        """
+        if self._shutdown_event.is_set():
+            if self._restarting.is_set() and not self._closing.is_set():
+                raise WCSManagerRestartingError("WCSWorker process is restarting")
+            raise WCSManagerShutdownError("WCSManager is set to shut down")
+
+    def _send_request(
+        self, request: RequestType
+    ) -> tuple[threading.Event, None | Process, Queue[RequestType | None]]:
+        """Register a request as pending and send it to the worker process.
+
+        Args:
+            request (RequestType): The request.
+
+        Raises:
+            RuntimeError: If the request could not be sent.
+
+        Returns:
+            tuple: The event that is set when the response has arrived, the
+                worker process and the request queue the request was sent to.
+        """
+        request_id = request["id"]
         event = threading.Event()
         with self._lock:
             logger.debug(f"Request ID {request_id} added to the pending requests")
@@ -773,7 +812,7 @@ class WCSManager:
         request_queue = self._request_queue
         try:
             request_queue.put(request)
-            logger.debug(f"Sent request ID {request_id} for method {method_name}")
+            logger.debug(f"Sent request ID {request_id} for method {request['method']}")
         except Exception as e:
             with self._lock:
                 self._pending_requests.pop(request_id, None)
@@ -790,58 +829,74 @@ class WCSManager:
                 logger.debug("Worker process open handle check triggered")
                 # Launch in other thread to not block the listener
                 threading.Thread(target=self._handle_check_worker, daemon=True).start()
+        return event, worker, request_queue
 
-        # Waiting for an answer to be received
-        outcome = self._wait_for_response(event, worker, request_queue)
-        if outcome != "response":
-            with self._lock:
-                self._pending_requests.pop(request_id, None)
-                logger.debug(
-                    f"Request ID {request_id} removed from pending requests: "
-                    f"{outcome}"
-                )
-            if outcome == "worker died":
-                raise WCSWorkerDiedError(
-                    f"WCSWorker process PID {worker.pid} exited (exit code "
-                    f"{_format_exitcode(worker.exitcode)}) before answering "
-                    f"request {request_id}"
-                )
-            if outcome == "request lost":
-                raise WCSWorkerDiedError(
-                    f"Request {request_id} was lost in a WCSWorker process restart"
-                )
-            raise TimeoutError(f"Timeout waiting for response to request {request_id}")
+    def _raise_for_outcome(
+        self, outcome: str, worker: None | Process, request_id: str
+    ) -> NoReturn:
+        """Raise the error for a request that got no response.
 
-        # Processing the result
-        with self._lock:
-            req_data = self._pending_requests.pop(request_id, {})
-            logger.debug(
-                f"Request ID {request_id} removed from pending requests: success"
+        Args:
+            outcome (str): How waiting for the response ended (see
+                :meth:`_wait_for_response`).
+            worker (None | Process): The worker process the request was sent
+                to.
+            request_id (str): The request's ID.
+
+        Raises:
+            WCSWorkerDiedError: If the worker process died or the request was
+                lost in a worker process restart (retried).
+            TimeoutError: If the response did not arrive in time (retried).
+        """
+        if outcome == "worker died":
+            raise WCSWorkerDiedError(
+                f"WCSWorker process PID {worker.pid} exited (exit code "
+                f"{_format_exitcode(worker.exitcode)}) before answering "
+                f"request {request_id}"
             )
+        if outcome == "request lost":
+            raise WCSWorkerDiedError(
+                f"Request {request_id} was lost in a WCSWorker process restart"
+            )
+        raise TimeoutError(f"Timeout waiting for response to request {request_id}")
 
-        if "error" in req_data:  # error path
-            error_response = req_data.get("error")
-            if error_response:
-                error_type = error_response.get("type")
-                error_message = error_response.get("message")
-                error_errno = error_response.get("errno")
+    @staticmethod
+    def _response_result(req_data: PendingType | dict[str, Any]) -> Any:  # noqa: ANN401
+        """Return the result of a request, or raise the error it caused.
 
-                # Recreating exceptions
-                try:
-                    exc_class = getattr(builtins, error_type)
-                except Exception:
-                    exc_class = WCSWorkerError
+        Args:
+            req_data (PendingType | dict): The answered request.
 
-                if issubclass(exc_class, OSError):
-                    exc = exc_class(error_message)
-                    if error_errno is not None:
-                        exc.errno = error_errno
-                    raise exc
-                # Something else might have happened
-                raise exc_class(f"{error_type}: {error_message}")
+        Raises:
+            OSError: The worker's OSError (or subclass), with its errno.
+            WCSWorkerError: If the worker raised an error that is not a
+                builtin exception.
+            Exception: The worker's (builtin) exception otherwise.
 
-        # normal path
-        return req_data.get("result")
+        Returns:
+            Any: The result.
+        """
+        error_response = req_data.get("error")
+        if not error_response:
+            return req_data.get("result")
+
+        error_type = error_response.get("type")
+        error_message = error_response.get("message")
+        error_errno = error_response.get("errno")
+
+        # Recreating exceptions
+        try:
+            exc_class = getattr(builtins, error_type)
+        except Exception:
+            exc_class = WCSWorkerError
+
+        if issubclass(exc_class, OSError):
+            exc = exc_class(error_message)
+            if error_errno is not None:
+                exc.errno = error_errno
+            raise exc
+        # Something else might have happened
+        raise exc_class(f"{error_type}: {error_message}")
 
     def shutdown(self) -> None:
         """Shutdowns the worker process and listener thread."""
