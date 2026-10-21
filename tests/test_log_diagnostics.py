@@ -538,6 +538,41 @@ def test_stdio_to_log_writes_repeat_summary_before_next_record(
     assert [line.split(" ", 2)[2] for line in file_lines] == expected
 
 
+def test_stdio_to_log_does_not_count_a_line_still_being_written(
+    stdio_env: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A summary never comes before the line it counts.
+
+    While one thread is about to write a line, another thread writing the
+    same line to the same stream logs it in full instead of counting it as
+    a repeat of a line that is not in the file yet (a record of a third
+    source would then put the summary first).
+    """
+    stream = log.StdioToLog(logging.INFO, stdio_env.blackhole)
+    stream.write("W\n")
+    real_emit_record = log._emit_record
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_emit_record(level: int, msg: str, *args, **kwargs) -> object:
+        if msg == "X" and threading.current_thread().name == "writer-a":
+            entered.set()
+            release.wait(10)
+        return real_emit_record(level, msg, *args, **kwargs)
+
+    monkeypatch.setattr(log, "_emit_record", slow_emit_record)
+    writer_a = threading.Thread(target=stream.write, args=("X\n",), name="writer-a")
+    writer_a.start()
+    try:
+        assert entered.wait(10)
+        stream.write("X\n")
+        stdio_env.logger.info("R")
+    finally:
+        release.set()
+        writer_a.join(10)
+
+    assert [m for _, m in _messages(stdio_env.logger)] == ["W", "X", "R", "X"]
+
+
 def test_stdio_to_log_repeat_summary_has_time_of_last_repetition(
     stdio_env: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:

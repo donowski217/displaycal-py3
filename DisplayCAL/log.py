@@ -1155,9 +1155,10 @@ class StdioToLog:
         # its last counted repetition (the timestamp of the summary)
         self._repeat_time = 0.0
         self._repeat_last = 0.0
-        # Number of this stream's last line in the log file (None: unknown).
-        # Written after emitting, without the lock: a stale value can only
-        # make the next line count as not adjacent, i.e. be logged in full.
+        # Number of this stream's last line in the log file (None: unknown,
+        # e.g. while that line is being written). Set after emitting,
+        # without the lock: a stale value can only make the next line count
+        # as not adjacent, i.e. be logged in full.
         self._last_record = None
         _ALL_STDIO_LOG_STREAMS.add(self)
 
@@ -1377,6 +1378,10 @@ class StdioToLog:
                 messages.append(self._take_repeat_summary(now))
             self._last_line = line
             self._repeat_time = now
+            # Unknown until the line is written: another thread writing the
+            # same line meanwhile must not count it as a repeat of a line
+            # that is not in the file yet
+            self._last_record = None
             messages.append((line, None))
         return messages
 
