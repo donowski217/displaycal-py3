@@ -9,6 +9,7 @@ private logger with a UTF-8 file handler for the duration of each test.
 from __future__ import annotations
 
 import codecs
+import collections
 import contextlib
 import faulthandler
 import gc
@@ -16,9 +17,12 @@ import io
 import locale
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
+import time
+import traceback
 import types
 import uuid
 import weakref
@@ -103,9 +107,9 @@ def test_session_logfile_does_not_hijack_app_log(app_log, tmp_path, file_loggers
     assert "line during session" in app_text
     assert "line after session" in app_text
     assert "session only line" not in app_text
-    session_text = (
-        tmp_path / "session" / f"{session.filename}.log"
-    ).read_text(encoding="utf-8")
+    session_text = (tmp_path / "session" / f"{session.filename}.log").read_text(
+        encoding="utf-8"
+    )
     assert "session only line" in session_text
     assert "line during session" not in session_text
 
@@ -204,8 +208,6 @@ class Stderr:
         pass
 
 
-
-
 @contextlib.contextmanager
 def _stdio(stdout: object, stderr: object):
     """Temporarily replace sys.stdout and sys.stderr.
@@ -227,6 +229,10 @@ def stdio_env(app_log, monkeypatch):
     """Isolate the stdio redirection state of the log module."""
     registered = []
     monkeypatch.setattr(log, "_STDIO_LOG_STREAMS", [])
+    # Streams and partial lines of finished threads left over by other tests
+    # must not show up in this test's log
+    monkeypatch.setattr(log, "_ALL_STDIO_LOG_STREAMS", weakref.WeakSet())
+    monkeypatch.setattr(log, "_ORPHANED_LINES", collections.deque())
     monkeypatch.setattr(
         log,
         "atexit",
@@ -406,6 +412,11 @@ def test_stdio_to_log_two_threads_do_not_deadlock(stdio_env, stderr_writing_hand
     assert {f"stderr {i}" for i in range(count)} <= messages
 
 
+def _summary(line: str, count: int) -> str:
+    """Return the repeat summary StdioToLog writes for line."""
+    return f'(previous line repeated {count} time{"" if count == 1 else "s"}: "{line}")'
+
+
 def test_stdio_to_log_collapses_repeated_lines(stdio_env):
     with _stdio(stdio_env.blackhole, stdio_env.shim):
         log.redirect_stdio_to_log()
@@ -415,7 +426,10 @@ def test_stdio_to_log_collapses_repeated_lines(stdio_env):
 
     assert _messages(stdio_env.logger) == [
         (logging.INFO, "DisplayConfigurationMonitoringThread: Acquired lock"),
-        (logging.INFO, "(last message repeated 4 times)"),
+        (
+            logging.INFO,
+            _summary("DisplayConfigurationMonitoringThread: Acquired lock", 4),
+        ),
         (logging.INFO, "Display configuration changed"),
     ]
 
@@ -436,9 +450,329 @@ def test_stdio_to_log_keeps_a_heartbeat_while_collapsing(stdio_env, monkeypatch)
 
     assert [m for _, m in _messages(stdio_env.logger)] == [
         "Acquired lock",
-        "(last message repeated 2 times)",
-        "(last message repeated 1 time)",
+        _summary("Acquired lock", 2),
+        _summary("Acquired lock", 1),
     ]
+
+
+def test_stdio_to_log_logs_repeats_separated_by_other_records(
+    stdio_env: types.SimpleNamespace,
+) -> None:
+    """Only a copy of the previous record in the log file is collapsed.
+
+    The log file is shared by both streams, LOG()/safe_print() and
+    log_error(): a line repeated after other records is a new event (e.g. a
+    retry after a traceback, or the same error again minutes later) and must
+    stay in place in the timeline.
+    """
+    applying = "Applying calibration to display 1"
+    wcs_error = "WCS call failed: timeout"
+    with _stdio(stdio_env.blackhole, stdio_env.shim):
+        log.redirect_stdio_to_log()
+        print(applying)
+        try:
+            raise OSError(31, "SetDeviceGammaRamp failed")
+        except OSError:
+            traceback.print_exc()
+        print(applying)
+        log.LOG("Calibration applied")
+        print(applying)
+        print("Display 1 done")
+        sys.stderr.write(f"{wcs_error}\n")
+        print("Next iteration")
+        sys.stderr.write(f"{wcs_error}\n")
+        log.log_error("Something else failed")
+        sys.stderr.write(f"{wcs_error}\n")
+        print("Exiting")
+    log._flush_stdio_log_streams()
+
+    messages = _messages(stdio_env.logger)
+    assert not [m for _, m in messages if "repeated" in m]
+    traceback_end = messages.index(
+        (logging.ERROR, "OSError: [Errno 31] SetDeviceGammaRamp failed")
+    )
+    assert messages[0] == (logging.INFO, applying)
+    assert messages[1] == (logging.ERROR, "Traceback (most recent call last):")
+    assert messages[traceback_end + 1 :] == [
+        (logging.INFO, applying),
+        (logging.INFO, "Calibration applied"),
+        (logging.INFO, applying),
+        (logging.INFO, "Display 1 done"),
+        (logging.ERROR, wcs_error),
+        (logging.INFO, "Next iteration"),
+        (logging.ERROR, wcs_error),
+        (logging.ERROR, "Something else failed"),
+        (logging.ERROR, wcs_error),
+        (logging.INFO, "Exiting"),
+    ]
+
+
+@pytest.mark.parametrize("source", ["LOG", "stderr", "log_error", "child logger"])
+def test_stdio_to_log_writes_repeat_summary_before_next_record(
+    stdio_env: types.SimpleNamespace, source: str
+) -> None:
+    """The summary follows the line it counts, before any other record."""
+    with _stdio(stdio_env.blackhole, stdio_env.shim):
+        log.redirect_stdio_to_log()
+        for _ in range(3):
+            print("Acquired lock")
+        if source == "LOG":
+            log.LOG("Other record")
+        elif source == "stderr":
+            sys.stderr.write("Other record\n")
+        elif source == "log_error":
+            log.log_error("Other record")
+        else:
+            logging.getLogger(f"{stdio_env.logger.name}.child").warning("Other record")
+        print("Acquired lock")
+
+    expected = [
+        "Acquired lock",
+        _summary("Acquired lock", 2),
+        "Other record",
+        "Acquired lock",
+    ]
+    assert [m for _, m in _messages(stdio_env.logger)] == expected
+    file_lines = stdio_env.path.read_text(encoding="utf-8").splitlines()
+    # "<date> <time> <message>"
+    assert [line.split(" ", 2)[2] for line in file_lines] == expected
+
+
+def test_stdio_to_log_does_not_count_a_line_still_being_written(
+    stdio_env: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A summary never comes before the line it counts.
+
+    While one thread is about to write a line, another thread writing the
+    same line to the same stream logs it in full instead of counting it as
+    a repeat of a line that is not in the file yet (a record of a third
+    source would then put the summary first).
+    """
+    stream = log.StdioToLog(logging.INFO, stdio_env.blackhole)
+    stream.write("W\n")
+    real_emit_record = log._emit_record
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_emit_record(level: int, msg: str, *args, **kwargs) -> object:
+        if msg == "X" and threading.current_thread().name == "writer-a":
+            entered.set()
+            release.wait(10)
+        return real_emit_record(level, msg, *args, **kwargs)
+
+    monkeypatch.setattr(log, "_emit_record", slow_emit_record)
+    writer_a = threading.Thread(target=stream.write, args=("X\n",), name="writer-a")
+    writer_a.start()
+    try:
+        assert entered.wait(10)
+        stream.write("X\n")
+        stdio_env.logger.info("R")
+    finally:
+        release.set()
+        writer_a.join(10)
+
+    assert [m for _, m in _messages(stdio_env.logger)] == ["W", "X", "R", "X"]
+
+
+def test_stdio_to_log_repeat_summary_has_time_of_last_repetition(
+    stdio_env: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A summary written later is stamped when the repetition ended.
+
+    So its timestamp says when the line was last repeated, and timestamps
+    never go backwards (a summary written before another record would
+    otherwise be created after that record).
+    """
+    clock = [1000.25]
+    monkeypatch.setattr(log, "time", lambda: clock[0])
+    with _stdio(stdio_env.blackhole, stdio_env.shim):
+        log.redirect_stdio_to_log()
+        for _ in range(3):
+            print("Acquired lock")
+            clock[0] += 1
+        clock[0] += 60
+        print("Display configuration changed")
+
+    records = stdio_env.logger.handlers[0].records
+    assert [r.getMessage() for r in records] == [
+        "Acquired lock",
+        _summary("Acquired lock", 2),
+        "Display configuration changed",
+    ]
+    assert records[1].created == 1002.25
+    assert records[1].msecs == 250.0
+
+
+def test_stdio_to_log_repeat_summary_quotes_long_lines_shortened(
+    stdio_env: types.SimpleNamespace,
+) -> None:
+    """A summary quotes at most max_summary_quote_length characters."""
+    long_line = "x" * 300
+    with _stdio(stdio_env.blackhole, stdio_env.shim):
+        log.redirect_stdio_to_log()
+        print(long_line)
+        print(long_line)
+        print("end")
+
+    assert [m for _, m in _messages(stdio_env.logger)] == [
+        long_line,
+        _summary("x" * 200 + "...", 1),
+        "end",
+    ]
+
+
+class _LocalLogsWhileLocked(threading.local):
+    """Thread-local storage of a StdioToLog stream, used under its lock.
+
+    Logs a record directly to the app logger the first time the line buffer
+    is looked up while armed, like a finalizer calling LOG() when a garbage
+    collection interrupts the stream's bookkeeping.
+    """
+
+    def __init__(self, logger: logging.Logger, text: str) -> None:
+        self.logger = logger
+        self.text = text
+        self.armed = False
+        self._buffer = None
+
+    @property
+    def buffer(self) -> object:
+        if self.armed:
+            self.armed = False
+            self.logger.info(self.text)
+        return self._buffer
+
+    @buffer.setter
+    def buffer(self, value: object) -> None:
+        self._buffer = value
+
+
+def test_stdio_to_log_record_interrupting_bookkeeping_with_pending_summary(
+    stdio_env: types.SimpleNamespace,
+) -> None:
+    """A record logged while the stream holds its lock does not take its lock.
+
+    The pending summary then follows that record, still naming its line.
+    """
+    stream = log.StdioToLog(logging.INFO, stdio_env.blackhole)
+    stream._local = _LocalLogsWhileLocked(stdio_env.logger, "record from finalizer")
+
+    def scenario() -> None:
+        stream.write("Acquired lock\n")
+        stream.write("Acquired lock\n")
+        stream._local.armed = True
+        stream.write("Acquired lock\n")
+        stream.write("Display configuration changed\n")
+
+    thread = _run_with_time_limit(scenario)
+
+    assert not thread.is_alive(), "the thread deadlocked on the stream's own lock"
+    assert [m for _, m in _messages(stdio_env.logger)] == [
+        "Acquired lock",
+        "record from finalizer",
+        _summary("Acquired lock", 1),
+        "Acquired lock",
+        "Display configuration changed",
+    ]
+
+
+def _print_partial_line(text: str) -> None:
+    print(text, end="")
+
+
+def _run_threads_leaving_partial_lines(
+    texts: list[str], logger: logging.Logger
+) -> None:
+    """Run one thread per text that prints it without a line ending and ends.
+
+    Returns once every thread has ended and its partial line has been queued
+    (or logged already, by another thread's write).
+    """
+    threads = [
+        threading.Thread(target=_print_partial_line, args=(text,)) for text in texts
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert not [thread for thread in threads if thread.is_alive()]
+
+    def settled() -> bool:
+        logged = [m for _, m in _messages(logger) if m in texts]
+        return len(log._ORPHANED_LINES) + len(logged) >= len(texts)
+
+    # CPython drops a thread's thread-local data before join() returns; wait
+    # anyway, so the tests do not depend on that
+    deadline = time.monotonic() + 10
+    while not settled() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def test_stdio_to_log_logs_partial_line_of_finished_thread(
+    stdio_env: types.SimpleNamespace,
+) -> None:
+    """A thread that ends without a line ending does not lose its last words."""
+    with _stdio(stdio_env.blackhole, stdio_env.shim):
+        log.redirect_stdio_to_log()
+        _run_threads_leaving_partial_lines(
+            ["partial line of a finished thread"], stdio_env.logger
+        )
+        print("next line of the main thread")
+
+    assert _messages(stdio_env.logger) == [
+        (logging.INFO, "partial line of a finished thread"),
+        (logging.INFO, "next line of the main thread"),
+    ]
+
+
+def test_stdio_to_log_writes_partial_line_of_finished_thread_at_exit(
+    stdio_env: types.SimpleNamespace,
+) -> None:
+    """At exit, also the partial lines of finished threads are written."""
+    with _stdio(stdio_env.blackhole, stdio_env.shim):
+        log.redirect_stdio_to_log()
+        _run_threads_leaving_partial_lines(
+            ["partial line of a finished thread"], stdio_env.logger
+        )
+    assert _messages(stdio_env.logger) == []
+
+    stdio_env.atexit_registered[0]()
+    assert _messages(stdio_env.logger) == [
+        (logging.INFO, "partial line of a finished thread")
+    ]
+
+
+def test_stdio_to_log_drops_partial_line_of_a_discarded_stream(
+    stdio_env: types.SimpleNamespace,
+) -> None:
+    """A stream that goes away leaves nothing queued for logging."""
+    stream = log.StdioToLog(logging.INFO, stdio_env.blackhole)
+    stream.write("partial line of a discarded stream")
+    del stream
+    gc.collect()
+
+    assert not log._ORPHANED_LINES
+    assert _messages(stdio_env.logger) == []
+
+
+def test_stdio_to_log_logs_partial_lines_of_many_finished_threads(
+    stdio_env: types.SimpleNamespace,
+) -> None:
+    """Partial lines of threads that end while others write are all logged."""
+    texts = [f"partial line of thread {i}" for i in range(20)]
+    with _stdio(stdio_env.blackhole, stdio_env.shim):
+        log.redirect_stdio_to_log()
+        writer = threading.Thread(
+            target=lambda: [print("writer line", i) for i in range(200)]
+        )
+        writer.start()
+        _run_threads_leaving_partial_lines(texts, stdio_env.logger)
+        writer.join(10)
+        print("next line of the main thread")
+
+    messages = [m for _, m in _messages(stdio_env.logger)]
+    assert sorted(m for m in messages if m.startswith("partial")) == sorted(texts)
+    assert {f"writer line {i}" for i in range(200)} <= set(messages)
+    assert messages[-1] == "next line of the main thread"
 
 
 def test_stdio_to_log_writes_partial_line_at_exit(stdio_env):
@@ -599,10 +933,29 @@ scenario, log_path, dump_path = sys.argv[1:4]
 dump = open(dump_path, "w", encoding="utf-8")
 faulthandler.dump_traceback_later(20, exit=True, file=dump)
 
+class MemoryFileHandler(logging.FileHandler):
+    # Keeps the formatted records in memory until the end. A buffered file is
+    # not reentrant: a finalizer that logs while the same thread flushes
+    # another record to it loses its record ("reentrant call inside
+    # BufferedWriter", swallowed by handleError). That CPython limitation is
+    # not what the "repeats" scenario counts on.
+
+    def __init__(self, path):
+        super().__init__(path, encoding="utf-8", delay=True)
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(self.format(record))
+
+
 logger = logging.getLogger("gc_finalizer_chain")
 logger.propagate = False
 logger.setLevel(logging.DEBUG)
-logger.addHandler(logging.FileHandler(log_path, encoding="utf-8"))
+if scenario == "repeats":
+    handler = MemoryFileHandler(log_path)
+else:
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+logger.addHandler(handler)
 log.LOGGER = logger
 
 
@@ -633,6 +986,22 @@ class GarbageChain:
         raise RuntimeError(f"chain link {self.remaining}")
 
 
+class LoggingChain:
+    # Like GarbageChain, but its finalizer logs a record, like a finalizer
+    # calling LOG(), possibly while a stream holds its lock with a repeat
+    # count pending.
+
+    def __init__(self, remaining):
+        self.remaining = remaining
+        self.cycle = self
+
+    def __del__(self):
+        if self.remaining and not STOP:
+            LoggingChain(self.remaining - 1)
+        if not self.remaining % 40:
+            log.LOG(f"finalizer record {self.remaining}")
+
+
 def first_write():
     GarbageChain(2000)
     sys.stderr.write("first line of a new thread\\n")
@@ -643,9 +1012,19 @@ def flush_at_exit():
     sys.stderr.flush_pending()
 
 
+def repeats():
+    GarbageChain(100)
+    LoggingChain(2000)
+    for _ in range(300):
+        sys.stderr.write("same line\\n")
+    sys.stderr.flush_pending()
+
+
 if scenario == "flush":
     sys.stderr.write("partial line at exit")
     target = flush_at_exit
+elif scenario == "repeats":
+    target = repeats
 else:
     target = first_write
 gc.set_threshold(1)
@@ -656,17 +1035,21 @@ STOP = True
 gc.set_threshold(700, 10, 10)
 gc.collect()
 faulthandler.cancel_dump_traceback_later()
+if scenario == "repeats":
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        log_file.write("".join(f"{line}\\n" for line in handler.lines))
 """
 
 
-@pytest.mark.parametrize("scenario", ["first-write", "flush"])
+@pytest.mark.parametrize("scenario", ["first-write", "flush", "repeats"])
 def test_stdio_to_log_survives_gc_finalizers_writing_to_stderr(tmp_path, scenario):
     """The real thing: the default sys.unraisablehook run by the garbage collector.
 
     With gc.set_threshold(1), nearly every allocation can run a finalizer,
     also while the stream holds its lock. Runs in a child process, so a
     deadlock cannot hang the test run (faulthandler ends it after 20 s and
-    dumps the stacks).
+    dumps the stacks). In the "repeats" scenario, finalizers also log
+    records while a line repeats: no repetition may be lost.
     """
     log_path = tmp_path / "app.log"
     dump_path = tmp_path / "stacks.txt"
@@ -692,6 +1075,20 @@ def test_stdio_to_log_survives_gc_finalizers_writing_to_stderr(tmp_path, scenari
     text = log_path.read_text(encoding="utf-8")
     if scenario == "flush":
         assert "partial line at exit" in text
+    elif scenario == "repeats":
+        # Every finalizer record is there (every 40th chain link logs one)
+        records = sorted(
+            int(number)
+            for number in re.findall(r"^finalizer record (\d+)$", text, re.M)
+        )
+        assert records
+        assert records == list(range(records[0], 2001, 40))
+        # No repetition was lost: each was written or counted in a summary
+        written = text.splitlines().count("same line")
+        counted = re.findall(
+            r'^\(previous line repeated (\d+) times?: "same line"\)$', text, re.M
+        )
+        assert written + sum(int(count) for count in counted) == 300
     else:
         assert "first line of a new thread" in text
     assert "Exception ignored in" in text

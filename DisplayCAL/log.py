@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import collections
 import contextlib
+import itertools
 import logging
 import logging.handlers
 import os
@@ -770,6 +771,20 @@ _BOOKKEEPING = threading.local()
 _MAX_DEFERRED_WRITES = 1000
 # StdioToLog instances installed by redirect_stdio_to_log()
 _STDIO_LOG_STREAMS: list[StdioToLog] = []
+# Every StdioToLog instance, so that the pending repeat summary of a stream
+# can be logged before a record from any other source (_AppRecordSequencer)
+_ALL_STDIO_LOG_STREAMS: weakref.WeakSet[StdioToLog] = weakref.WeakSet()
+# Numbers the records written to the application log file (see
+# _AppRecordSequencer), and the number of the newest one (0: none yet)
+_APP_RECORD_NUMBERS = itertools.count(1)
+_last_app_record = 0
+# LogRecord attributes: the number of a record in the application log file,
+# and the mark of a repeat summary (which gets no number)
+_RECORD_NUMBER_ATTR = "displaycal_app_log_number"
+_REPEAT_SUMMARY_ATTR = "displaycal_repeat_summary"
+# (weakref to StdioToLog, text) of each partial line that a thread left
+# behind when it ended without writing a line ending (see _LineBuffer)
+_ORPHANED_LINES: collections.deque[tuple[weakref.ref, str]] = collections.deque()
 
 
 def _app_file_handlers() -> list[logging.FileHandler]:
@@ -783,6 +798,141 @@ def _app_file_handlers() -> list[logging.FileHandler]:
     if logger is None:
         return []
     return [h for h in list(logger.handlers) if isinstance(h, logging.FileHandler)]
+
+
+class _AppRecordSequencer(logging.Filter):
+    """Number the records written to the application log file.
+
+    Installed on the application log file handlers, so every record written
+    to the file passes through it, whatever its source: LOG() and
+    safe_print(), log_error() and handle_error(), both redirected standard
+    streams, warnings, and loggers that propagate to the application logger.
+    A record handed to several handlers is numbered once.
+
+    The numbers let a StdioToLog stream tell whether its last line is still
+    the previous record in the file, which is the only case where a repeated
+    line is collapsed. Before a record is written, a stream's pending repeat
+    summary is written, so the summary stays next to the line it counts.
+    Repeat summaries get no number: they do not separate a line from its
+    repetitions.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Number a new record and log pending repeat summaries before it.
+
+        Never raises, and never rejects a record.
+
+        Args:
+            record (logging.LogRecord): The record about to be written.
+
+        Returns:
+            bool: Always True.
+        """
+        global _last_app_record
+        try:
+            if getattr(record, _RECORD_NUMBER_ATTR, None) is None and not getattr(
+                record, _REPEAT_SUMMARY_ATTR, False
+            ):
+                number = next(_APP_RECORD_NUMBERS)
+                setattr(record, _RECORD_NUMBER_ATTR, number)
+                _last_app_record = number
+                # Numbered first: a stream deciding about a repeat right now
+                # (under its lock) either already sees this record and logs
+                # its line in full, or has counted the repeat by the time
+                # the flush below gets the lock.
+                _flush_repeat_summaries()
+        except Exception:
+            pass
+        return True
+
+
+_APP_RECORD_SEQUENCER = _AppRecordSequencer()
+
+
+def _install_record_sequencer(handlers: list[logging.Handler]) -> None:
+    """Make sure the handlers number their records (_AppRecordSequencer).
+
+    Args:
+        handlers (list[logging.Handler]): The application log file handlers.
+    """
+    for handler in handlers:
+        if _APP_RECORD_SEQUENCER not in handler.filters:
+            handler.addFilter(_APP_RECORD_SEQUENCER)
+
+
+def _flush_repeat_summaries() -> None:
+    """Log the pending repeat summary of every stream.
+
+    Called before a record is written to the application log file.
+    """
+    if getattr(_BOOKKEEPING, "active", False) or sys.is_finalizing():
+        # This record interrupts a stream's bookkeeping on this thread (e.g.
+        # a finalizer calls LOG() during a garbage collection). Taking a
+        # stream's lock here could deadlock or tear its state, so the
+        # stream logs its summary (which names its line) with its next line.
+        return
+    for stream in list(_ALL_STDIO_LOG_STREAMS):
+        if stream._repeat_count:
+            stream._flush_repeat_summary()
+
+
+def _set_record_time(record: logging.LogRecord, created: float) -> None:
+    """Set the creation time of record, as shown by its timestamp.
+
+    Args:
+        record (logging.LogRecord): The record.
+        created (float): The time, as returned by time.time().
+    """
+    record.relativeCreated += (created - record.created) * 1000
+    record.created = created
+    record.msecs = int((created - int(created)) * 1000) + 0.0
+
+
+def _emit_record(
+    level: int,
+    msg: str,
+    summary_time: float | None = None,
+    nested: bool = False,
+) -> logging.LogRecord | None:
+    """Emit msg as one record directly to the application log file handlers.
+
+    See _emit_to_app_log(). Never raises.
+
+    Args:
+        level (int): The log level of the record.
+        msg (str): The message. May span multiple lines.
+        summary_time (float | None, optional): Emit a repeat summary, with
+            this time (that of the last repetition it counts) as timestamp.
+        nested (bool, optional): Emit even while this thread emits another
+            record (a repeat summary logged by _AppRecordSequencer before
+            that record).
+
+    Returns:
+        logging.LogRecord | None: The record, if it was handed to at least
+            one application log file handler.
+    """
+    emitting = getattr(_EMITTING, "active", False)
+    if emitting and not nested:
+        return None
+    try:
+        handlers = _app_file_handlers()
+        if not handlers:
+            return None
+        _install_record_sequencer(handlers)
+        _EMITTING.active = True
+        try:
+            record = logging.LogRecord(LOGGER.name, level, __file__, 0, msg, None, None)
+            if summary_time is not None:
+                setattr(record, _REPEAT_SUMMARY_ATTR, True)
+                _set_record_time(record, summary_time)
+            for handler in handlers:
+                if record.levelno >= handler.level:
+                    handler.handle(record)
+        finally:
+            _EMITTING.active = emitting
+    except Exception:
+        return None
+    return record
 
 
 def _emit_to_app_log(level: int, msg: str) -> bool:
@@ -801,25 +951,7 @@ def _emit_to_app_log(level: int, msg: str) -> bool:
             file handler, False if there is none (or if called re-entrantly
             while emitting).
     """
-    if getattr(_EMITTING, "active", False):
-        return False
-    try:
-        handlers = _app_file_handlers()
-        if not handlers:
-            return False
-        _EMITTING.active = True
-        try:
-            record = logging.LogRecord(
-                LOGGER.name, level, __file__, 0, msg, None, None
-            )
-            for handler in handlers:
-                if record.levelno >= handler.level:
-                    handler.handle(record)
-        finally:
-            _EMITTING.active = False
-    except Exception:
-        return False
-    return True
+    return _emit_record(level, msg) is not None
 
 
 def log_error(text: str) -> bool:
@@ -852,13 +984,79 @@ def log_error(text: str) -> bool:
     return False
 
 
-class _LineBuffer:
-    """Pending partial line of one thread for one StdioToLog stream."""
+class _PendingText:
+    """The text of a _LineBuffer, kept apart so that it outlives the buffer."""
 
-    __slots__ = ("__weakref__", "pending")
+    __slots__ = ("value",)
 
     def __init__(self) -> None:
-        self.pending = ""
+        self.value = ""
+
+
+class _LineBuffer:
+    """Pending partial line of one thread for one StdioToLog stream.
+
+    Only the thread-local storage of its stream holds the buffer, so it is
+    collected when its thread ends. A partial line still pending then is
+    queued (see _orphan_partial_line) and logged by the next write to a
+    redirected stream or at exit, instead of being lost with the thread.
+
+    Args:
+        stream (StdioToLog): The stream the buffer belongs to.
+    """
+
+    __slots__ = ("__weakref__", "_text")
+
+    def __init__(self, stream: StdioToLog) -> None:
+        self._text = _PendingText()
+        finalizer = weakref.finalize(
+            self, _orphan_partial_line, weakref.ref(stream), self._text
+        )
+        # A live buffer's partial line is logged by flush_pending() at exit
+        finalizer.atexit = False
+
+    @property
+    def pending(self) -> str:
+        """str: The partial line (text after the last line ending)."""
+        return self._text.value
+
+    @pending.setter
+    def pending(self, text: str) -> None:
+        self._text.value = text
+
+
+def _orphan_partial_line(stream_ref: weakref.ref, text: _PendingText) -> None:
+    """Queue the partial line of a line buffer that has been collected.
+
+    Runs wherever the buffer happens to be collected: normally while its
+    thread ends, but possibly within a garbage collection on any thread, even
+    in the middle of a stream's bookkeeping. So this only appends to a deque
+    (atomic: it takes no lock and emits nothing), and _log_orphaned_lines()
+    logs the text later.
+
+    Args:
+        stream_ref (weakref.ref): Weak reference to the buffer's stream.
+        text (_PendingText): The buffer's text.
+    """
+    pending, text.value = text.value, ""
+    # A buffer also goes when its stream goes; then there is nowhere to log
+    if pending.strip() and stream_ref() is not None:
+        _ORPHANED_LINES.append((stream_ref, pending))
+
+
+def _log_orphaned_lines() -> None:
+    """Log the partial lines of threads that ended without a line ending.
+
+    Must be called while the calling thread holds no StdioToLog lock.
+    """
+    for _ in range(_MAX_DEFERRED_WRITES):
+        try:
+            stream_ref, text = _ORPHANED_LINES.popleft()
+        except IndexError:
+            break
+        stream = stream_ref()
+        if stream is not None:
+            stream._log_text(text.rstrip(), whole_line=True)
 
 
 def _begin_bookkeeping() -> None:
@@ -905,11 +1103,17 @@ class StdioToLog:
     signal handler) is queued and logged once the lock is released, instead
     of deadlocking on the lock (see _BOOKKEEPING).
 
-    Consecutive identical lines (like the profile loader's monitoring
-    thread "Acquired lock" message every few seconds) are collapsed into
-    "(last message repeated N times)", which is still written at least every
-    ``repeat_summary_interval`` seconds while the repetition goes on, so the
-    log keeps showing that the process was alive.
+    A line that repeats the previous record in the log file (the same line
+    written to this stream, with no other record from any source in between)
+    is not written again but counted. The count is written as
+    '(previous line repeated N times: "<line>")' before the next record of
+    any source, and at least every ``repeat_summary_interval`` seconds while
+    the repetition goes on, so the log keeps showing that the process was
+    alive. A line is never collapsed with a copy that is separated from it by
+    other records (see _AppRecordSequencer).
+
+    A partial line left behind by a thread that ends without writing a line
+    ending is logged by the next write to a redirected stream, or at exit.
 
     Like py2exe's Blackhole, this deliberately has no ``isatty()`` and no
     ``fileno()``: e.g. Worker.exec_cmd checks ``hasattr(sys.stdout,
@@ -918,7 +1122,7 @@ class StdioToLog:
 
     Args:
         level (int): The log level for lines written to this stream.
-        original (None | TextIO): The stream object that is replaced.
+        original (TextIO | None): The stream object that is replaced.
         passthrough (bool, optional): Also write everything to the original
             stream. Text is always passed through to the original stream if
             there is no application log file handler. Defaults to False.
@@ -928,11 +1132,13 @@ class StdioToLog:
     encoding = "utf-8"
     repeat_summary_interval = 600.0
     max_line_length = 64 * 1024
+    # Longest part of a line that a repeat summary quotes
+    max_summary_quote_length = 200
 
     def __init__(
         self,
         level: int,
-        original: None | TextIO = None,
+        original: TextIO | None = None,
         passthrough: bool = False,
     ) -> None:
         self.level = level
@@ -946,7 +1152,16 @@ class StdioToLog:
         self._buffers = weakref.WeakSet()
         self._last_line = None
         self._repeat_count = 0
+        # Time of the last record or summary of the repeated line, and of
+        # its last counted repetition (the timestamp of the summary)
         self._repeat_time = 0.0
+        self._repeat_last = 0.0
+        # Number of this stream's last line in the log file (None: unknown,
+        # e.g. while that line is being written). Set after emitting,
+        # without the lock: a stale value can only make the next line count
+        # as not adjacent, i.e. be logged in full.
+        self._last_record = None
+        _ALL_STDIO_LOG_STREAMS.add(self)
 
     def write(self, text: str | bytes) -> int:
         """Write text. Whole lines are sent to the application log.
@@ -978,6 +1193,8 @@ class StdioToLog:
                 # This interrupted a stream's bookkeeping on this thread
                 _BOOKKEEPING.deferred.append((self, text))
                 return len(text)
+            if _ORPHANED_LINES:
+                _log_orphaned_lines()
             self._log_text(text)
             _log_deferred_writes()
         except Exception:
@@ -1003,7 +1220,8 @@ class StdioToLog:
     def flush_pending(self) -> None:
         """Log every thread's pending partial line and any repeat summary.
 
-        Called at exit, so the last words of the process are not lost.
+        Called at exit, so the last words of the process are not lost. This
+        includes the partial lines of threads that have ended already.
         """
         try:
             if (
@@ -1013,6 +1231,7 @@ class StdioToLog:
                 or not _app_file_handlers()
             ):
                 return
+            _log_orphaned_lines()
             _begin_bookkeeping()
             try:
                 with self._lock:
@@ -1022,12 +1241,10 @@ class StdioToLog:
                     for buffer in list(self._buffers):
                         pending, buffer.pending = buffer.pending, ""
                         if pending.strip():
-                            messages.append(pending.rstrip())
+                            messages.append((pending.rstrip(), None))
             finally:
                 _BOOKKEEPING.active = False
-            # Emit without holding the lock
-            for message in messages:
-                _emit_to_app_log(self.level, message)
+            self._emit_messages(messages)
             _log_deferred_writes()
         except Exception:
             pass
@@ -1043,23 +1260,62 @@ class StdioToLog:
             with contextlib.suppress(Exception):
                 original.write(text)
 
-    def _log_text(self, text: str) -> None:
+    def _log_text(self, text: str, whole_line: bool = False) -> None:
         """Send the whole lines of text to the log (without passthrough).
 
         Must be called while the calling thread holds no StdioToLog lock.
 
         Args:
             text (str): The text to add to the calling thread's buffer.
+            whole_line (bool, optional): Log text as one line, bypassing the
+                calling thread's buffer.
         """
         _begin_bookkeeping()
         try:
             with self._lock:
-                messages = self._collapse(self._take_lines(text), time())
+                lines = [text] if whole_line else self._take_lines(text)
+                messages = self._collapse(lines, time())
         finally:
             _BOOKKEEPING.active = False
-        # Emit without holding the lock
-        for message in messages:
-            _emit_to_app_log(self.level, message)
+        self._emit_messages(messages)
+
+    def _emit_messages(self, messages: list[tuple[str, float | None]]) -> None:
+        """Emit messages and remember the number of the last line.
+
+        Must be called while the calling thread holds no StdioToLog lock.
+
+        Args:
+            messages (list[tuple[str, float | None]]): (message, None) for a
+                line, (message, time) for a repeat summary.
+        """
+        line_emitted = False
+        last_record = None
+        for message, summary_time in messages:
+            record = _emit_record(self.level, message, summary_time)
+            if summary_time is None:
+                line_emitted = True
+                last_record = getattr(record, _RECORD_NUMBER_ATTR, None)
+        if line_emitted:
+            self._last_record = last_record
+
+    def _flush_repeat_summary(self) -> None:
+        """Log the pending repeat summary, before another record is written.
+
+        Called by _AppRecordSequencer. Must be called while the calling
+        thread holds no StdioToLog lock.
+        """
+        _begin_bookkeeping()
+        try:
+            with self._lock:
+                summary = None
+                if self._repeat_count:
+                    summary = self._take_repeat_summary(time())
+        finally:
+            _BOOKKEEPING.active = False
+        if summary:
+            _emit_record(self.level, *summary, nested=True)
+        if not getattr(_EMITTING, "active", False):
+            _log_deferred_writes()
 
     def _take_lines(self, text: str) -> list[str]:
         """Add text to the calling thread's buffer and take the whole lines.
@@ -1074,7 +1330,7 @@ class StdioToLog:
         """
         buffer = getattr(self._local, "buffer", None)
         if buffer is None:
-            buffer = self._local.buffer = _LineBuffer()
+            buffer = self._local.buffer = _LineBuffer(self)
             self._buffers.add(buffer)
         text = (buffer.pending + text).replace("\r\n", "\n").replace("\r", "\n")
         *lines, pending = text.split("\n")
@@ -1084,8 +1340,8 @@ class StdioToLog:
         buffer.pending = pending
         return lines
 
-    def _collapse(self, lines: list[str], now: float) -> list[str]:
-        """Return the messages to log, collapsing consecutive identical lines.
+    def _collapse(self, lines: list[str], now: float) -> list[tuple[str, float | None]]:
+        """Return the messages to log, collapsing adjacent identical lines.
 
         Must be called with the lock held.
 
@@ -1094,15 +1350,28 @@ class StdioToLog:
             now (float): The current time.
 
         Returns:
-            list[str]: The messages to log.
+            list[tuple[str, float | None]]: The messages to log: (line, None)
+                or (repeat summary, its time).
         """
         messages = []
+        if not lines:
+            return messages
+        if self._last_record is None or self._last_record != _last_app_record:
+            # Another record was written to the log file since this stream's
+            # last line, so the next line repeats nothing. A pending summary
+            # normally went out before that record (_AppRecordSequencer); if
+            # it could not (that record interrupted this thread's
+            # bookkeeping), log it now. It names its line.
+            if self._repeat_count:
+                messages.append(self._take_repeat_summary(now))
+            self._last_line = None
         for line in lines:
             line = line.rstrip()  # noqa: PLW2901
             if not line:
                 continue
             if line == self._last_line:
                 self._repeat_count += 1
+                self._repeat_last = now
                 if now - self._repeat_time >= self.repeat_summary_interval:
                     messages.append(self._take_repeat_summary(now))
                 continue
@@ -1110,11 +1379,15 @@ class StdioToLog:
                 messages.append(self._take_repeat_summary(now))
             self._last_line = line
             self._repeat_time = now
-            messages.append(line)
+            # Unknown until the line is written: another thread writing the
+            # same line meanwhile must not count it as a repeat of a line
+            # that is not in the file yet
+            self._last_record = None
+            messages.append((line, None))
         return messages
 
-    def _take_repeat_summary(self, now: float) -> str:
-        """Return the repeat summary message and reset the repeat count.
+    def _take_repeat_summary(self, now: float) -> tuple[str, float]:
+        """Return the repeat summary and reset the repeat count.
 
         Must be called with the lock held.
 
@@ -1122,19 +1395,25 @@ class StdioToLog:
             now (float): The current time.
 
         Returns:
-            str: The repeat summary message.
+            tuple[str, float]: The repeat summary message, which quotes the
+                repeated line, and the time of the last repetition it
+                counts, which becomes its timestamp.
         """
         count = self._repeat_count
         self._repeat_count = 0
         self._repeat_time = now
-        return f"(last message repeated {count} time{'' if count == 1 else 's'})"
+        line = self._last_line or ""
+        if len(line) > self.max_summary_quote_length:
+            line = line[: self.max_summary_quote_length] + "..."
+        times = "time" if count == 1 else "times"
+        return f'(previous line repeated {count} {times}: "{line}")', self._repeat_last
 
 
-def _discards_output(stream: None | TextIO, shim_name: str) -> bool:
+def _discards_output(stream: TextIO | None, shim_name: str) -> bool:
     """Return whether everything written to a standard stream is lost.
 
     Args:
-        stream (None | TextIO): The stream (sys.stdout or sys.stderr).
+        stream (TextIO | None): The stream (sys.stdout or sys.stderr).
         shim_name (str): Class name of the py2exe replacement for the stream:
             "Blackhole" for sys.stdout, "Stderr" for sys.stderr.
 
@@ -1150,7 +1429,7 @@ def _discards_output(stream: None | TextIO, shim_name: str) -> bool:
 
 def _flush_stdio_log_streams() -> None:
     """Log pending partial lines and repeat summaries of all redirections."""
-    for stream in list(_STDIO_LOG_STREAMS):
+    for stream in _STDIO_LOG_STREAMS.copy():
         stream.flush_pending()
 
 
@@ -1174,8 +1453,10 @@ def redirect_stdio_to_log() -> bool:
     Returns:
         bool: True if at least one stream was redirected.
     """
-    if not _app_file_handlers():
+    handlers = _app_file_handlers()
+    if not handlers:
         return False
+    _install_record_sequencer(handlers)
     redirected = []
     if _discards_output(sys.stdout, "Blackhole"):
         sys.stdout = StdioToLog(logging.INFO, sys.stdout)
