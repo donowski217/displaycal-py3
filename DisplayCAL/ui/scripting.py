@@ -50,6 +50,7 @@ from DisplayCAL.config import (
     getcfg,
     setcfg,
 )
+from DisplayCAL.debughelpers import log_error_traceback, print_safe
 from DisplayCAL.meta import NAME as APPNAME
 from DisplayCAL.network import ScriptingClientSocket, get_network_addr
 from DisplayCAL.util_str import safe_str
@@ -276,47 +277,81 @@ class ScriptingHostMixin:
         Non-UI commands are answered directly on this worker thread; commands
         that touch the UI are marshalled onto the GUI thread via the bridge.
 
+        Commands are newline-terminated UTF-8 lines. The received bytes are
+        split on newlines before decoding, so a multi-byte character that
+        arrives in two ``recv()`` chunks is decoded intact, and bytes that are
+        not valid UTF-8 (e.g. from a program that is not a DisplayCAL
+        scripting client) are replaced instead of ending the connection. An
+        error while handling one line is logged and the next line is read,
+        and the connection is always closed when the handler ends.
+
         Args:
             conn (socket.socket): The client connection.
             addrport (tuple): The client's ``(address, port)``.
         """
         responseformats[conn] = "plain"
-        buffer = ""
-        while self and getattr(self, "listening", False):
-            try:
-                incoming = conn.recv(4096)
-                if isinstance(incoming, bytes):
-                    incoming = incoming.decode("utf-8")
-            except socket.timeout:
-                continue
-            except OSError as exception:
-                if exception.errno == errno.EWOULDBLOCK:
-                    sleep(0.05)
+        buffer = b""
+        try:
+            while self and getattr(self, "listening", False):
+                try:
+                    incoming = conn.recv(4096)
+                except socket.timeout:
                     continue
-                break
-            if not incoming:
-                break
-            buffer += incoming
-            while "\n" in buffer and self and getattr(self, "listening", False):
-                end = buffer.find("\n")
-                line = buffer[:end].strip()
-                buffer = buffer[end + 1 :]
-                if not line:
-                    continue
-                command_timestamp = datetime.now().strftime("%Y-%m-%dTH:%M:%S.%f")
-                print(lang.getstr("app.incoming_message", (*addrport, line)))
-                data = split_command_line(str(line))
-                response = self._handle_non_ui_command(data, conn)
-                if response is not None:
-                    self.send_response(response, data, conn, command_timestamp)
-                    continue
-                # UI command: run on the GUI thread.
-                self._finish_bridge.requested.emit(data, conn, command_timestamp)
-        with contextlib.suppress(OSError):
-            conn.shutdown(socket.SHUT_RDWR)
-        print(lang.getstr("app.client.disconnect", addrport))
-        conn.close()
-        responseformats.pop(conn, None)
+                except OSError as exception:
+                    if exception.errno == errno.EWOULDBLOCK:
+                        sleep(0.05)
+                        continue
+                    break
+                if not incoming:
+                    break
+                buffer += incoming
+                while b"\n" in buffer and self and getattr(self, "listening", False):
+                    end = buffer.find(b"\n")
+                    line = buffer[:end].decode("utf-8", "replace").strip()
+                    buffer = buffer[end + 1 :]
+                    if not line:
+                        continue
+                    try:
+                        self.handle_message_line(line, conn, addrport)
+                    except Exception:  # noqa: BLE001
+                        print_safe(
+                            "Warning - error while handling scripting command "
+                            f"{line!r} from {addrport}"
+                        )
+                        log_error_traceback()
+        except Exception:  # noqa: BLE001
+            print_safe(f"Warning - scripting connection from {addrport} failed")
+            log_error_traceback()
+        finally:
+            with contextlib.suppress(OSError):
+                conn.shutdown(socket.SHUT_RDWR)
+            print(lang.getstr("app.client.disconnect", addrport))
+            with contextlib.suppress(OSError):
+                conn.close()
+            responseformats.pop(conn, None)
+
+    def handle_message_line(
+        self, line: str, conn: socket.socket, addrport: tuple
+    ) -> None:
+        """Handle one command line received by :meth:`message_handler`.
+
+        Non-UI commands are answered right away on the calling (worker)
+        thread; UI commands are marshalled onto the GUI thread via the bridge.
+
+        Args:
+            line (str): The command line (decoded, stripped and not empty).
+            conn (socket.socket): The client connection.
+            addrport (tuple): The client's ``(address, port)``.
+        """
+        command_timestamp = datetime.now().strftime("%Y-%m-%dTH:%M:%S.%f")
+        print_safe(lang.getstr("app.incoming_message", (*addrport, line)))
+        data = split_command_line(line)
+        response = self._handle_non_ui_command(data, conn)
+        if response is not None:
+            self.send_response(response, data, conn, command_timestamp)
+            return
+        # UI command: run on the GUI thread.
+        self._finish_bridge.requested.emit(data, conn, command_timestamp)
 
     # -- non-UI commands (answered off the GUI thread) ---------------------
 
@@ -491,14 +526,15 @@ class ScriptingHostMixin:
             command (str): The command line to send.
 
         Returns:
-            The host's response string, or an ``Exception`` on failure.
+            The host's decoded response string, ``None`` if it is not running
+            (or another application is listening on its port), or the
+            ``Exception`` raised while talking to it.
         """
         lock_name = APPBASENAME
         scripting_host = APPNAME
         if scripting_host_name_suffix:
             lock_name += "-" + scripting_host_name_suffix
             scripting_host += "-" + scripting_host_name_suffix
-        response = None
         try:
             for host in self.get_scripting_hosts():
                 ip_port, name = host.split(None, 1)
@@ -509,25 +545,27 @@ class ScriptingHostMixin:
                 if isinstance(conn, Exception):
                     raise conn
                 # Confirm we reached the expected app (the port could have been
-                # reused if it exited unexpectedly).
+                # reused if it exited unexpectedly). Replies are bytes, and the
+                # name is lowercase when running from source.
                 conn.send_command("getappname")
-                response = conn.get_single_response()
-                if response == scripting_host:
-                    conn.send_command(command)
-                    response = conn.get_single_response()
-                    print(f"{scripting_host} {command} returned", response)
-                else:
+                response = conn.get_single_response().decode("utf-8", "replace")
+                if response.lower() != scripting_host.lower():
                     print(
                         f"Warning - {scripting_host} not running under expected port",
                         port,
                     )
+                    del conn
+                    continue
+                conn.send_command(command)
+                response = conn.get_single_response().decode("utf-8", "replace")
+                print_safe(f"{scripting_host} {command} returned {response}")
                 del conn
                 return response
             print(f"Warning - {scripting_host} not running?")
         except Exception as exception:  # noqa: BLE001
             print(f"Warning - couldn't talk to {scripting_host}:", exception)
             return exception
-        return response
+        return None
 
     # -- responses ---------------------------------------------------------
 
