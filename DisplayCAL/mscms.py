@@ -48,6 +48,7 @@ from typing import (
     Any,
     Callable,
     Literal,
+    TextIO,
     TypeVar,
     Union,
 )
@@ -95,17 +96,54 @@ default_logging_level = logging.INFO
 logger = logging.getLogger(__name__ + ".manager")
 logger.setLevel(default_logging_level)
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-# Only attach a real stderr handler when stderr is an interactive console.
-# A frozen windowed exe (py2exe) replaces sys.stderr with a lazily-opening
-# log-file shim that pops up an "Errors in ..." dialog on exit for ANY
-# write, even plain INFO messages, so stay silent there (see #804).
-if hasattr(sys.stderr, "isatty") and sys.stderr.isatty():
-    ch = logging.StreamHandler()
-else:
-    ch = logging.NullHandler()
-ch.setFormatter(formatter)
-logger.addHandler(ch)
-logger.propagate = False
+
+
+def _configure_logger(
+    manager_logger: logging.Logger, stream: None | TextIO = None
+) -> None:
+    """Configure where the WCS manager's log records go.
+
+    Only attach a real stderr handler when stderr is an interactive console.
+    A frozen windowed exe (py2exe) replaces sys.stderr with a lazily-opening
+    log-file shim that pops up an "Errors in ..." dialog on exit for ANY
+    write, even plain INFO messages, so don't write to stderr there (see
+    #804). Instead, let the records propagate to the application's (root)
+    logger, which writes them to DisplayCAL's own log file.
+
+    Args:
+        manager_logger (logging.Logger): The logger to configure.
+        stream (None | TextIO, optional): The stderr stream to check.
+            Defaults to sys.stderr.
+    """
+    if stream is None:
+        stream = sys.stderr
+    if hasattr(stream, "isatty") and stream.isatty():
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(formatter)
+        manager_logger.addHandler(handler)
+        manager_logger.propagate = False
+    else:
+        manager_logger.propagate = True
+
+
+_configure_logger(logger)
+
+
+class _DispatchToLogger(logging.Handler):
+    """Hand log records received from the worker process to the local logger.
+
+    Used by the WCS manager's QueueListener, so that records logged by the
+    worker process end up wherever records of a logger of the same name in
+    this process would go (normally the application's log file).
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Pass the record to the logger it was logged with.
+
+        Args:
+            record (logging.LogRecord): The record received from the worker.
+        """
+        logging.getLogger(record.name).handle(record)
 
 check_handles_call_num = 100  # check leaking handles every <num> of calls
 open_handles_threshold = 3000  # worker process open handle limit
@@ -333,7 +371,7 @@ class WCSManager:
 
         self._response_listener_thread: None | Thread = None
 
-        handlers = logger.handlers if logger.handlers else [logging.StreamHandler()]
+        handlers = logger.handlers if logger.handlers else [_DispatchToLogger()]
         self._log_listener = QueueListener(
             self._log_queue, *handlers, respect_handler_level=True
         )
@@ -400,7 +438,7 @@ class WCSManager:
             self._shutdown_event.set()  # Closing down listener and call functionality
 
     def _handle_check_worker(self) -> None:
-        logger.info("Performing worker process open handle check")
+        logger.debug("Performing worker process open handle check")
 
         p = None
         num_handles = 0
