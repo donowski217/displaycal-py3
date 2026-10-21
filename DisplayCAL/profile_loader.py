@@ -5337,10 +5337,19 @@ class ProfileLoader:
     def _set_display_profiles(self, dry_run: bool = False) -> None:
         """Set display profiles for all monitors.
 
+        Rebuilds ``devices2profiles``, the original associations that
+        :meth:`_reset_display_profile_associations` restores. Does nothing on
+        the monitoring thread once shutdown has begun (see
+        :meth:`_must_stop_writing`): shutdown's reset needs that mapping.
+
         Args:
             dry_run (bool): If True, do not actually set the profiles.
         """
         if not self._can_fix_profile_associations():
+            return
+        if self._must_stop_writing():
+            # Keep the mapping, e.g. when shutdown began during the reset that
+            # a display change does first: it may have left fixes in place
             return
         debug_print("-" * 80)
         debug_print("Checking profile associations")
@@ -5348,6 +5357,9 @@ class ProfileLoader:
         self.devices2profiles = {}
         for i, (display, _edid, moninfo, _device) in enumerate(self.monitors):
             if self._must_stop_writing():
+                # Safe to stop with a partial mapping: only a reset that ran
+                # to the end (or nothing, on the first run) came before, so
+                # the monitors not processed yet are not fixed
                 break
             debug_print(
                 f"Enumerating display devices for monitor {i:d} {moninfo['Device']}"

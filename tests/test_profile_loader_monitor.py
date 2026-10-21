@@ -1251,6 +1251,8 @@ def test_set_display_profiles_stops_when_shutdown_began(monkeypatch):
     pl = _make_pl()
     pl._can_fix_profile_associations = lambda: True
     pl.monitors = [("Display 1", None, {"Device": r"\\.\DISPLAY1"}, None)]
+    mapping = {"key0": (("Display 1",), "old.icc", "Old")}
+    pl.devices2profiles = dict(mapping)
     enumerated = []
     monkeypatch.setattr(
         profile_loader, "get_display_devices", lambda name: enumerated.append(name)
@@ -1260,6 +1262,155 @@ def test_set_display_profiles_stops_when_shutdown_began(monkeypatch):
     _in_thread(pl._set_display_profiles)
 
     assert enumerated == []
+    # Kept for shutdown's reset of the associations fixed so far
+    assert pl.devices2profiles == mapping
+
+
+class _FakeAssociationStore:
+    """In-memory display profile associations (device key -> default profile).
+
+    Stands in for every WCS read and write of the association code.
+    """
+
+    def __init__(self, monkeypatch, associations):
+        self.associations = dict(associations)
+        self.writes = []
+        # Called (on the monitoring thread) after its first unset, if set
+        self.after_monitor_unset = None
+        monkeypatch.setattr(profile_loader, "get_display_profile", self.get)
+        monkeypatch.setattr(profile_loader, "set_display_profile", self.set)
+        monkeypatch.setattr(profile_loader, "unset_display_profile", self.unset)
+        monkeypatch.setattr(profile_loader, "is_superuser", lambda: True)
+
+    def get(self, display_no=0, path_only=False, devicekey=None):
+        profile = self.associations.get(devicekey)
+        return profile and os.path.join(r"C:\x", profile)
+
+    def set(self, profile_name, display_no=0, devicekey=None):
+        self.writes.append(("set", devicekey, profile_name))
+        self.associations[devicekey] = profile_name
+
+    def unset(self, profile_name, display_no=0, devicekey=None):
+        self.writes.append(("unset", devicekey, profile_name))
+        if self.associations.get(devicekey) == profile_name:
+            self.associations[devicekey] = None
+        if (
+            self.after_monitor_unset
+            and threading.current_thread().name == "DisplayConfigurationMonitoring"
+        ):
+            after_monitor_unset, self.after_monitor_unset = (
+                self.after_monitor_unset,
+                None,
+            )
+            after_monitor_unset()
+
+
+@pytest.mark.parametrize("shutdown_begins", ["before_reset", "during_reset"])
+def test_shutdown_resets_fixes_after_a_display_change_iteration(
+    monkeypatch, shutdown_begins
+):
+    """A display change iteration that shutdown overtakes must not keep a fix.
+
+    The iteration resets the fixed associations and fixes them again (see
+    ``_check_display_changed``). Once shutdown began, it does neither (or
+    stops part-way), and shutdown's own reset must still undo every fix. It
+    found nothing to reset when the iteration had cleared the mapping of
+    original associations before stopping.
+    """
+    harness = ShutdownHarness(monkeypatch)
+    pl = harness.pl
+    del pl._reset_display_profile_associations  # the real one
+    pl._can_fix_profile_associations = lambda: True
+    pl._fixed_profile_associations = set()
+    pl.devices2profiles = {}
+    # Two monitors, each with two child devices. The 2nd is the active one;
+    # the 1st is the one GetICMProfile reads, whose association gets fixed.
+    devices = {
+        r"\\.\DISPLAY1": [_FakeDevice("a0"), _FakeDevice("a1")],
+        r"\\.\DISPLAY2": [_FakeDevice("b0"), _FakeDevice("b1")],
+    }
+    pl.monitors = [
+        (f"Display {i}", None, {"Device": name}, children[1])
+        for i, (name, children) in enumerate(devices.items(), 1)
+    ]
+    original = {
+        "a0": "oldA.icc",
+        "a1": "goodA.icc",
+        "b0": "oldB.icc",
+        "b1": "goodB.icc",
+    }
+    store = _FakeAssociationStore(monkeypatch, original)
+    monkeypatch.setattr(profile_loader, "get_display_devices", devices.get)
+    monkeypatch.setattr(
+        profile_loader,
+        "get_active_display_device",
+        lambda name, devices=None: devices[1],
+    )
+    monkeypatch.setattr(
+        profile_loader,
+        "get_display_name_edid",
+        lambda device, *args: (f"Display {device.DeviceKey}", {}),
+    )
+    monkeypatch.setattr(profile_loader, "get_profile_desc", lambda name: name)
+    monkeypatch.setattr(profile_loader, "lang", _FakeLang(), raising=False)
+    # A display change, detected without the registry key
+    pl._display_conf_key_unavailable = True
+    pl._active_displays = []
+    monkeypatch.setattr(
+        profile_loader, "get_active_display_devices", lambda attr: ["a1", "b1"]
+    )
+    pl._enumerate_monitors = lambda: None
+    pl._is_displaycal_running = lambda: False
+
+    # Startup: the first iteration fixes both monitors' associations
+    _in_thread(lambda: pl._check_display_changed(first_run=True))
+    assert store.associations == dict(original, a0="goodA.icc", b0="goodB.icc")
+    assert pl._fixed_profile_associations == {"a0", "b0"}
+
+    holding = threading.Event()
+    shutdown_began = threading.Event()
+    ready_for_shutdown = threading.Event()
+    waited = []
+    writecfg = pl.writecfg
+
+    def writecfg_after_shutdown_began():
+        # shutdown() has set _shutdown and stopped monitoring by now
+        writecfg()
+        shutdown_began.set()
+
+    pl.writecfg = writecfg_after_shutdown_began
+
+    def wait_for_shutdown():
+        ready_for_shutdown.set()
+        waited.append(shutdown_began.wait(5))
+
+    if shutdown_begins == "during_reset":
+        # Shutdown begins once the iteration has reset monitor 1's fix
+        store.after_monitor_unset = wait_for_shutdown
+
+    def display_change_iteration():
+        with pl.lock:
+            holding.set()
+            pl._display_changed_event = True
+            if shutdown_begins == "before_reset":
+                wait_for_shutdown()
+            pl._check_display_changed()
+
+    pl._check_display_conf_thread, outcome = _run_in_monitor_thread(
+        display_change_iteration
+    )
+    assert holding.wait(5)
+    assert ready_for_shutdown.wait(5)
+    pl.shutdown()
+    pl._check_display_conf_thread.join(5)
+
+    assert outcome == {"result": None}
+    assert waited == [True]
+    assert harness.names() == ["writecfg", "wcs_shutdown", "teardown_ui"]
+    # Every fix undone; nothing fixed again
+    assert store.associations == original
+    assert ("set", "a0", "goodA.icc") not in store.writes[2:]
+    assert ("set", "b0", "goodB.icc") not in store.writes[2:]
 
 
 class _RecordingGDI32:
@@ -1751,6 +1902,9 @@ class _FakeDevice:
     def __init__(self, devicekey):
         self.DeviceKey = devicekey
         self.DeviceID = devicekey
+        self.DeviceName = devicekey
+        self.DeviceString = devicekey
+        self.StateFlags = 0
 
 
 def _wcs_write_fails(*args, **kwargs):
