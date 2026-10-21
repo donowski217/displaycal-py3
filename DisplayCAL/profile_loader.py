@@ -40,7 +40,12 @@ from DisplayCAL.config import (
     getcfg,
     setcfg,
 )
-from DisplayCAL.debughelpers import Error, UnloggedError, handle_error
+from DisplayCAL.debughelpers import (
+    Error,
+    UnloggedError,
+    handle_error,
+    log_error_traceback,
+)
 from DisplayCAL.edid import get_edid
 from DisplayCAL.icc_profile import (
     ADict,
@@ -1011,7 +1016,7 @@ class ProfileAssociationsDialog(InfoDialog):
                 profile = ICCProfile(pth)
             except ICCProfileInvalidError as exception:
                 print(f"{pth}:", exception)
-                traceback.print_exc()
+                log_error_traceback()
                 continue
             except OSError as exception:
                 print(exception)
@@ -3318,19 +3323,27 @@ class ProfileLoader:
 
         Errors in individual iterations are handled (logged and retried) by
         :meth:`_check_display_conf` itself. Anything that still escapes it is
-        logged here and handed to the GUI thread as a fatal error.
+        handed to the GUI thread as a fatal error, whose ``handle_error()``
+        logs the traceback (once), or only logged if shutting down.
         """
         try:
             self._check_display_conf()
         except Exception as exception:
-            # Log the real traceback while it is still available
-            traceback.print_exc()
             # Note that self.lock is NOT released here: the monitoring loop
             # only ever holds it inside a "with" block, so it has already been
             # released. Releasing it here could only free a lock held by
             # another thread (the GUI thread or ProcessDisplayChangedEvent).
             if not self._shutdown:
-                self._post_to_gui_thread(self._handle_fatal_error, exception)
+                try:
+                    # handle_error() logs the traceback (from the exception
+                    # itself), so it is not logged here as well
+                    self._post_to_gui_thread(self._handle_fatal_error, exception)
+                except Exception:
+                    log_error_traceback()
+                else:
+                    return
+            # handle_error() will not run: log the traceback here
+            log_error_traceback(exception)
 
     def _handle_fatal_error(self, exception: Exception) -> None:
         handle_error(exception)
@@ -3550,7 +3563,9 @@ class ProfileLoader:
         tb = traceback.format_exc()
         if tb != getattr(self, "_last_monitor_traceback", None):
             self._last_monitor_traceback = tb
-            traceback.print_exc()
+            # Handled: into the app log as one record (not line by line
+            # through stderr)
+            log_error_traceback()
         else:
             print(
                 "Display configuration monitoring error (same as before):",
@@ -4586,7 +4601,7 @@ class ProfileLoader:
                 self._reset_display_profile_associations()
             except Exception:
                 # Still write the configuration and remove the tray icon
-                traceback.print_exc()
+                log_error_traceback()
         self.writecfg()
         if self._is_gui_thread():
             self._teardown_ui()

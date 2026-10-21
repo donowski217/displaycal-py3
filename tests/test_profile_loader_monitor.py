@@ -329,6 +329,116 @@ def test_failed_display_change_is_redone(monkeypatch):
     assert not harness.fatal_posted
 
 
+@pytest.fixture
+def frozen_stderr(monkeypatch):
+    """Emulate a windowed (frozen) build's stderr and app log.
+
+    There, sys.stderr is the app log redirector (log.StdioToLog), which
+    records each line written to it as its own log record. Handled errors
+    should instead be recorded as one record via log.log_error(), which is
+    recorded here (``records``); writes to stderr are in ``writes``.
+
+    Use ``with frozen_stderr:`` in the test body to install the stream
+    (pytest's output capturing re-installs its own sys.stderr when the test
+    call starts, so it cannot be done in the fixture).
+    """
+    from DisplayCAL import log
+
+    class LogStream:
+        is_log_stream = True
+
+        def __init__(self):
+            self.writes = []
+            self.records = []
+            self._saved = None
+
+        def write(self, text):
+            self.writes.append(text)
+            return len(text)
+
+        def flush(self):
+            pass
+
+        def __enter__(self):
+            self._saved = sys.stderr
+            sys.stderr = self
+            return self
+
+        def __exit__(self, *exc_info):
+            sys.stderr = self._saved
+
+    stream = LogStream()
+    monkeypatch.setattr(
+        log, "log_error", lambda text: stream.records.append(text) or True
+    )
+    return stream
+
+
+def test_recovered_error_traceback_is_one_log_record(monkeypatch, frozen_stderr):
+    harness = MonitorHarness(monkeypatch, [RuntimeError("transient"), STOP])
+    with frozen_stderr:
+        harness.run()
+
+    assert not harness.fatal_posted
+    assert len(frozen_stderr.records) == 1
+    assert "RuntimeError: transient" in frozen_stderr.records[0]
+    assert "Traceback" in frozen_stderr.records[0]
+    assert frozen_stderr.writes == []
+
+
+def test_fatal_error_traceback_is_left_to_handle_error(monkeypatch, frozen_stderr):
+    """handle_error() on the GUI thread logs it: not twice."""
+    harness = MonitorHarness(monkeypatch, [])
+
+    def check_display_conf():
+        raise RuntimeError("fatal")
+
+    harness.pl._check_display_conf = check_display_conf
+    with frozen_stderr:
+        harness.run()
+
+    assert harness.fatal_posted
+    assert frozen_stderr.records == []
+    assert frozen_stderr.writes == []
+
+
+def test_fatal_error_while_shutting_down_is_logged(monkeypatch, frozen_stderr):
+    """No error dialog then, so the traceback is logged right away."""
+    harness = MonitorHarness(monkeypatch, [])
+    harness.pl._shutdown = True
+
+    def check_display_conf():
+        raise RuntimeError("fatal during shutdown")
+
+    harness.pl._check_display_conf = check_display_conf
+    with frozen_stderr:
+        harness.run()
+
+    assert harness.posted == []
+    assert len(frozen_stderr.records) == 1
+    assert "RuntimeError: fatal during shutdown" in frozen_stderr.records[0]
+    assert frozen_stderr.writes == []
+
+
+def test_handled_errors_are_not_printed_with_print_exc():
+    """traceback.print_exc() writes handled errors to stderr, line by line."""
+    import ast
+    import inspect
+
+    from DisplayCAL import systrayicon
+
+    for module in (profile_loader, systrayicon):
+        tree = ast.parse(inspect.getsource(module))
+        print_exc_lines = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "print_exc"
+        ]
+        assert print_exc_lines == [], module.__name__
+
+
 def test_backoff_grows_and_is_capped(monkeypatch, capsys):
     error = RuntimeError("transient")
     harness = MonitorHarness(monkeypatch, [error] * 7 + [STOP])
@@ -800,6 +910,21 @@ def test_shutdown_still_writes_config_if_reset_fails(monkeypatch, capsys):
     assert "TimeoutError" in capsys.readouterr().err
 
 
+def test_shutdown_logs_failed_reset_as_one_record(monkeypatch, frozen_stderr):
+    harness = ShutdownHarness(monkeypatch)
+
+    def reset_display_profile_associations():
+        raise TimeoutError("WCS worker did not answer")
+
+    harness.pl._reset_display_profile_associations = reset_display_profile_associations
+    with frozen_stderr:
+        harness.pl.shutdown()
+
+    assert len(frozen_stderr.records) == 1
+    assert "TimeoutError: WCS worker did not answer" in frozen_stderr.records[0]
+    assert frozen_stderr.writes == []
+
+
 def test_forced_shutdown_shuts_down_before_closing_frame(monkeypatch):
     harness = ShutdownHarness(monkeypatch)
 
@@ -1061,9 +1186,7 @@ def test_registry_access_denied_uses_fallback_without_warning(
     )
     monkeypatch.setattr(profile_loader, "lang", _FakeLang(), raising=False)
     association_calls = []
-    pl._enumerate_monitors = lambda: setattr(
-        pl, "_active_displays", list(display_keys)
-    )
+    pl._enumerate_monitors = lambda: setattr(pl, "_active_displays", list(display_keys))
     pl._set_display_profiles = lambda dry_run=False: association_calls.append("set")
     pl._reset_display_profile_associations = lambda: association_calls.append("reset")
     pl._is_displaycal_running = lambda: False

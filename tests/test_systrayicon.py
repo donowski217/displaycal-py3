@@ -102,6 +102,45 @@ def test_regular_handlers_still_return_their_values(make_tray_icon, capsys):
     assert make_tray_icon.excepthook_calls == []
 
 
+def test_handler_exception_is_one_app_log_record(monkeypatch):
+    """In a windowed build, not line by line through stderr (the app log)."""
+    from DisplayCAL import log
+
+    class LogStream:
+        is_log_stream = True
+
+        def __init__(self):
+            self.writes = []
+
+        def write(self, text):
+            self.writes.append(text)
+            return len(text)
+
+        def flush(self):
+            pass
+
+    stream = LogStream()
+    records = []
+    monkeypatch.setattr(log, "log_error", lambda text: records.append(text) or True)
+
+    def handler(hwnd, msg, wparam, lparam):
+        raise RuntimeError("boom in handler")
+
+    # Not via monkeypatch in a fixture: pytest's output capturing installs its
+    # own sys.stderr when the test call starts
+    saved_stderr = sys.stderr
+    sys.stderr = stream
+    try:
+        result = systrayicon._safe_wndproc(handler)(0, 0, 0, 0)
+    finally:
+        sys.stderr = saved_stderr
+
+    assert result == 0
+    assert len(records) == 1
+    assert "RuntimeError: boom in handler" in records[0]
+    assert stream.writes == []
+
+
 @pytest.mark.parametrize(
     ("result", "expected"),
     [(None, 0), (0, 0), (1, 1), (True, 1), (False, 0), (-1, -1), ("x", 0)],
