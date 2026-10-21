@@ -394,9 +394,7 @@ def _set_remote_language(display_cal, loader, monkeypatch):
     frame.set_remote_language()
 
 
-def test_set_remote_language_updates_loader(
-    display_cal, loader, monkeypatch, capsys
-):
+def test_set_remote_language_updates_loader(display_cal, loader, monkeypatch, capsys):
     """setlanguage gets through and the notify command is sent."""
     _set_remote_language(display_cal, loader, monkeypatch)
 
@@ -413,9 +411,7 @@ def test_set_remote_language_loader_accepts_notify(
     """The loader accepts the notify command and updates its text."""
     _set_remote_language(display_cal, loader, monkeypatch)
 
-    text = display_cal.lang.getstr(
-        "app.detected.calibration_loading_disabled", APPNAME
-    )
+    text = display_cal.lang.getstr("app.detected.calibration_loading_disabled", APPNAME)
     assert loader.notifications == [([text], True, False)]
     assert "couldn't update profile loader" not in capsys.readouterr().out
 

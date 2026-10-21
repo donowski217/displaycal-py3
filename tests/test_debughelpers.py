@@ -158,9 +158,7 @@ def _excepthook(etype, value, tb) -> None:
     handle_error((etype, value, tb))
 
 
-def test_handle_error_in_sys_excepthook_called_by_pyerr_print(
-    app_log, dialogs, capsys
-):
+def test_handle_error_in_sys_excepthook_called_by_pyerr_print(app_log, dialogs, capsys):
     """C code reports errors via PyErr_Print() -> sys.excepthook.
 
     Inside the hook, no exception is being handled (sys.exc_info() is empty).

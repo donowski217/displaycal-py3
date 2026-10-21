@@ -257,9 +257,7 @@ def test_probe_gives_up_on_silent_foreign_listener(main, server, monkeypatch):
     assert asked == [fake.port]
 
 
-def test_probe_waits_for_our_instance_that_is_still_starting(
-    main, server, monkeypatch
-):
+def test_probe_waits_for_our_instance_that_is_still_starting(main, server, monkeypatch):
     """An instance listens early, but only replies once its UI is set up.
 
     That can take longer than the probe's time limit (splash screen, display

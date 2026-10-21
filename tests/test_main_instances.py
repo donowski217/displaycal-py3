@@ -124,9 +124,7 @@ def test_launcher_does_not_give_the_loader_pipes():
     non-frozen loader would then raise OSError.
     """
     tree = ast.parse(
-        (SCRIPTS_DIR / "displaycal-apply-profiles-launcher").read_text(
-            encoding="utf-8"
-        )
+        (SCRIPTS_DIR / "displaycal-apply-profiles-launcher").read_text(encoding="utf-8")
     )
     popen_calls = [
         node
