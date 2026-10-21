@@ -141,11 +141,11 @@ else:
         """Stub for non-Windows platforms."""
         return False
 
-    def invalidate_per_user_profiles_cache(devicekey: None | str = None) -> None:
+    def invalidate_per_user_profiles_cache(devicekey: str | None = None) -> None:
         """Stub for non-Windows platforms."""
 
     def cached_per_user_profiles(
-        max_age: None | float = None,
+        max_age: float | None = None,
     ) -> contextlib.AbstractContextManager[None]:
         """Stub for non-Windows platforms."""
         return contextlib.nullcontext()
@@ -3061,11 +3061,11 @@ class ProfileLoader:
         self.numwindows = numwindows
         return True
 
-    def _count_own_top_level_windows(self) -> None | int:
+    def _count_own_top_level_windows(self) -> int | None:
         """Count our own top-level windows. Must be called on the GUI thread.
 
         Returns:
-            None | int: The number of windows, or None if it could not be
+            int | None: The number of windows, or None if it could not be
                 determined.
         """
         try:
@@ -3076,7 +3076,7 @@ class ProfileLoader:
                 print("Could not enumerate own top-level windows:", exception)
             return None
 
-    def _count_own_top_level_windows_on_gui_thread(self) -> None | int:
+    def _count_own_top_level_windows_on_gui_thread(self) -> int | None:
         """Have the GUI thread count our own top-level windows.
 
         At most one request is outstanding at any time. If the GUI thread does
@@ -3085,7 +3085,7 @@ class ProfileLoader:
         the next call.
 
         Returns:
-            None | int: The number of windows, or None if it could not be
+            int | None: The number of windows, or None if it could not be
                 determined in time.
         """
         request = self._window_count_request
@@ -3095,7 +3095,7 @@ class ProfileLoader:
                 # to stop processing them
                 return None
             done = threading.Event()
-            result: list[None | int] = [None]
+            result: list[int | None] = [None]
 
             def count() -> None:
                 try:
@@ -3263,14 +3263,13 @@ class ProfileLoader:
                         Warning,
                         stacklevel=2,
                     )
-        if key is None:
-            # get_active_display_devices takes around 3-10ms in contrast to
-            # querying registry which takes 1-3ms
-            if (
-                not self._active_displays
-                or self._active_displays != get_active_display_devices("DeviceKey")
-            ):
-                has_display_changed = True
+        # Without the registry key: get_active_display_devices takes around
+        # 3-10ms in contrast to querying registry which takes 1-3ms
+        if key is None and (
+            not self._active_displays
+            or self._active_displays != get_active_display_devices("DeviceKey")
+        ):
+            has_display_changed = True
         for i in range(numsubkeys):
             try:
                 subkey_name = winreg.EnumKey(key, i)
@@ -5293,7 +5292,7 @@ class ProfileLoader:
         for devicekey, entry in list(self.devices2profiles.items()):
             if not force and self._must_stop_writing():
                 break
-            display_edid, profile, desc = entry
+            display_edid, profile, _desc = entry
             if devicekey not in self._fixed_profile_associations or not profile:
                 continue
             try:
