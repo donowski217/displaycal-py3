@@ -2076,6 +2076,10 @@ class ProfileLoader:
     GUI_REQUEST_TIMEOUT = 1.0
     #: How long shutdown() waits for the monitoring thread to exit (seconds).
     MONITOR_JOIN_TIMEOUT = 10.0
+    #: How long shutdown() then waits for self.lock (held by a monitoring
+    #: iteration that outlived the wait above) before it skips resetting the
+    #: fixed profile associations (seconds).
+    SHUTDOWN_LOCK_TIMEOUT = 2.0
     #: How often exit() retries leaving the main loop while a modal dialog's
     #: nested event loop is still active (milliseconds).
     EXIT_RETRY_MS = 50
@@ -2086,6 +2090,10 @@ class ProfileLoader:
         self.lock = threading.Lock()
         self._is_other_running_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
+        # Set once shutdown() has finished (see _finish_shutdown_on_gui_thread)
+        self._shutdown_done = threading.Event()
+        self._shutdown_thread = None
+        self._ui_torn_down = False
         self.monitoring = True
         # Whether a persistent tray icon is active on this platform/toolkit.
         # Set True by setup_taskbar_icon() (wx, win32-only) or overridden by
@@ -3672,6 +3680,9 @@ class ProfileLoader:
         profile_associations_changed = 0
         apply_profiles = self._should_apply_profiles()
         for i, (display, _edid, moninfo, device) in enumerate(self.monitors):
+            if self._must_stop_writing():
+                # Shutting down: leave the remaining displays alone
+                break
             display_desc = display.replace("[PRIMARY]", lang.getstr("display.primary"))
             devicekey = device.DeviceKey if device else None
             key = devicekey or str(i)
@@ -3836,6 +3847,9 @@ class ProfileLoader:
                 desc,
                 hwnds_pids_changed,
             )
+            if self._must_stop_writing():
+                # Shutdown began during this iteration: no gamma ramp changes
+                break
             try:
                 hdc = win32gui.CreateDC(moninfo["Device"], None, None)
             except Exception as exception:
@@ -4608,33 +4622,113 @@ class ProfileLoader:
     def shutdown(self) -> None:
         """Shut down the profile loader.
 
-        Runs at most once. Stops the display configuration monitoring thread
-        and waits (up to ``MONITOR_JOIN_TIMEOUT`` seconds) for it to exit, so
-        it does not keep running into interpreter finalization, then resets
-        the fixed profile associations, writes the configuration and tears
-        down the UI. Normally called on the GUI thread from the application's
-        exit handlers. The UI is only ever torn down on the GUI thread.
+        Runs at most once. Stops the display configuration monitoring thread,
+        writes the configuration (first: it does not depend on the WCS worker
+        process, and at the end of a session there may be little time left),
+        waits (up to ``MONITOR_JOIN_TIMEOUT`` seconds) for the monitoring
+        thread to exit, resets the fixed profile associations and tears down
+        the UI.
+
+        The association reset holds ``self.lock``, so it never interleaves
+        with a monitoring iteration that outlived the wait (e.g. stalled in a
+        WCS worker call). If the lock cannot be taken within
+        ``SHUTDOWN_LOCK_TIMEOUT`` seconds, the reset is skipped (and logged).
+        Once shutdown has begun, the monitoring thread writes neither profile
+        associations nor gamma ramps any more (see
+        :meth:`_must_stop_writing`), so it cannot undo the reset either.
+
+        Normally called on the GUI thread from the application's exit
+        handlers. The UI is only ever torn down on the GUI thread: when called
+        on another thread, the teardown is posted to the GUI thread, and a
+        GUI-thread call made meanwhile waits for that shutdown to finish and
+        tears down the UI itself (the posted teardown may never run once the
+        main loop has ended).
         """
         with self._shutdown_lock:
-            if self._shutdown:
-                return
+            first_call = not self._shutdown
             self._shutdown = True
-        print("Shutting down profile loader")
-        if self.monitoring:
-            print("Shutting down display configuration monitoring thread")
-            self.monitoring = False
-        self._join_monitoring_thread()
-        if getcfg("profile_loader.fix_profile_associations"):
+            if first_call:
+                self._shutdown_thread = threading.current_thread()
+        if not first_call:
+            if (
+                self._is_gui_thread()
+                and self._shutdown_thread is not threading.current_thread()
+            ):
+                self._finish_shutdown_on_gui_thread()
+            return
+        try:
+            print("Shutting down profile loader")
+            if self.monitoring:
+                print("Shutting down display configuration monitoring thread")
+                self.monitoring = False
             try:
-                self._reset_display_profile_associations()
+                self.writecfg()
             except Exception:
-                # Still write the configuration and remove the tray icon
+                # Still reset the associations and remove the tray icon
                 log_error_traceback()
-        self.writecfg()
+            self._join_monitoring_thread()
+            if getcfg("profile_loader.fix_profile_associations"):
+                self._reset_associations_on_shutdown()
+        finally:
+            self._shutdown_done.set()
         if self._is_gui_thread():
-            self._teardown_ui()
+            self._teardown_ui_once()
         else:
-            self._post_to_gui_thread(self._teardown_ui)
+            self._post_to_gui_thread(self._teardown_ui_once)
+
+    def _reset_associations_on_shutdown(self) -> None:
+        """Reset the fixed profile associations, holding ``self.lock``.
+
+        Skipped if a monitoring iteration still holds the lock after
+        ``SHUTDOWN_LOCK_TIMEOUT`` seconds (rather than interleaving with it).
+        """
+        if not self.lock.acquire(timeout=self.SHUTDOWN_LOCK_TIMEOUT):
+            print(
+                "Display configuration monitoring is still busy, not resetting "
+                "profile associations"
+            )
+            return
+        try:
+            self._reset_display_profile_associations(force=True)
+        except Exception:
+            # Still remove the tray icon
+            log_error_traceback()
+        finally:
+            self.lock.release()
+
+    def _finish_shutdown_on_gui_thread(self) -> None:
+        """Complete a shutdown that another thread started, on the GUI thread.
+
+        Waits for that shutdown to finish, then tears down the UI unless the
+        teardown that it posted to the GUI thread has already run.
+        """
+        timeout = self.MONITOR_JOIN_TIMEOUT + self.SHUTDOWN_LOCK_TIMEOUT + 5
+        if not self._shutdown_done.wait(timeout):
+            print("Shutdown on another thread is taking long, removing the UI now")
+        self._teardown_ui_once()
+
+    def _teardown_ui_once(self) -> None:
+        """Tear down the UI (see :meth:`_teardown_ui`) unless already done."""
+        if self._ui_torn_down:
+            return
+        self._ui_torn_down = True
+        self._teardown_ui()
+
+    def _must_stop_writing(self) -> bool:
+        """Return whether the calling thread must not change displays any more.
+
+        Once shutdown has begun (or monitoring was stopped), the display
+        configuration monitoring thread must write neither profile
+        associations nor gamma ramps: :meth:`shutdown` resets the
+        associations it fixed, and an iteration that outlived shutdown's wait
+        for it (e.g. stalled in a WCS worker call) would otherwise fix them
+        again after the reset, or reload calibration while the loader exits.
+        The GUI thread (the tray menu, shutdown itself) is not affected.
+
+        Returns:
+            bool: True if a non-GUI caller must stop changing displays.
+        """
+        return not self._is_gui_thread() and (self._shutdown or not self.monitoring)
 
     def _join_monitoring_thread(self) -> None:
         """Wait for the display configuration monitoring thread to exit."""
@@ -5152,12 +5246,21 @@ class ProfileLoader:
         with self.lock:
             self._next = True
 
-    def _reset_display_profile_associations(self) -> None:
-        """Reset display profile associations for all monitors."""
+    def _reset_display_profile_associations(self, force: bool = False) -> None:
+        """Reset display profile associations for all monitors.
+
+        Args:
+            force (bool): Reset even when called on the monitoring thread
+                after shutdown has begun (see :meth:`_must_stop_writing`), as
+                shutdown itself does.
+        """
         if not self._can_fix_profile_associations():
             return
-        for devicekey in self.devices2profiles:
-            display_edid, profile, desc = self.devices2profiles[devicekey]
+        # A copy: the monitoring thread may rebuild the mapping meanwhile
+        for devicekey, entry in list(self.devices2profiles.items()):
+            if not force and self._must_stop_writing():
+                break
+            display_edid, profile, desc = entry
             if devicekey not in self._fixed_profile_associations or not profile:
                 continue
             try:
@@ -5176,6 +5279,9 @@ class ProfileLoader:
             current_profile = os.path.basename(current_profile)
             if not current_profile or current_profile == profile:
                 continue
+            if not force and self._must_stop_writing():
+                # Shutdown began while the association was being read
+                break
             print(
                 f"Resetting profile association for {display_edid[0]}:",
                 current_profile,
@@ -5209,6 +5315,8 @@ class ProfileLoader:
         debug_print("")
         self.devices2profiles = {}
         for i, (display, _edid, moninfo, _device) in enumerate(self.monitors):
+            if self._must_stop_writing():
+                break
             debug_print(
                 f"Enumerating display devices for monitor {i:d} {moninfo['Device']}"
             )
@@ -5326,6 +5434,11 @@ class ProfileLoader:
         device = devices[0]
         current_profile = self.devices2profiles[device.DeviceKey][1]
         if correct_profile and current_profile != correct_profile and not dry_run:
+            if self._must_stop_writing():
+                # Shutdown began (e.g. while the association was being read):
+                # do not fix it again after shutdown's reset
+                print(f"Not fixing profile association for {display}: exiting")
+                return
             print(
                 f"Fixing profile association for {display}:",
                 current_profile,
