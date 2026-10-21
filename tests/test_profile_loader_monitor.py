@@ -787,3 +787,61 @@ def test_reset_display_profile_associations_survives_wcs_errors(monkeypatch):
     pl._reset_display_profile_associations()
 
     assert unset_calls == []
+
+
+# --- GraphicsDrivers\Configuration registry key not accessible --------------
+
+
+class _FakeLang:
+    @staticmethod
+    def getstr(name, *args):
+        return name
+
+
+def test_registry_access_denied_uses_fallback_without_warning(
+    monkeypatch, recwarn, capsys
+):
+    pl = _make_pl()
+    pl._display_changed_event = False
+    pl._active_displays = []
+    display_keys = ["key-a", "key-b"]
+    open_calls = []
+
+    def open_key(*args):
+        open_calls.append(args)
+        raise PermissionError(13, "Access is denied", None, 5)
+
+    monkeypatch.setattr(profile_loader.winreg, "OpenKey", open_key)
+    monkeypatch.setattr(
+        profile_loader, "get_active_display_devices", lambda attr: list(display_keys)
+    )
+    monkeypatch.setattr(
+        profile_loader,
+        "getcfg",
+        lambda name, *args, **kwargs: (
+            1 if name == "profile_loader.fix_profile_associations" else 0
+        ),
+    )
+    monkeypatch.setattr(profile_loader, "lang", _FakeLang(), raising=False)
+    association_calls = []
+    pl._enumerate_monitors = lambda: setattr(
+        pl, "_active_displays", list(display_keys)
+    )
+    pl._set_display_profiles = lambda dry_run=False: association_calls.append("set")
+    pl._reset_display_profile_associations = lambda: association_calls.append("reset")
+    pl._is_displaycal_running = lambda: False
+
+    results = []
+    for first_run, added_display in ((True, None), (False, None), (False, "key-c")):
+        if added_display:
+            display_keys.append(added_display)
+        pl._display_changed_event = True
+        # Always the same caller line, so warnings' once-per-location
+        # de-duplication cannot hide a warning
+        results.append(pl._check_display_changed(first_run))
+
+    assert results == [True, False, True]
+    assert association_calls == ["set", "reset", "set"]
+    assert len(open_calls) == 1
+    assert not [w for w in recwarn if "Registry access failed" in str(w.message)]
+    assert capsys.readouterr().out.count("is not accessible") == 1

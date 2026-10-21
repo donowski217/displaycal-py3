@@ -2092,6 +2092,9 @@ class ProfileLoader:
         # see _calibration_management_isenabled()
         self._calibration_management_state = None
         self._last_wcs_error = None
+        # Whether the GraphicsDrivers\Configuration registry key turned out to
+        # be inaccessible (see _check_display_changed)
+        self._display_conf_key_unavailable = False
         self._shutdown = False
         self._skip = "--skip" in sys.argv[1:]
         apply_profiles = bool(
@@ -2424,7 +2427,9 @@ class ProfileLoader:
                             # screen), see issue #694.
                             if not verify_load:
                                 break
-                            if not worker.calibration_is_clobbered(dispwin, i, profile_arg):
+                            if not worker.calibration_is_clobbered(
+                                dispwin, i, profile_arg
+                            ):
                                 # Loaded OK (or could not be determined)
                                 break
                             if attempt + 1 < max_attempts:
@@ -3191,19 +3196,33 @@ class ProfileLoader:
         has_display_changed = False
         ts = time.time()
         key_name = r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Configuration"
-        try:
-            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_name)
-            numsubkeys, numvalues, mtime = winreg.QueryInfoKey(key)
-        except OSError as exception:
-            # Windows XP or Win10 >= 1903 if not running elevated
-            if exception.args[0] != errno.ENOENT or sys.getwindowsversion() >= (6,):
-                warnings.warn(
-                    rf"Registry access failed: {exception}: HKLM\{key_name}",
-                    Warning,
-                    stacklevel=2,
-                )
-            key = None
-            numsubkeys = 0
+        key = None
+        numsubkeys = 0
+        if not getattr(self, "_display_conf_key_unavailable", False):
+            try:
+                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_name)
+                numsubkeys, numvalues, mtime = winreg.QueryInfoKey(key)
+            except OSError as exception:
+                key = None
+                numsubkeys = 0
+                if exception.errno in (errno.ENOENT, errno.EACCES):
+                    # Windows XP, or Win10 >= 1903 if not running elevated
+                    # (access denied for every access mask). This is expected,
+                    # so don't warn. It won't change while we are running, so
+                    # remember it and say once which detection method is used.
+                    self._display_conf_key_unavailable = True
+                    print(
+                        rf"Registry key HKLM\{key_name} is not accessible "
+                        f"({exception}). Detecting display configuration "
+                        "changes by comparing active display device keys."
+                    )
+                else:
+                    warnings.warn(
+                        rf"Registry access failed: {exception}: HKLM\{key_name}",
+                        Warning,
+                        stacklevel=2,
+                    )
+        if key is None:
             # get_active_display_devices takes around 3-10ms in contrast to
             # querying registry which takes 1-3ms
             if (
