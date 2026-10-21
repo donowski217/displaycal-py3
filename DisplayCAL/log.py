@@ -1162,8 +1162,10 @@ def redirect_stdio_to_log() -> bool:
     DisplayCAL's diagnostic output), and sys.stderr is py2exe's Stderr shim,
     an untimestamped log file in %APPDATA%. Under pythonw both are None. Only
     such streams are replaced with StdioToLog: sys.stdout with level INFO,
-    sys.stderr with level ERROR (still also written to the py2exe shim, so
-    its log and its "Errors in..." message at exit keep working). Console
+    sys.stderr with level ERROR. The py2exe shim only still gets text the
+    application log cannot take (no file handler, a failing logging handler,
+    interpreter finalization), so errors that are already in the timestamped
+    log do not also arm py2exe's "Errors in ..." message box at exit. Console
     runs, pytest and Linux/macOS terminals are not affected.
 
     Does nothing if there is no application log file handler (yet), and
@@ -1179,7 +1181,7 @@ def redirect_stdio_to_log() -> bool:
         sys.stdout = StdioToLog(logging.INFO, sys.stdout)
         redirected.append(sys.stdout)
     if _discards_output(sys.stderr, "Stderr"):
-        sys.stderr = StdioToLog(logging.ERROR, sys.stderr, passthrough=True)
+        sys.stderr = StdioToLog(logging.ERROR, sys.stderr)
         redirected.append(sys.stderr)
     if redirected:
         if not _STDIO_LOG_STREAMS:

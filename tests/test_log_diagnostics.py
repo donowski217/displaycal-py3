@@ -271,8 +271,9 @@ def test_redirect_stdio_to_log_in_windowed_build(stdio_env):
     text = env.path.read_text(encoding="utf-8")
     assert "Acquired lock file: banner 42" in text
     assert "Traceback line on stderr" in text
-    # py2exe's stderr log (and its message at exit) keep working
-    assert "".join(env.shim.written) == "Traceback line on stderr\n"
+    # Text the app log took does not also go to py2exe's stderr log, whose
+    # first write arms an "Errors in ..." message box at exit
+    assert env.shim.written == []
     assert env.blackhole.written == []
     assert env.atexit_registered == [log._flush_stdio_log_streams]
 
@@ -477,7 +478,7 @@ def test_thread_exception_reaches_app_log(stdio_env):
     assert "Exception in thread OtherThread" in text
     assert "_raise_in_thread" in text
     assert "RuntimeError: thread boom" in text
-    assert "RuntimeError: thread boom" in "".join(stdio_env.shim.written)
+    assert "RuntimeError: thread boom" not in "".join(stdio_env.shim.written)
 
 
 class _RaisesInDel:
