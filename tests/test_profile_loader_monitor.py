@@ -338,6 +338,16 @@ def test_backoff_grows_and_is_capped(monkeypatch, capsys):
     assert not harness.fatal_posted
 
 
+def test_backoff_still_notices_request_to_exit(monkeypatch):
+    harness = MonitorHarness(monkeypatch, [RuntimeError("transient"), STOP])
+    harness.pl._check_keep_running = lambda: False
+    harness.run()
+
+    assert harness.calls == 1
+    assert harness.pl.monitoring is False
+    assert [func.__name__ for func in harness.posted] == ["_request_forced_shutdown"]
+
+
 def test_identical_tracebacks_are_logged_once(monkeypatch, capsys):
     def raise_same_error():
         raise RuntimeError("same")

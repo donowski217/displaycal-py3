@@ -3472,12 +3472,24 @@ class ProfileLoader:
             and not self._manual_restore
             and not self._next
         ):
-            if round(timeout * 100) % 25 == 0 and not self._check_keep_running():
-                self.monitoring = False
-                self._post_to_gui_thread(self._request_forced_shutdown)
+            if round(timeout * 100) % 25 == 0 and self._stop_if_asked_to_exit():
                 break
             time.sleep(0.1)
             timeout += 0.1
+
+    def _stop_if_asked_to_exit(self) -> bool:
+        """Stop monitoring if something external asked us to exit.
+
+        If so, a forced shutdown is requested on the GUI thread.
+
+        Returns:
+            bool: True if monitoring was stopped.
+        """
+        if self._check_keep_running():
+            return False
+        self.monitoring = False
+        self._post_to_gui_thread(self._request_forced_shutdown)
+        return True
 
     def _handle_monitor_error(self, failures: int, first_run: bool) -> int:
         """Handle an exception from a monitoring iteration.
@@ -3525,8 +3537,16 @@ class ProfileLoader:
             f"Display configuration monitoring: iteration failed ({failures} in a "
             f"row), retrying in {delay:.0f} s"
         )
+        # Back off in short slices, so stopping is not delayed, and keep
+        # noticing an external request to exit (e.g. at logoff)
         waited = 0.0
         while self and self.monitoring and waited < delay:
+            if round(waited * 100) % 50 == 0:
+                try:
+                    if self._stop_if_asked_to_exit():
+                        break
+                except Exception as exception:
+                    debug_print("Keep-running check failed:", exception)
             time.sleep(0.1)
             waited += 0.1
         return failures
