@@ -221,6 +221,7 @@ def test_monitoring_iterations_survive_persistent_wcs_errors(monkeypatch):
     pl._display_changed_event = False
     pl._active_displays = ["key0"]
     pl._hwnds_pids = set()
+    pl._program_pids = set()
     pl._ProfileLoader__apply_profiles = None
     pl._handle_profile_updates = lambda first_run, apply, running, *args: running
     pl._check_keep_running = lambda: True
