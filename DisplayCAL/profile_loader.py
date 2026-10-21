@@ -2418,7 +2418,8 @@ class ProfileLoader:
                                 if (
                                     sys.platform == "win32"
                                     or "Failed to set VideoLUT" in errortxt
-                                    or "We don't have access to the VideoLUT" in errortxt
+                                    or "We don't have access to the VideoLUT"
+                                    in errortxt
                                 ):
                                     errstr = lang.getstr("calibration.load_error")
                                 else:
