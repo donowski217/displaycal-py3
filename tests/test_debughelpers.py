@@ -136,13 +136,13 @@ def test_handle_error_from_excepthook_tuple(app_log, dialogs, capsys):
 
 def test_handle_error_from_wndproc_style_excepthook_tuple(app_log, dialogs, capsys):
     """pywin32 passes an error raised in C, i.e. without a traceback."""
-    exception = TypeError("WPARAM is simple, so must be an int object (got NoneType)")
+    message = "WPARAM is simple, so must be an int object (got NoneType)"
+    exception = TypeError(message)
 
     handle_error((TypeError, exception, None), silent=True)
 
     out, err = capsys.readouterr()
-    text = _log_text(app_log)
-    assert text == "TypeError: WPARAM is simple, so must be an int object (got NoneType)"
+    assert _log_text(app_log) == f"TypeError: {message}"
     assert not dialogs
     _assert_no_nonetype(out, err)
 

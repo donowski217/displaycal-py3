@@ -793,7 +793,9 @@ def _emit_to_app_log(level: int, msg: str) -> bool:
             return False
         _EMITTING.active = True
         try:
-            record = logging.LogRecord(LOGGER.name, level, __file__, 0, msg, None, None)
+            record = logging.LogRecord(
+                LOGGER.name, level, __file__, 0, msg, None, None
+            )
             for handler in handlers:
                 if record.levelno >= handler.level:
                     handler.handle(record)
