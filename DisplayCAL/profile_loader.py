@@ -265,9 +265,10 @@ def setup_profile_loader_task(exe: str, exedir: str, pydir: str) -> None:
                 triggers=[daily],
                 actions=actions,
             )
-        except Exception:
-            if DEBUG:
-                exception = traceback.format_exc()
+        except Exception as exc:
+            # "exception" is not bound here (the "as" name of an earlier
+            # handler is unbound when that handler ends)
+            exception = traceback.format_exc() if DEBUG else exc
             print(
                 f"Warning - Could not create task {taskname}:",
                 exception,
@@ -2931,10 +2932,7 @@ class ProfileLoader:
         Returns:
             str: The notification body text.
         """
-        if (
-            "--force" not in sys.argv[1:]
-            and self._calibration_management_isenabled()
-        ):
+        if "--force" not in sys.argv[1:] and self._calibration_management_isenabled():
             text = lang.getstr("calibration.load.handled_by_os") + "\n"
         else:
             text = ""
@@ -3649,17 +3647,21 @@ class ProfileLoader:
                 debug_print(f"Display {key} ({display}) no longer present?")
                 self._next = False
                 break
-            except Exception as exception:
-                if (
-                    exception.args[0] != errno.ENOENT
-                    and exception.args != self._last_exception_args
-                ) or DEBUG:
-                    self._last_exception_args = exception.args
+            except Exception as exc:
+                # Not "except ... as exception": Python unbinds the "as" name
+                # when the handler ends, and "exception" is used below (this
+                # used to raise UnboundLocalError for every error, e.g. a WCS
+                # worker timeout, and fail the whole monitoring iteration)
+                exception = exc
+                # args may be empty (e.g. a bare TimeoutError())
+                is_enoent = exc.args[:1] == (errno.ENOENT,)
+                if (not is_enoent and exc.args != self._last_exception_args) or DEBUG:
+                    self._last_exception_args = exc.args
                     print(
                         f"Could not get display profile for display {key} ({display}):",
-                        exception,
+                        exc,
                     )
-                if exception.args[0] == errno.ENOENT:
+                if is_enoent:
                     # Unassigned - don't show error icon
                     self.setgammaramp_success[i] = True
                     exception = None
