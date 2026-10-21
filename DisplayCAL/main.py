@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import errno
 import getpass
 import glob
@@ -12,7 +13,7 @@ import socket
 import subprocess as sp
 import sys
 import threading
-from time import sleep
+from time import monotonic, sleep
 from typing import TYPE_CHECKING, Any
 
 # Python version check
@@ -50,7 +51,7 @@ from DisplayCAL.config import (
     initcfg,
 )
 from DisplayCAL.debughelpers import ResourceError, handle_error
-from DisplayCAL.log import LOG
+from DisplayCAL.log import LOG, open_fault_log, write_fault_log_footer
 from DisplayCAL.meta import (
     NAME as APPNAME,
 )
@@ -129,8 +130,8 @@ def _main(
     with AppLock(
         app_lock_file_name, "a+", False, module in MULTI_INSTANCE_APP_NAMES
     ) as lock:
-        print(f"Acquired lock file: {lock}")
         LOG("=" * 80)
+        print(f"Acquired lock file: {lock}")
 
         print_system_version_information()
         initialize_fault_handler()
@@ -202,18 +203,29 @@ def print_system_version_information() -> None:
 
 
 def initialize_fault_handler() -> None:
-    """Initialize faulthandler to log crashes."""
+    """Initialize faulthandler to log crashes.
+
+    The fault log is appended to, with a header line for each process start
+    and a footer line at a normal exit, so the crash dump of a previous run
+    (or of another instance that is still running) is not wiped when the
+    application is started again.
+    """
     # Enable faulthandler
     try:
         import faulthandler
     except Exception as exception:
         print(exception)
     else:
+        label = f"{PYNAME}{RUNTYPE} {VERSION_STRING}"
         try:
-            faulthandler.enable(open(os.path.join(LOGDIR, f"{PYNAME}-fault.log"), "w"))  # noqa: SIM115
+            fault_log = open_fault_log(
+                os.path.join(LOGDIR, f"{PYNAME}-fault.log"), label
+            )
+            faulthandler.enable(fault_log, all_threads=True)
         except Exception as exception:
             print(exception)
         else:
+            atexit.register(write_fault_log_footer, fault_log, label)
             print("Faulthandler", getattr(faulthandler, "__version__", ""))
 
 
@@ -513,19 +525,7 @@ def connect_and_notify_running_instance(
         # Other instance already running?
         # Get appname to check if expected app is actually
         # running under that port
-        print("Getting instance name")
-        if appsocket.send("getappname"):
-            print("Sent scripting request, awaiting response...")
-            data_read = appsocket.read()
-            incoming = data_read.rstrip("\4")
-            print(f"Got response: {incoming!r}")
-            # translate incoming values
-            incoming = {
-                PYNAME: PYNAME,
-                False: False,
-                None: False,
-                "": False,
-            }.get(incoming)
+        incoming = get_running_instance_name(appsocket, port)
 
     while incoming:
         # Send args as UTF-8
@@ -558,6 +558,49 @@ def connect_and_notify_running_instance(
         break
     appsocket.close()
     return incoming
+
+
+def get_running_instance_name(appsocket: AppSocket, port: int) -> None | bool | str:
+    """Ask the instance listening on a port for its name ("getappname").
+
+    Args:
+        appsocket (AppSocket): Socket connected to the port.
+        port (int): The port.
+
+    Returns:
+        None | bool | str: PYNAME if our instance replied. False if the peer
+            closed the connection without a reply. None if the request could
+            not be sent, for any other reply (e.g. of a foreign service), or
+            if there was no reply in time and none of our processes listens
+            on the port.
+    """
+    print("Getting instance name")
+    if not appsocket.send("getappname"):
+        return None
+    print("Sent scripting request, awaiting response...")
+    data_read = appsocket.read(AppSocket.PROBE_TIMEOUT)
+    while data_read is None and is_port_of_running_instance(port):
+        # One of our instances listens on that port, but has not replied yet:
+        # e.g. it is still starting up (it listens early, but only accepts
+        # connections once its UI is set up). Keep waiting for it, without a
+        # time limit as before.
+        print("Waiting for the running instance to respond...")
+        data_read = appsocket.read(AppSocket.PROBE_TIMEOUT)
+    if data_read is None:
+        # No reply in time, and none of our processes listens on that port: a
+        # foreign service on a stale port from the lock file. Treated like any
+        # other unexpected reply.
+        return None
+    incoming = data_read.rstrip("\4")
+    print(f"Got response: {incoming!r}")
+    # translate incoming values. Anything else (e.g. the reply of a foreign
+    # service) means it is not one of our instances.
+    return {
+        PYNAME: PYNAME,
+        False: False,
+        None: False,
+        "": False,
+    }.get(incoming)
 
 
 def terminate_conflicting_instance(
@@ -615,6 +658,8 @@ def terminate_conflicting_instance(
             ) and basename_lower == pyexe_lower
             if not (is_pid_match or is_session_exe_match) or pid2 == opid:
                 continue
+            if not is_other_instance_process(pid2):
+                continue
             # Other instance running
             incoming = False
             if module != "apply-profiles":
@@ -632,6 +677,195 @@ def terminate_conflicting_instance(
             incoming = terminate_running_instance(incoming, pid2, startupinfo)
 
     return incoming
+
+
+def is_other_instance_process(pid: int) -> bool:
+    """Return whether a process with a matching executable is another instance.
+
+    A multiprocessing child (e.g. the profile loader's WCS worker, which in a
+    frozen build is another process of the same executable, started with
+    "--multiprocessing-fork") is not: it cannot be closed gracefully, and if
+    it was listed after its parent, its failed taskkill would override the
+    result, so that this instance would not start either. A process that has
+    exited in the meantime is not running either.
+
+    Args:
+        pid (int): The process ID.
+
+    Returns:
+        bool: False for a multiprocessing child or a process that no longer
+            exists, otherwise True (also if the process cannot be inspected).
+    """
+    try:
+        import psutil
+    except ImportError:
+        return True
+    try:
+        cmdline = psutil.Process(pid).cmdline()
+    except psutil.NoSuchProcess:  # Includes psutil.ZombieProcess
+        print(f"Process with PID {pid} no longer exists")
+        return False
+    except psutil.AccessDenied:
+        return True
+    except Exception as exception:
+        print(f"Warning - could not get command line of PID {pid}:", exception)
+        return True
+    if "--multiprocessing-fork" in cmdline:
+        print(f"Ignoring multiprocessing child process with PID {pid}")
+        return False
+    return True
+
+
+def is_port_of_running_instance(port: int) -> bool:
+    """Return whether another process of this application listens on a port.
+
+    Asked when the process listening on the port from a lock file does not
+    reply to "getappname" in time. That can be a foreign service which took
+    over the port of an instance that is gone, but also one of our instances
+    that is still starting up: it listens early, but only accepts connections
+    once its UI is set up (after the splash screen, display and instrument
+    enumeration, or first-run dialogs). A process counts as one of ours if its
+    name contains the application name (e.g. the frozen
+    DisplayCAL-apply-profiles.exe), or if it is a Python interpreter whose
+    command line does (a source install).
+
+    Args:
+        port (int): The TCP port.
+
+    Returns:
+        bool: True if another process of ours listens on the port, or if that
+            cannot be ruled out (no psutil, or a listener that cannot be
+            identified). False if none of our processes listens on it.
+    """
+    try:
+        import psutil
+    except ImportError:
+        print(f"Warning - cannot tell which process listens on port {port}")
+        return True
+    opid = os.getpid()
+    try:
+        pids = {
+            connection.pid
+            for connection in psutil.net_connections(kind="tcp")
+            if _is_listening_on(psutil, connection, port)
+        }
+    except Exception as exception:
+        # E.g. psutil.AccessDenied under macOS
+        print("Warning - could not list TCP connections:", exception)
+        pids = {None}
+    pids.discard(opid)
+    if None not in pids:
+        # Every listener is known (always the case under Windows)
+        verdicts = []
+        for pid in pids:
+            try:
+                verdicts.append(_is_application_process(psutil, psutil.Process(pid)))
+            except psutil.NoSuchProcess:  # Includes psutil.ZombieProcess
+                pass
+            except Exception:
+                verdicts.append(None)
+    else:
+        # Not allowed to see who listens (e.g. a process of another user):
+        # look at the connections of the processes that may be ours instead
+        verdicts = _get_listening_instances(psutil, port, opid)
+    if True in verdicts:
+        print(f"Port {port} belongs to a running instance")
+        return True
+    if None in verdicts:
+        print(f"Cannot rule out that a running instance listens on port {port}")
+        return True
+    print(f"Port {port} does not belong to a running instance")
+    return False
+
+
+def _is_listening_on(psutil: Any, connection: Any, port: int) -> bool:  # noqa: ANN401
+    """Return whether a psutil connection is a listening socket on a port.
+
+    Args:
+        psutil (module): The psutil module.
+        connection (Any): A connection as returned by psutil.
+        port (int): The TCP port.
+
+    Returns:
+        bool: True if the connection listens on the port.
+    """
+    return (
+        connection.status == psutil.CONN_LISTEN
+        and getattr(connection.laddr, "port", None) == port
+    )
+
+
+def _is_application_process(psutil: Any, process: Any) -> None | bool:  # noqa: ANN401
+    """Return whether a process is one of this application's.
+
+    Args:
+        psutil (module): The psutil module.
+        process (psutil.Process): The process.
+
+    Returns:
+        None | bool: True if the process name contains the application name,
+            or it is a Python interpreter whose command line does. None if
+            that cannot be told (no permission). Otherwise False.
+    """
+    appname_lower = APPNAME.lower()
+    try:
+        name = process.name().lower()
+        if appname_lower in name:
+            return True
+        if not name.startswith("python"):
+            return False
+        cmdline = process.cmdline()
+    except psutil.NoSuchProcess:  # Includes psutil.ZombieProcess
+        return False
+    except Exception:
+        return None
+    return any(appname_lower in arg.lower() for arg in cmdline)
+
+
+def _get_listening_instances(
+    psutil: Any,  # noqa: ANN401
+    port: int,
+    opid: int,
+) -> list[None | bool]:
+    """Look for processes that may be ours and listen on a port.
+
+    Args:
+        psutil (module): The psutil module.
+        port (int): The TCP port.
+        opid (int): Our PID, which is skipped.
+
+    Returns:
+        list[None | bool]: For every process that listens on the port (or
+            whose connections cannot be inspected) and may be ours, the result
+            of _is_application_process(), or None if its connections cannot be
+            inspected.
+    """
+    try:
+        processes = list(psutil.process_iter())
+    except Exception as exception:
+        print("Warning - could not enumerate processes:", exception)
+        return [None]
+    verdicts = []
+    for process in processes:
+        if process.pid == opid:
+            continue
+        is_ours = _is_application_process(psutil, process)
+        if is_ours is False:
+            continue
+        try:
+            # psutil >= 6.0 has net_connections(), older versions connections()
+            get_connections = getattr(process, "net_connections", None)
+            if get_connections is None:
+                get_connections = process.connections
+            connections = get_connections(kind="tcp")
+        except psutil.NoSuchProcess:  # Includes psutil.ZombieProcess
+            continue
+        except Exception:
+            verdicts.append(None)
+            continue
+        if any(_is_listening_on(psutil, c, port) for c in connections):
+            verdicts.append(is_ours)
+    return verdicts
 
 
 def create_dummy_lockfile(lockfilename: str) -> None:
@@ -1312,7 +1546,22 @@ class AppLock:
 class AppSocket:
     """Socket wrapper class."""
 
+    PROBE_TIMEOUT = 30.0
+    """Seconds to wait for the reply to "getappname" before checking who
+    listens on the port.
+
+    Without a limit, a foreign service that accepts the connection on a stale
+    port from the lock file but never replies would block startup forever.
+    When the time is up, connect_and_notify_running_instance() keeps waiting
+    (in steps of this length) as long as one of our processes listens on the
+    port (see is_port_of_running_instance()), because an instance that is
+    still starting up only replies once its UI is set up. Only this probe has
+    a time limit: e.g. the reply to "exit" may legitimately take long, and a
+    timeout there must not be mistaken for success."""
+
     def __init__(self) -> None:
+        # Bytes received by a read() that timed out, kept for the next read()
+        self._received = b""
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         except OSError as exception:
@@ -1356,26 +1605,59 @@ class AppSocket:
             return False
         return True
 
-    def read(self) -> str:
+    def read(self, timeout: None | float = None) -> None | str:
         """Read data until EOT character (ASCII 4) is found.
 
+        The received bytes are collected and decoded at the end, so a UTF-8
+        sequence split across two recv() calls is decoded correctly. Bytes
+        which are not valid UTF-8 (e.g. the reply of a foreign service which
+        listens on a stale port from a lock file) are escaped instead of
+        raising UnicodeDecodeError, and with "backslashreplace" (unlike
+        "replace") the result can be printed to any stdout encoding. Such a
+        reply never matches an application name.
+
+        Args:
+            timeout (None | float, optional): Give up after this many seconds
+                without the complete data. None (default) waits indefinitely.
+                The part received until then is kept for the next read().
+
         Returns:
-            str: Incoming data.
+            None | str: Incoming data (empty if the peer closed the connection
+                without sending anything, or on a socket error), or None if the
+                timeout expired.
         """
-        incoming = ""
-        while "\4" not in incoming:
-            try:
-                data = self.socket.recv(1024).decode("utf-8")
-            except OSError as exception:
-                if exception.errno == errno.EWOULDBLOCK:
-                    sleep(0.05)
-                    continue
-                print("Warning - could not receive data:", exception)
-                break
-            if not data:
-                break
-            incoming += data
-        return incoming
+        incoming, self._received = self._received, b""
+        deadline = None if timeout is None else monotonic() + timeout
+        previous_timeout = self.socket.gettimeout()
+        try:
+            while b"\4" not in incoming:
+                if deadline is not None:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        print(f"Warning - no complete response within {timeout} s")
+                        self._received = incoming
+                        return None
+                    self.socket.settimeout(remaining)
+                try:
+                    data = self.socket.recv(1024)
+                except socket.timeout:
+                    print(f"Warning - no complete response within {timeout} s")
+                    self._received = incoming
+                    return None
+                except OSError as exception:
+                    if exception.errno == errno.EWOULDBLOCK:
+                        sleep(0.05)
+                        continue
+                    print("Warning - could not receive data:", exception)
+                    break
+                if not data:
+                    break
+                incoming += data
+        finally:
+            if deadline is not None:
+                with contextlib.suppress(OSError):
+                    self.socket.settimeout(previous_timeout)
+        return incoming.decode("utf-8", "backslashreplace")
 
     def send(self, data: str) -> bool:
         """Send data.

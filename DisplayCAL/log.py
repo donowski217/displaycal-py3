@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import atexit
+import collections
 import contextlib
 import logging
 import logging.handlers
 import os
 import re
 import sys
+import threading
 import warnings
+import weakref
 from codecs import EncodedFile
 from hashlib import md5
 from io import BytesIO
@@ -341,11 +344,13 @@ def get_file_logger(
     Returns:
         logging.Logger: The logger object.
     """
-    global _LOGDIR
-    global LOGGER
+    # Only setup_logging() sets the application logger (LOGGER). Session,
+    # interact, adjust etc. loggers must not replace it, otherwise LOG() and
+    # safe_print() would write to e.g. a profile's session log, and drop
+    # messages once that log is closed.
     if logdir is None:
         logdir = _LOGDIR
-    LOGGER = logging.getLogger(name)
+    logger = logging.getLogger(name)
     if not filename:
         filename = name
     mode = "a"
@@ -358,13 +363,13 @@ def get_file_logger(
             mode,
         )
     logfile = os.path.join(logdir, filename + ".log")
-    for handler in LOGGER.handlers:
+    for handler in logger.handlers:
         if isinstance(
             handler, logging.FileHandler
         ) and handler.baseFilename == os.path.abspath(logfile):
-            return LOGGER
-    LOGGER.propagate = 0
-    LOGGER.setLevel(level)
+            return logger
+    logger.propagate = 0
+    logger.setLevel(level)
     if not os.path.exists(logdir):
         try:
             os.makedirs(logdir)
@@ -375,19 +380,49 @@ def get_file_logger(
     elif when != "never" and os.path.exists(logfile):
         rotate_log_files(backup_count, logdir, logfile)
     if os.path.exists(logdir):
+        # Always write UTF-8. With the default (locale) encoding, e.g. cp1252,
+        # any record containing a character outside that code page (box
+        # drawing characters, arrows, non-Latin display or profile names...)
+        # would raise in emit() and be dropped silently, because
+        # logging.raiseExceptions is off.
         try:
             if when != "never":
                 filehandler = logging.handlers.TimedRotatingFileHandler(
-                    logfile, when=when, backupCount=backup_count
+                    logfile,
+                    when=when,
+                    backupCount=backup_count,
+                    encoding="utf-8",
+                    errors="backslashreplace",
                 )
             else:
-                filehandler = logging.FileHandler(logfile, mode)
+                filehandler = logging.FileHandler(
+                    logfile, mode, encoding="utf-8", errors="backslashreplace"
+                )
             fileformatter = logging.Formatter("%(asctime)s %(message)s")
             filehandler.setFormatter(fileformatter)
-            LOGGER.addHandler(filehandler)
+            logger.addHandler(filehandler)
         except Exception as exception:
             print(f"Warning - logging to file '{logfile}' not possible: {exception}")
-    return LOGGER
+    return logger
+
+
+def is_multiprocessing_child() -> bool:
+    """Return whether this process is a multiprocessing child process.
+
+    The process name alone is not enough: in a frozen Windows build, a
+    spawned child runs the entry script, which may import DisplayCAL and set
+    up logging, before multiprocessing.freeze_support() names the process.
+    The "--multiprocessing-fork" argument which the spawn start method passes
+    to the child is there from the start. (It is replaced by the parent's
+    arguments once the child is prepared, so check this early, e.g. while
+    setting up logging, and do not cache the result.)
+
+    Returns:
+        bool: True if this is a multiprocessing child process.
+    """
+    return mp.current_process().name != "MainProcess" or (
+        "--multiprocessing-fork" in (getattr(sys, "argv", None) or [])
+    )
 
 
 def update_filename_for_confighome(
@@ -412,7 +447,7 @@ def update_filename_for_confighome(
             'filename', and 'mode'.
     """
     # Use different logfile name (append number) for each additional instance
-    is_main_process = mp.current_process().name == "MainProcess"
+    is_main_process = not is_multiprocessing_child()
     if os.path.basename(confighome).lower() == "dispcalgui":
         lockbasename = filename.replace(APPNAME, "dispcalGUI")
     else:
@@ -461,7 +496,7 @@ def update_filename_with_lockfile(
         filename (str): Name of the log file.
         lockfilepath (str): Path to the lock file.
     """
-    is_main_process = mp.current_process().name == "MainProcess"
+    is_main_process = not is_multiprocessing_child()
     try:
         with open(lockfilepath) as lockfile:
             instances = len(lockfile.read().splitlines())
@@ -621,6 +656,61 @@ def validate_and_rename_logfile(logfile: str, logbackup: str) -> None:
         # logging.handlers.TimedRotatingFileHandler.getFilesToDelete
 
 
+def open_fault_log(path: str, label: str, max_size: int = 1024 * 1024) -> TextIO:
+    """Open the faulthandler log for appending and write a start header.
+
+    The file is appended to rather than truncated, so the crash dump of a
+    previous run, or of another instance that is still running, is kept. If
+    the file is larger than max_size, it is first moved to "<path>.prev"
+    (this is skipped if it fails, e.g. while another instance holds the file
+    open).
+
+    Note that faulthandler never records a Py_FatalError (CPython disables
+    faulthandler before it aborts); that text only goes to the C-level stderr.
+
+    Args:
+        path (str): Path of the fault log file.
+        label (str): Identifies the process in the header, e.g. the
+            application name and version.
+        max_size (int, optional): Size in bytes above which the existing file
+            is moved aside. Defaults to 1 MiB.
+
+    Returns:
+        TextIO: The open file, to be passed to faulthandler.enable().
+    """
+    try:
+        if os.path.getsize(path) > max_size:
+            os.replace(path, f"{path}.prev")
+    except OSError:
+        pass
+    fault_log = open(path, "a", encoding="utf-8")  # noqa: SIM115
+    fault_log.write(
+        f"=== {strftime('%Y-%m-%d %H:%M:%S')} {label} PID {os.getpid()} started ===\n"
+    )
+    fault_log.flush()
+    return fault_log
+
+
+def write_fault_log_footer(fault_log: TextIO, label: str) -> None:
+    """Write an exit footer to the fault log. Never raises.
+
+    Meant to run at exit, so a start header without a matching footer means
+    that the process did not exit normally (e.g. it crashed or was killed).
+    Also tells real crashes apart from handled first-chance exceptions which
+    faulthandler logs on Windows as well.
+
+    Args:
+        fault_log (TextIO): The file returned by open_fault_log().
+        label (str): The label that was passed to open_fault_log().
+    """
+    with contextlib.suppress(Exception):
+        fault_log.write(
+            f"=== {strftime('%Y-%m-%d %H:%M:%S')} {label} PID {os.getpid()} "
+            "exited ===\n"
+        )
+        fault_log.flush()
+
+
 def setup_logging(
     logdir: str,
     name: str = APPNAME,
@@ -655,3 +745,444 @@ def setup_logging(
             streamformatter = logging.Formatter("%(asctime)s %(message)s")
             streamhandler.setFormatter(streamformatter)
             LOGGER.addHandler(streamhandler)
+        redirect_stdio_to_log()
+
+
+# Per-thread flag that is set while a record is being emitted to the app log
+# file handlers. Anything written to a redirected standard stream while it is
+# set (e.g. by a handler reporting its own error to sys.stderr) is only passed
+# through to the original stream, so emitting can never recurse.
+_EMITTING = threading.local()
+# Per-thread state while a StdioToLog stream holds its lock: .active is set
+# meanwhile, and .deferred queues (stream, text) of every write to a
+# redirected stream that happens on the same thread in that time. Such a write
+# can only come from code that interrupts the bookkeeping: a finalizer run by
+# a garbage collection at any allocation (e.g. the default sys.unraisablehook
+# reporting "Exception ignored in ..." to sys.stderr), or a signal handler.
+# Taking the lock again there would deadlock the thread on its own lock (and
+# with it every other thread that writes to that stream), and emitting there
+# would emit with the lock held, so the outer call logs the queued text once
+# it has released the lock.
+_BOOKKEEPING = threading.local()
+# Upper bound of queued writes that one call logs, so a finalizer that keeps
+# writing on every garbage collection cannot keep the writing thread busy
+# forever. Anything left is logged by the next write on that thread.
+_MAX_DEFERRED_WRITES = 1000
+# StdioToLog instances installed by redirect_stdio_to_log()
+_STDIO_LOG_STREAMS: list[StdioToLog] = []
+
+
+def _app_file_handlers() -> list[logging.FileHandler]:
+    """Return the file handlers of the application logger.
+
+    Returns:
+        list[logging.FileHandler]: The file handlers of LOGGER (no
+            LOGBUFFER/stream handlers), or an empty list if there are none.
+    """
+    logger = LOGGER
+    if logger is None:
+        return []
+    return [h for h in list(logger.handlers) if isinstance(h, logging.FileHandler)]
+
+
+def _emit_to_app_log(level: int, msg: str) -> bool:
+    """Emit msg as one record directly to the application log file handlers.
+
+    This bypasses LOG(), LOGBUFFER and the wx log window, so it is safe to use
+    from exception hooks and from any thread. No lock of ours is held while
+    the handlers run. Never raises.
+
+    Args:
+        level (int): The log level of the record.
+        msg (str): The message. May span multiple lines.
+
+    Returns:
+        bool: True if the record was handed to at least one application log
+            file handler, False if there is none (or if called re-entrantly
+            while emitting).
+    """
+    if getattr(_EMITTING, "active", False):
+        return False
+    try:
+        handlers = _app_file_handlers()
+        if not handlers:
+            return False
+        _EMITTING.active = True
+        try:
+            record = logging.LogRecord(
+                LOGGER.name, level, __file__, 0, msg, None, None
+            )
+            for handler in handlers:
+                if record.levelno >= handler.level:
+                    handler.handle(record)
+        finally:
+            _EMITTING.active = False
+    except Exception:
+        return False
+    return True
+
+
+def log_error(text: str) -> bool:
+    """Record an error (e.g. a traceback) in the application log file.
+
+    The text is written as one ERROR record directly to the application log
+    file handlers, bypassing LOG(), LOGBUFFER and the wx log window, so this
+    is safe to call from exception hooks and from any thread. If there is no
+    application log file handler (e.g. before setup_logging() ran), the text
+    is written to sys.stderr instead. Never raises.
+
+    Args:
+        text (str): The text to record. May span multiple lines.
+
+    Returns:
+        bool: True if the text was recorded in the application log file,
+            False if it was written to sys.stderr instead (or could not be
+            written at all).
+    """
+    try:
+        text = str(text).rstrip()
+        if _emit_to_app_log(logging.ERROR, text):
+            return True
+        stream = sys.stderr
+        if stream is not None:
+            stream.write(f"{text}\n")
+            stream.flush()
+    except Exception:
+        pass
+    return False
+
+
+class _LineBuffer:
+    """Pending partial line of one thread for one StdioToLog stream."""
+
+    __slots__ = ("__weakref__", "pending")
+
+    def __init__(self) -> None:
+        self.pending = ""
+
+
+def _begin_bookkeeping() -> None:
+    """Mark the calling thread as holding (or about to take) a stream lock.
+
+    The deferral queue is created before the flag is set, so a write that
+    interrupts this (and sees the flag) always finds the queue.
+    """
+    if getattr(_BOOKKEEPING, "deferred", None) is None:
+        _BOOKKEEPING.deferred = collections.deque()
+    _BOOKKEEPING.active = True
+
+
+def _log_deferred_writes() -> None:
+    """Log the text that was written during the calling thread's bookkeeping.
+
+    Must be called while the calling thread holds no StdioToLog lock.
+    """
+    deferred = getattr(_BOOKKEEPING, "deferred", None)
+    for _ in range(_MAX_DEFERRED_WRITES):
+        if not deferred:
+            break
+        try:
+            stream, text = deferred.popleft()
+        except IndexError:
+            break
+        stream._log_text(text)
+
+
+class StdioToLog:
+    """Standard stream replacement that sends whole lines to the app log.
+
+    Installed by redirect_stdio_to_log() in place of a standard output stream
+    which would otherwise discard everything written to it: py2exe's
+    ``Blackhole`` (sys.stdout) and ``Stderr`` (sys.stderr) in the windowed
+    frozen builds, or None (pythonw). Each whole line becomes one record of
+    the given level in the application log file. This also catches the
+    output of the default threading.excepthook and sys.unraisablehook.
+
+    Partial lines are buffered per thread, and no lock is held while a
+    record is emitted, so there is no lock-order inversion with the handlers'
+    locks. A write on a thread whose bookkeeping it interrupts (a finalizer
+    run by the garbage collector, e.g. the default sys.unraisablehook, or a
+    signal handler) is queued and logged once the lock is released, instead
+    of deadlocking on the lock (see _BOOKKEEPING).
+
+    Consecutive identical lines (like the profile loader's monitoring
+    thread "Acquired lock" message every few seconds) are collapsed into
+    "(last message repeated N times)", which is still written at least every
+    ``repeat_summary_interval`` seconds while the repetition goes on, so the
+    log keeps showing that the process was alive.
+
+    Like py2exe's Blackhole, this deliberately has no ``isatty()`` and no
+    ``fileno()``: e.g. Worker.exec_cmd checks ``hasattr(sys.stdout,
+    "isatty")`` to decide how to capture subprocess output, and that decision
+    must not change.
+
+    Args:
+        level (int): The log level for lines written to this stream.
+        original (None | TextIO): The stream object that is replaced.
+        passthrough (bool, optional): Also write everything to the original
+            stream. Text is always passed through to the original stream if
+            there is no application log file handler. Defaults to False.
+    """
+
+    is_log_stream = True
+    encoding = "utf-8"
+    repeat_summary_interval = 600.0
+    max_line_length = 64 * 1024
+
+    def __init__(
+        self,
+        level: int,
+        original: None | TextIO = None,
+        passthrough: bool = False,
+    ) -> None:
+        self.level = level
+        self.original = original
+        self.passthrough = passthrough
+        self._local = threading.local()
+        # Only protects the bookkeeping below. Never held while emitting, and
+        # never taken again by the thread holding it (_BOOKKEEPING defers such
+        # writes). Reentrant only as a safety net against a permanent freeze.
+        self._lock = threading.RLock()
+        self._buffers = weakref.WeakSet()
+        self._last_line = None
+        self._repeat_count = 0
+        self._repeat_time = 0.0
+
+    def write(self, text: str | bytes) -> int:
+        """Write text. Whole lines are sent to the application log.
+
+        Args:
+            text (str | bytes): The text to write.
+
+        Returns:
+            int: The number of characters written.
+        """
+        try:
+            if isinstance(text, (bytes, bytearray)):
+                text = bytes(text).decode("utf-8", "backslashreplace")
+            elif not isinstance(text, str):
+                text = str(text)
+        except Exception:
+            return 0
+        try:
+            if (
+                getattr(_EMITTING, "active", False)
+                or sys.is_finalizing()
+                or not _app_file_handlers()
+            ):
+                self._write_original(text)
+                return len(text)
+            if self.passthrough:
+                self._write_original(text)
+            if getattr(_BOOKKEEPING, "active", False):
+                # This interrupted a stream's bookkeeping on this thread
+                _BOOKKEEPING.deferred.append((self, text))
+                return len(text)
+            self._log_text(text)
+            _log_deferred_writes()
+        except Exception:
+            pass
+        return len(text)
+
+    def writelines(self, lines: list[str]) -> None:
+        """Write a sequence of strings.
+
+        Args:
+            lines (list[str]): The strings to write.
+        """
+        for line in lines:
+            self.write(line)
+
+    def flush(self) -> None:
+        """Flush the original stream."""
+        original = self.original
+        if original is not None:
+            with contextlib.suppress(Exception):
+                original.flush()
+
+    def flush_pending(self) -> None:
+        """Log every thread's pending partial line and any repeat summary.
+
+        Called at exit, so the last words of the process are not lost.
+        """
+        try:
+            if (
+                getattr(_EMITTING, "active", False)
+                or getattr(_BOOKKEEPING, "active", False)
+                or sys.is_finalizing()
+                or not _app_file_handlers()
+            ):
+                return
+            _begin_bookkeeping()
+            try:
+                with self._lock:
+                    messages = []
+                    if self._repeat_count:
+                        messages.append(self._take_repeat_summary(time()))
+                    for buffer in list(self._buffers):
+                        pending, buffer.pending = buffer.pending, ""
+                        if pending.strip():
+                            messages.append(pending.rstrip())
+            finally:
+                _BOOKKEEPING.active = False
+            # Emit without holding the lock
+            for message in messages:
+                _emit_to_app_log(self.level, message)
+            _log_deferred_writes()
+        except Exception:
+            pass
+
+    def _write_original(self, text: str) -> None:
+        """Write text to the original stream, ignoring errors.
+
+        Args:
+            text (str): The text to write.
+        """
+        original = self.original
+        if original is not None:
+            with contextlib.suppress(Exception):
+                original.write(text)
+
+    def _log_text(self, text: str) -> None:
+        """Send the whole lines of text to the log (without passthrough).
+
+        Must be called while the calling thread holds no StdioToLog lock.
+
+        Args:
+            text (str): The text to add to the calling thread's buffer.
+        """
+        _begin_bookkeeping()
+        try:
+            with self._lock:
+                messages = self._collapse(self._take_lines(text), time())
+        finally:
+            _BOOKKEEPING.active = False
+        # Emit without holding the lock
+        for message in messages:
+            _emit_to_app_log(self.level, message)
+
+    def _take_lines(self, text: str) -> list[str]:
+        """Add text to the calling thread's buffer and take the whole lines.
+
+        Must be called with the lock held.
+
+        Args:
+            text (str): The text to add.
+
+        Returns:
+            list[str]: The complete lines, without line endings.
+        """
+        buffer = getattr(self._local, "buffer", None)
+        if buffer is None:
+            buffer = self._local.buffer = _LineBuffer()
+            self._buffers.add(buffer)
+        text = (buffer.pending + text).replace("\r\n", "\n").replace("\r", "\n")
+        *lines, pending = text.split("\n")
+        if len(pending) > self.max_line_length:
+            lines.append(pending)
+            pending = ""
+        buffer.pending = pending
+        return lines
+
+    def _collapse(self, lines: list[str], now: float) -> list[str]:
+        """Return the messages to log, collapsing consecutive identical lines.
+
+        Must be called with the lock held.
+
+        Args:
+            lines (list[str]): The lines to log.
+            now (float): The current time.
+
+        Returns:
+            list[str]: The messages to log.
+        """
+        messages = []
+        for line in lines:
+            line = line.rstrip()  # noqa: PLW2901
+            if not line:
+                continue
+            if line == self._last_line:
+                self._repeat_count += 1
+                if now - self._repeat_time >= self.repeat_summary_interval:
+                    messages.append(self._take_repeat_summary(now))
+                continue
+            if self._repeat_count:
+                messages.append(self._take_repeat_summary(now))
+            self._last_line = line
+            self._repeat_time = now
+            messages.append(line)
+        return messages
+
+    def _take_repeat_summary(self, now: float) -> str:
+        """Return the repeat summary message and reset the repeat count.
+
+        Must be called with the lock held.
+
+        Args:
+            now (float): The current time.
+
+        Returns:
+            str: The repeat summary message.
+        """
+        count = self._repeat_count
+        self._repeat_count = 0
+        self._repeat_time = now
+        return f"(last message repeated {count} time{'' if count == 1 else 's'})"
+
+
+def _discards_output(stream: None | TextIO, shim_name: str) -> bool:
+    """Return whether everything written to a standard stream is lost.
+
+    Args:
+        stream (None | TextIO): The stream (sys.stdout or sys.stderr).
+        shim_name (str): Class name of the py2exe replacement for the stream:
+            "Blackhole" for sys.stdout, "Stderr" for sys.stderr.
+
+    Returns:
+        bool: True if the stream is None (pythonw) or py2exe's replacement.
+    """
+    if stream is None:
+        return True
+    if getattr(stream, "is_log_stream", False):
+        return False
+    return type(stream).__name__ == shim_name
+
+
+def _flush_stdio_log_streams() -> None:
+    """Log pending partial lines and repeat summaries of all redirections."""
+    for stream in list(_STDIO_LOG_STREAMS):
+        stream.flush_pending()
+
+
+def redirect_stdio_to_log() -> bool:
+    """Send output of discarded standard streams to the application log.
+
+    In the windowed py2exe builds, sys.stdout is py2exe's Blackhole, which
+    throws away everything written to it, i.e. every print() (most of
+    DisplayCAL's diagnostic output), and sys.stderr is py2exe's Stderr shim,
+    an untimestamped log file in %APPDATA%. Under pythonw both are None. Only
+    such streams are replaced with StdioToLog: sys.stdout with level INFO,
+    sys.stderr with level ERROR (still also written to the py2exe shim, so
+    its log and its "Errors in..." message at exit keep working). Console
+    runs, pytest and Linux/macOS terminals are not affected.
+
+    Does nothing if there is no application log file handler (yet), and
+    nothing for a stream that has already been redirected.
+
+    Returns:
+        bool: True if at least one stream was redirected.
+    """
+    if not _app_file_handlers():
+        return False
+    redirected = []
+    if _discards_output(sys.stdout, "Blackhole"):
+        sys.stdout = StdioToLog(logging.INFO, sys.stdout)
+        redirected.append(sys.stdout)
+    if _discards_output(sys.stderr, "Stderr"):
+        sys.stderr = StdioToLog(logging.ERROR, sys.stderr, passthrough=True)
+        redirected.append(sys.stderr)
+    if redirected:
+        if not _STDIO_LOG_STREAMS:
+            atexit.register(_flush_stdio_log_streams)
+        _STDIO_LOG_STREAMS.extend(redirected)
+    return bool(redirected)

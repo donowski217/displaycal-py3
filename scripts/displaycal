@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
-from DisplayCAL.main import main
+from multiprocessing import freeze_support
+
+# Must run before any DisplayCAL import: in a frozen build, multiprocessing
+# children run this script too, and importing DisplayCAL would set them up
+# (logging, lock files) as if they were another instance of the application.
+freeze_support()
+
+from DisplayCAL.main import main  # noqa: E402
 
 main()

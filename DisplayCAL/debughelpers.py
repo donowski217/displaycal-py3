@@ -7,10 +7,12 @@ for debugging purposes.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import traceback
 from typing import TYPE_CHECKING
 
+from DisplayCAL.log import log_error
 from DisplayCAL.meta import WX_RECVERSION
 from DisplayCAL.options import DEBUG
 from DisplayCAL.util_str import box
@@ -88,6 +90,95 @@ def getevttype(event: wx.Event) -> None | str:
     return None
 
 
+def _safe_str(obj: object) -> str:
+    """Return str(obj), or a fallback if that raises.
+
+    Args:
+        obj (object): The object to convert.
+
+    Returns:
+        str: The string representation of the object.
+    """
+    try:
+        return str(obj)
+    except Exception:
+        try:
+            return repr(obj)
+        except Exception:
+            return f"<unprintable {type(obj).__name__} object>"
+
+
+def _resolve_exc_info(
+    error: tuple[type, BaseException, TracebackType] | BaseException | str,
+) -> None | tuple[type[BaseException], BaseException, None | TracebackType]:
+    """Return the exception info whose traceback should be reported for error.
+
+    Args:
+        error (tuple[type, BaseException, TracebackType] | BaseException | str):
+            The error passed to handle_error().
+
+    Returns:
+        None | tuple: (type, value, traceback) to report: the given tuple (e.g.
+            from sys.excepthook), the exception's own traceback if it was
+            raised, otherwise the exception currently being handled (if any).
+            The latter keeps the original traceback of the exception that a
+            wrapper like ``Error(f"Fatal error: {exception}")`` was created
+            for inside an ``except`` block. None if there is no traceback to
+            report.
+    """
+    if isinstance(error, tuple):
+        if len(error) == 3 and error[1] is not None:
+            return error
+        return None
+    if isinstance(error, BaseException) and error.__traceback__ is not None:
+        return type(error), error, error.__traceback__
+    exc_info = sys.exc_info()
+    if exc_info[1] is not None:
+        return exc_info
+    return None
+
+
+def format_error_traceback(
+    error: tuple[type, BaseException, TracebackType] | BaseException | str,
+) -> str:
+    """Return the formatted traceback to report for error.
+
+    Unlike traceback.format_exc(), this also works outside an ``except`` block
+    (e.g. in sys.excepthook, in a wx.CallAfter callback, or for an exception
+    caught in another thread), and it never returns "NoneType: None".
+
+    Args:
+        error (tuple[type, BaseException, TracebackType] | BaseException | str):
+            An exception info tuple, an exception, or an error message.
+
+    Returns:
+        str: The formatted traceback, or an empty string if there is none.
+    """
+    exc_info = _resolve_exc_info(error)
+    if not exc_info:
+        return ""
+    try:
+        return "".join(traceback.format_exception(*exc_info))
+    except Exception:
+        try:
+            return "".join(traceback.format_exception_only(*exc_info[:2]))
+        except Exception:
+            return ""
+
+
+def _is_log_stream(stream: object) -> bool:
+    """Return whether stream is the app log redirector (log.StdioToLog).
+
+    Args:
+        stream (object): The stream to check, e.g. sys.stderr.
+
+    Returns:
+        bool: True if text written to the stream already ends up in the
+            application log.
+    """
+    return bool(getattr(stream, "is_log_stream", False))
+
+
 def handle_error(
     error: tuple[type, str, TracebackType] | Exception,
     parent: None | wx.Window = None,
@@ -95,6 +186,9 @@ def handle_error(
     tb: bool = True,
 ) -> None:
     """Log an error string and show an error dialog.
+
+    The error message, followed by its traceback if there is one, is always
+    recorded in the application log file (on sys.stderr if there is none).
 
     Args:
         error (tuple[type, str, TracebackType] | Exception): The error to handle,
@@ -104,18 +198,43 @@ def handle_error(
         silent (bool): If True, suppresses the dialog display.
         tb (bool): If True, includes the traceback in the error message.
     """
-    traceback.print_exc()
-    msg = ""
+    tbstr = format_error_traceback(error)
     if isinstance(error, tuple):
         # We got a tuple. Assume (etype, value, tb)
-        tbstr = "".join(traceback.format_exception(*error))
         error = error[1]
+    errstr = _safe_str(error)
+
+    # Record the user-facing message (e.g. "Fatal error: ..." of a wrapper
+    # error) followed by the traceback, unless the traceback already ends
+    # with that message.
+    header = errstr
+    if isinstance(error, BaseException):
+        header = type(error).__name__
+        if errstr:
+            header += f": {errstr}"
+    tbstr_stripped = tbstr.rstrip()
+    if not tbstr:
+        logtext = header
+    elif header and not (
+        tbstr_stripped == header
+        or tbstr_stripped.endswith((f"\n{header}", f".{header}"))
+    ):
+        logtext = f"{header}\n{tbstr}"
     else:
-        tbstr = traceback.format_exc()
+        logtext = tbstr
+    logged = log_error(logtext)
+
+    # Console runs: keep showing the real traceback on stderr (unless stderr
+    # already is the app log, or log_error() already wrote it there).
+    stderr = sys.stderr
+    if tbstr and logged and stderr is not None and not _is_log_stream(stderr):
+        with contextlib.suppress(Exception):
+            stderr.write(tbstr)
+            stderr.flush()
 
     if (
         tb
-        and tbstr.strip() != "None"
+        and tbstr
         and isinstance(error, Exception)
         and (
             DEBUG
@@ -123,17 +242,14 @@ def handle_error(
             or not getattr(error, "filename", None)
         )
     ):
-        # Print a traceback if in debug mode, for non OS errors,
+        # Show a traceback if in debug mode, for non OS errors,
         # and for OS errors not related to files
-        errstr, tbstr = (str(v) for v in (error, tbstr))
         msg = f"{errstr}\n\n{tbstr}"
-        if msg.startswith(errstr):
-            print_safe(box(tbstr))
-        else:
-            print_safe(box(msg))
     else:
-        msg = str(error)
-        print_safe(box(msg))
+        msg = errstr
+    if not _is_log_stream(sys.stdout):
+        with contextlib.suppress(Exception):
+            print_safe(box(msg))
 
     if silent:
         return
@@ -141,8 +257,10 @@ def handle_error(
     try:
         show_error_dialog(error, msg, parent)
     except Exception as exception:
-        traceback.print_exc()
-        print("Warning: handle_error():", str(exception))
+        log_error(
+            "Warning: handle_error(): could not show the error dialog:\n"
+            + format_error_traceback(exception)
+        )
 
 
 def show_error_dialog(
