@@ -834,6 +834,12 @@ class ShutdownHarness:
             ("teardown_ui", threading.current_thread())
         )
         pl._post_to_gui_thread = lambda func, *args: self.posted.append(func)
+        # Never shut down a real WCS manager from these tests
+        monkeypatch.setattr(
+            profile_loader,
+            "shutdown_wcs_manager",
+            lambda: self.events.append(("wcs_shutdown", threading.current_thread())),
+        )
         monkeypatch.setattr(
             profile_loader,
             "getcfg",
@@ -851,8 +857,14 @@ def test_shutdown_tears_down_ui_on_gui_thread(monkeypatch):
     harness.pl.shutdown()
     harness.pl.shutdown()
 
-    # The configuration first: it does not depend on the WCS worker process
-    assert harness.names() == ["writecfg", "reset_associations", "teardown_ui"]
+    # The configuration first: it does not depend on the WCS worker process.
+    # The WCS manager is closed after the last WCS use (the reset).
+    assert harness.names() == [
+        "writecfg",
+        "reset_associations",
+        "wcs_shutdown",
+        "teardown_ui",
+    ]
     assert harness.events[-1][1] is threading.main_thread()
     assert harness.pl.monitoring is False
     # Never interleaved with a monitoring iteration
@@ -896,7 +908,12 @@ def test_gui_thread_shutdown_completes_one_started_elsewhere(monkeypatch):
 
     pl.shutdown()  # on the GUI thread, while the other one is still running
 
-    assert harness.names() == ["writecfg", "reset_associations", "teardown_ui"]
+    assert harness.names() == [
+        "writecfg",
+        "reset_associations",
+        "wcs_shutdown",
+        "teardown_ui",
+    ]
     assert harness.events[-1][1] is threading.main_thread()
     other.join(5)
     # The teardown the other thread posted is a no-op now
@@ -961,6 +978,7 @@ def test_shutdown_waits_for_monitoring_thread(monkeypatch):
         "writecfg",
         "monitor_exited",
         "reset_associations",
+        "wcs_shutdown",
         "teardown_ui",
     ]
 
@@ -991,7 +1009,7 @@ def test_shutdown_skips_reset_while_an_iteration_holds_the_lock(monkeypatch, cap
         release.set()
         pl._check_display_conf_thread.join(5)
 
-    assert harness.names() == ["writecfg", "teardown_ui"]
+    assert harness.names() == ["writecfg", "wcs_shutdown", "teardown_ui"]
     assert elapsed < 2
     assert "not resetting profile associations" in capsys.readouterr().out
 
@@ -1005,7 +1023,7 @@ def test_shutdown_still_writes_config_if_reset_fails(monkeypatch, capsys):
     harness.pl._reset_display_profile_associations = reset_display_profile_associations
     harness.pl.shutdown()
 
-    assert harness.names() == ["writecfg", "teardown_ui"]
+    assert harness.names() == ["writecfg", "wcs_shutdown", "teardown_ui"]
     assert "TimeoutError" in capsys.readouterr().err
 
 
@@ -1037,10 +1055,42 @@ def test_forced_shutdown_shuts_down_before_closing_frame(monkeypatch):
     assert harness.names() == [
         "writecfg",
         "reset_associations",
+        "wcs_shutdown",
         "teardown_ui",
         "close_frame",
     ]
     assert harness.events[-1] == ("close_frame", True)
+
+
+def test_shutdown_still_tears_down_ui_if_closing_wcs_fails(monkeypatch, capsys):
+    harness = ShutdownHarness(monkeypatch)
+
+    def shutdown_wcs_manager():
+        raise RuntimeError("could not stop the WCS worker")
+
+    monkeypatch.setattr(profile_loader, "shutdown_wcs_manager", shutdown_wcs_manager)
+    harness.pl.shutdown()
+
+    assert harness.names() == ["writecfg", "reset_associations", "teardown_ui"]
+    assert "could not stop the WCS worker" in capsys.readouterr().err
+
+
+def test_shutdown_wcs_manager_never_starts_one(monkeypatch):
+    from DisplayCAL import mscms, util_win
+
+    monkeypatch.setattr(mscms.WCSManagerProxy, "_instance", None)
+    util_win.shutdown_wcs_manager()
+    assert mscms.WCSManagerProxy._instance is None
+
+    calls = []
+
+    class FakeManager:
+        def shutdown(self):
+            calls.append("shutdown")
+
+    monkeypatch.setattr(mscms.WCSManagerProxy, "_instance", FakeManager())
+    util_win.shutdown_wcs_manager()
+    assert calls == ["shutdown"]
 
 
 # --- No display changes from the monitoring thread once shutdown began -------

@@ -163,6 +163,20 @@ def _get_mscms_windll():
     return MSCMSLoader.get_mscms_windll()
 
 
+def shutdown_wcs_manager() -> None:
+    """Shut down the WCS manager and its worker process, if they were started.
+
+    Never starts them (unlike any attribute access through the ``mscms``
+    proxy). Afterwards, WCS calls fail right away with
+    ``WCSManagerShutdownError`` instead of starting a new worker process
+    (e.g. after ``main._exit`` terminated the worker while another thread
+    still used WCS).
+    """
+    instance = WCSManagerProxy._instance
+    if instance is not None:
+        instance.shutdown()
+
+
 def calibration_management_isenabled() -> bool:
     """Check if calibration is enabled under Windows 7.
 

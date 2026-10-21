@@ -123,6 +123,7 @@ if sys.platform == "win32":
         invalidate_per_user_profiles_cache,
         per_user_profiles_isenabled,
         run_as_admin,
+        shutdown_wcs_manager,
         win_ver,
     )
 
@@ -148,6 +149,9 @@ else:
     ) -> contextlib.AbstractContextManager[None]:
         """Stub for non-Windows platforms."""
         return contextlib.nullcontext()
+
+    def shutdown_wcs_manager() -> None:
+        """Stub for non-Windows platforms."""
 
 
 if TYPE_CHECKING:
@@ -4626,8 +4630,8 @@ class ProfileLoader:
         writes the configuration (first: it does not depend on the WCS worker
         process, and at the end of a session there may be little time left),
         waits (up to ``MONITOR_JOIN_TIMEOUT`` seconds) for the monitoring
-        thread to exit, resets the fixed profile associations and tears down
-        the UI.
+        thread to exit, resets the fixed profile associations, closes the WCS
+        manager (see :meth:`_shutdown_wcs`) and tears down the UI.
 
         The association reset holds ``self.lock``, so it never interleaves
         with a monitoring iteration that outlived the wait (e.g. stalled in a
@@ -4669,6 +4673,7 @@ class ProfileLoader:
             self._join_monitoring_thread()
             if getcfg("profile_loader.fix_profile_associations"):
                 self._reset_associations_on_shutdown()
+            self._shutdown_wcs()
         finally:
             self._shutdown_done.set()
         if self._is_gui_thread():
@@ -4695,6 +4700,20 @@ class ProfileLoader:
             log_error_traceback()
         finally:
             self.lock.release()
+
+    def _shutdown_wcs(self) -> None:
+        """Close the WCS manager after shutdown's last use of it.
+
+        ``main._exit`` terminates every multiprocessing child (the WCS worker
+        process among them) after the exit handlers have run. A monitoring
+        iteration still running then made the WCS manager log an error and
+        start a new worker process during exit. Once the manager is closed,
+        such calls fail right away instead.
+        """
+        try:
+            shutdown_wcs_manager()
+        except Exception:
+            log_error_traceback()
 
     def _finish_shutdown_on_gui_thread(self) -> None:
         """Complete a shutdown that another thread started, on the GUI thread.
