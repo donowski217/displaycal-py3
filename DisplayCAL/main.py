@@ -129,8 +129,8 @@ def _main(
     with AppLock(
         app_lock_file_name, "a+", False, module in MULTI_INSTANCE_APP_NAMES
     ) as lock:
-        print(f"Acquired lock file: {lock}")
         LOG("=" * 80)
+        print(f"Acquired lock file: {lock}")
 
         print_system_version_information()
         initialize_fault_handler()

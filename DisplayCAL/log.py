@@ -9,7 +9,9 @@ import logging.handlers
 import os
 import re
 import sys
+import threading
 import warnings
+import weakref
 from codecs import EncodedFile
 from hashlib import md5
 from io import BytesIO
@@ -668,3 +670,330 @@ def setup_logging(
             streamformatter = logging.Formatter("%(asctime)s %(message)s")
             streamhandler.setFormatter(streamformatter)
             LOGGER.addHandler(streamhandler)
+        redirect_stdio_to_log()
+
+
+# Per-thread flag that is set while a record is being emitted to the app log
+# file handlers. Anything written to a redirected standard stream while it is
+# set (e.g. by a handler reporting its own error to sys.stderr) is only passed
+# through to the original stream, so emitting can never recurse.
+_EMITTING = threading.local()
+# StdioToLog instances installed by redirect_stdio_to_log()
+_STDIO_LOG_STREAMS: list[StdioToLog] = []
+
+
+def _app_file_handlers() -> list[logging.FileHandler]:
+    """Return the file handlers of the application logger.
+
+    Returns:
+        list[logging.FileHandler]: The file handlers of LOGGER (no
+            LOGBUFFER/stream handlers), or an empty list if there are none.
+    """
+    logger = LOGGER
+    if logger is None:
+        return []
+    return [h for h in list(logger.handlers) if isinstance(h, logging.FileHandler)]
+
+
+def _emit_to_app_log(level: int, msg: str) -> bool:
+    """Emit msg as one record directly to the application log file handlers.
+
+    This bypasses LOG(), LOGBUFFER and the wx log window, so it is safe to use
+    from exception hooks and from any thread. No lock of ours is held while
+    the handlers run. Never raises.
+
+    Args:
+        level (int): The log level of the record.
+        msg (str): The message. May span multiple lines.
+
+    Returns:
+        bool: True if the record was handed to at least one application log
+            file handler, False if there is none (or if called re-entrantly
+            while emitting).
+    """
+    if getattr(_EMITTING, "active", False):
+        return False
+    try:
+        handlers = _app_file_handlers()
+        if not handlers:
+            return False
+        _EMITTING.active = True
+        try:
+            record = logging.LogRecord(LOGGER.name, level, __file__, 0, msg, None, None)
+            for handler in handlers:
+                if record.levelno >= handler.level:
+                    handler.handle(record)
+        finally:
+            _EMITTING.active = False
+    except Exception:
+        return False
+    return True
+
+
+class _LineBuffer:
+    """Pending partial line of one thread for one StdioToLog stream."""
+
+    __slots__ = ("__weakref__", "pending")
+
+    def __init__(self) -> None:
+        self.pending = ""
+
+
+class StdioToLog:
+    """Standard stream replacement that sends whole lines to the app log.
+
+    Installed by redirect_stdio_to_log() in place of a standard output stream
+    which would otherwise discard everything written to it: py2exe's
+    ``Blackhole`` (sys.stdout) and ``Stderr`` (sys.stderr) in the windowed
+    frozen builds, or None (pythonw). Each whole line becomes one record of
+    the given level in the application log file. This also catches the
+    output of the default threading.excepthook and sys.unraisablehook.
+
+    Partial lines are buffered per thread, and no lock is held while a
+    record is emitted, so there is no lock-order inversion with the handlers'
+    locks. Consecutive identical lines (like the profile loader's monitoring
+    thread "Acquired lock" message every few seconds) are collapsed into
+    "(last message repeated N times)", which is still written at least every
+    ``repeat_summary_interval`` seconds while the repetition goes on, so the
+    log keeps showing that the process was alive.
+
+    Like py2exe's Blackhole, this deliberately has no ``isatty()`` and no
+    ``fileno()``: e.g. Worker.exec_cmd checks ``hasattr(sys.stdout,
+    "isatty")`` to decide how to capture subprocess output, and that decision
+    must not change.
+
+    Args:
+        level (int): The log level for lines written to this stream.
+        original (None | TextIO): The stream object that is replaced.
+        passthrough (bool, optional): Also write everything to the original
+            stream. Text is always passed through to the original stream if
+            there is no application log file handler. Defaults to False.
+    """
+
+    is_log_stream = True
+    encoding = "utf-8"
+    repeat_summary_interval = 600.0
+    max_line_length = 64 * 1024
+
+    def __init__(
+        self,
+        level: int,
+        original: None | TextIO = None,
+        passthrough: bool = False,
+    ) -> None:
+        self.level = level
+        self.original = original
+        self.passthrough = passthrough
+        self._local = threading.local()
+        # Only protects the bookkeeping below. Never held while emitting.
+        self._lock = threading.Lock()
+        self._buffers = weakref.WeakSet()
+        self._last_line = None
+        self._repeat_count = 0
+        self._repeat_time = 0.0
+
+    def write(self, text: str | bytes) -> int:
+        """Write text. Whole lines are sent to the application log.
+
+        Args:
+            text (str | bytes): The text to write.
+
+        Returns:
+            int: The number of characters written.
+        """
+        try:
+            if isinstance(text, (bytes, bytearray)):
+                text = bytes(text).decode("utf-8", "backslashreplace")
+            elif not isinstance(text, str):
+                text = str(text)
+        except Exception:
+            return 0
+        try:
+            if (
+                getattr(_EMITTING, "active", False)
+                or sys.is_finalizing()
+                or not _app_file_handlers()
+            ):
+                self._write_original(text)
+                return len(text)
+            if self.passthrough:
+                self._write_original(text)
+            self._log_lines(self._take_lines(text))
+        except Exception:
+            pass
+        return len(text)
+
+    def writelines(self, lines: list[str]) -> None:
+        """Write a sequence of strings.
+
+        Args:
+            lines (list[str]): The strings to write.
+        """
+        for line in lines:
+            self.write(line)
+
+    def flush(self) -> None:
+        """Flush the original stream."""
+        original = self.original
+        if original is not None:
+            with contextlib.suppress(Exception):
+                original.flush()
+
+    def flush_pending(self) -> None:
+        """Log every thread's pending partial line and any repeat summary.
+
+        Called at exit, so the last words of the process are not lost.
+        """
+        try:
+            if (
+                getattr(_EMITTING, "active", False)
+                or sys.is_finalizing()
+                or not _app_file_handlers()
+            ):
+                return
+            with self._lock:
+                messages = []
+                if self._repeat_count:
+                    messages.append(self._take_repeat_summary(time()))
+                for buffer in list(self._buffers):
+                    pending, buffer.pending = buffer.pending, ""
+                    if pending.strip():
+                        messages.append(pending.rstrip())
+            for message in messages:
+                _emit_to_app_log(self.level, message)
+        except Exception:
+            pass
+
+    def _write_original(self, text: str) -> None:
+        """Write text to the original stream, ignoring errors.
+
+        Args:
+            text (str): The text to write.
+        """
+        original = self.original
+        if original is not None:
+            with contextlib.suppress(Exception):
+                original.write(text)
+
+    def _take_lines(self, text: str) -> list[str]:
+        """Add text to the calling thread's buffer and take the whole lines.
+
+        Args:
+            text (str): The text to add.
+
+        Returns:
+            list[str]: The complete lines, without line endings.
+        """
+        buffer = getattr(self._local, "buffer", None)
+        if buffer is None:
+            buffer = self._local.buffer = _LineBuffer()
+            with self._lock:
+                self._buffers.add(buffer)
+        text = (buffer.pending + text).replace("\r\n", "\n").replace("\r", "\n")
+        *lines, pending = text.split("\n")
+        if len(pending) > self.max_line_length:
+            lines.append(pending)
+            pending = ""
+        buffer.pending = pending
+        return lines
+
+    def _log_lines(self, lines: list[str]) -> None:
+        """Send lines to the log, collapsing consecutive identical lines.
+
+        Args:
+            lines (list[str]): The lines to log.
+        """
+        messages = []
+        now = time()
+        with self._lock:
+            for line in lines:
+                line = line.rstrip()  # noqa: PLW2901
+                if not line:
+                    continue
+                if line == self._last_line:
+                    self._repeat_count += 1
+                    if now - self._repeat_time >= self.repeat_summary_interval:
+                        messages.append(self._take_repeat_summary(now))
+                    continue
+                if self._repeat_count:
+                    messages.append(self._take_repeat_summary(now))
+                self._last_line = line
+                self._repeat_time = now
+                messages.append(line)
+        # Emit without holding the lock
+        for message in messages:
+            _emit_to_app_log(self.level, message)
+
+    def _take_repeat_summary(self, now: float) -> str:
+        """Return the repeat summary message and reset the repeat count.
+
+        Must be called with the lock held.
+
+        Args:
+            now (float): The current time.
+
+        Returns:
+            str: The repeat summary message.
+        """
+        count = self._repeat_count
+        self._repeat_count = 0
+        self._repeat_time = now
+        return f"(last message repeated {count} time{'' if count == 1 else 's'})"
+
+
+def _discards_output(stream: None | TextIO, shim_name: str) -> bool:
+    """Return whether everything written to a standard stream is lost.
+
+    Args:
+        stream (None | TextIO): The stream (sys.stdout or sys.stderr).
+        shim_name (str): Class name of the py2exe replacement for the stream:
+            "Blackhole" for sys.stdout, "Stderr" for sys.stderr.
+
+    Returns:
+        bool: True if the stream is None (pythonw) or py2exe's replacement.
+    """
+    if stream is None:
+        return True
+    if getattr(stream, "is_log_stream", False):
+        return False
+    return type(stream).__name__ == shim_name
+
+
+def _flush_stdio_log_streams() -> None:
+    """Log pending partial lines and repeat summaries of all redirections."""
+    for stream in list(_STDIO_LOG_STREAMS):
+        stream.flush_pending()
+
+
+def redirect_stdio_to_log() -> bool:
+    """Send output of discarded standard streams to the application log.
+
+    In the windowed py2exe builds, sys.stdout is py2exe's Blackhole, which
+    throws away everything written to it, i.e. every print() (most of
+    DisplayCAL's diagnostic output), and sys.stderr is py2exe's Stderr shim,
+    an untimestamped log file in %APPDATA%. Under pythonw both are None. Only
+    such streams are replaced with StdioToLog: sys.stdout with level INFO,
+    sys.stderr with level ERROR (still also written to the py2exe shim, so
+    its log and its "Errors in..." message at exit keep working). Console
+    runs, pytest and Linux/macOS terminals are not affected.
+
+    Does nothing if there is no application log file handler (yet), and
+    nothing for a stream that has already been redirected.
+
+    Returns:
+        bool: True if at least one stream was redirected.
+    """
+    if not _app_file_handlers():
+        return False
+    redirected = []
+    if _discards_output(sys.stdout, "Blackhole"):
+        sys.stdout = StdioToLog(logging.INFO, sys.stdout)
+        redirected.append(sys.stdout)
+    if _discards_output(sys.stderr, "Stderr"):
+        sys.stderr = StdioToLog(logging.ERROR, sys.stderr, passthrough=True)
+        redirected.append(sys.stderr)
+    if redirected:
+        if not _STDIO_LOG_STREAMS:
+            atexit.register(_flush_stdio_log_streams)
+        _STDIO_LOG_STREAMS.extend(redirected)
+    return bool(redirected)
