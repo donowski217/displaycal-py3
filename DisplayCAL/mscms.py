@@ -508,6 +508,7 @@ class WCSManager:
                 self._start_worker()
             finally:
                 self._restarting.clear()
+            logger.info("WCSWorker restarted successfully")
 
     def _ensure_worker_alive(self) -> None:
         """Restart the worker process if it died (e.g. crashed or was killed).
@@ -574,7 +575,6 @@ class WCSManager:
                 "Open handle number exceeded: "
                 f"{num_handles}>{self.handle_threshold}"
             )
-            logger.info("WCSWorker restarted successfully")
         else:
             logger.debug(f"Current child process open handles: {num_handles}")
 
