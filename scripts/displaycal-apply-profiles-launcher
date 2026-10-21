@@ -30,9 +30,12 @@ if "--oneshot" in sys.argv[1:]:
 
 # Do not hand the loader pipes to this stub: it exits after a few seconds, so
 # every later print() in a non-frozen (pythonw) loader would fail on the broken
-# pipe. Inheriting our (absent) console handles leaves the loader's sys.stdout
-# and sys.stderr as None, which DisplayCAL.log redirects to its log file.
-sp.Popen(args, stdin=sp.DEVNULL)
+# pipe. Pass no std* arguments at all: with any of them (even stdin=DEVNULL),
+# subprocess sets STARTF_USESTDHANDLES and, as this stub has no console
+# handles under Task Scheduler, creates throwaway pipes for the other streams.
+# Without them, the loader's sys.stdout and sys.stderr are None, which
+# DisplayCAL.log redirects to its log file.
+sp.Popen(args)
 
 # Sleep a few seconds so task scheduler can see an instance already running and
 # won't start another one due to multiple triggers firing at the same time

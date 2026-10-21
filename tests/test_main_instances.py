@@ -136,13 +136,15 @@ def test_launcher_does_not_give_the_loader_pipes():
         and node.func.attr == "Popen"
     ]
     assert len(popen_calls) == 1
-    pipe_kwargs = {
-        keyword.arg
-        for keyword in popen_calls[0].keywords
-        if isinstance(keyword.value, ast.Attribute)
-        and keyword.value.attr in ("PIPE", "STDOUT")
+    # No std* argument at all: any of them (even stdin=DEVNULL) makes
+    # subprocess create throwaway pipes for the other streams when the stub
+    # has no console handles (Task Scheduler), so the loader's print() fails.
+    std_kwargs = {keyword.arg for keyword in popen_calls[0].keywords} & {
+        "stdin",
+        "stdout",
+        "stderr",
     }
-    assert not pipe_kwargs
+    assert not std_kwargs
 
 
 def test_entry_scripts_were_found():
