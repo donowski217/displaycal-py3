@@ -2992,7 +2992,13 @@ class ProfileLoader:
             hwnd (int): The handle of the window.
             windowlist (list): The list to append the window class names to.
         """
-        cls = win32gui.GetClassName(hwnd)
+        try:
+            cls = win32gui.GetClassName(hwnd)
+        except pywintypes.error:
+            # The window was destroyed after it was enumerated. Skip it
+            # instead of aborting the enumeration (which would make our window
+            # count drop and look like a request to exit).
+            return
         # print cls
         if cls in (
             "madHcNetQueueWindow",
@@ -4383,17 +4389,22 @@ class ProfileLoader:
             hwnd (int): Handle to the window.
             extra (object): Extra parameter (not used).
         """
-        cls = win32gui.GetClassName(hwnd)
-        if cls == "madHcNetQueueWindow" or self._is_known_window_class(cls):
-            try:
-                thread_id, pid = win32process.GetWindowThreadProcessId(hwnd)
-                filename: str = get_process_filename(pid)
-            except pywintypes.error:
+        try:
+            cls = win32gui.GetClassName(hwnd)
+            if not (cls == "madHcNetQueueWindow" or self._is_known_window_class(cls)):
                 return
-            self._hwnds_pids.add((filename, pid, thread_id, hwnd))
-            basename = os.path.basename(filename)
-            if basename.lower() != "madhcctrl.exe" and pid != self._pid:
-                self.__other_component = filename, cls, 0
+            thread_id, pid = win32process.GetWindowThreadProcessId(hwnd)
+            filename: str = get_process_filename(pid)
+        except (pywintypes.error, OSError):
+            # The window or its process went away while we were enumerating.
+            # Note that get_process_filename raises ctypes.WinError (OSError),
+            # e.g. [WinError 31] for a process that has just exited, which is
+            # not a pywintypes.error.
+            return
+        self._hwnds_pids.add((filename, pid, thread_id, hwnd))
+        basename = os.path.basename(filename)
+        if basename.lower() != "madhcctrl.exe" and pid != self._pid:
+            self.__other_component = filename, cls, 0
 
     def _is_known_window_class(self, cls: type) -> bool:
         """Check if the window class is known and should be monitored.
@@ -4454,33 +4465,37 @@ class ProfileLoader:
         """
         if sys.platform != "win32":
             return None
-        self._is_other_running_lock.acquire()
-        if enumerate_windows_and_processes:
-            # At launch, we won't be able to determine if madVR is running via
-            # the callback API, and we can only determine if another
-            # calibration solution is running by enumerating windows and
-            # processes anyway.
-            other_component = self.__other_component
-            self.__other_component = None, None, 0
-            # Look for known window classes
-            # Performance on C2D 3.16 GHz (Win7 x64, ~ 90 processes): ~ 1ms
-            self._hwnds_pids = set()
-            try:
-                win32gui.EnumWindows(self._enumerate_windows_callback, None)
-            except pywintypes.error as exception:
-                print("Enumerating windows failed:", exception)
-            if (
-                not self.__other_component[1]
-                or self.__other_component[1] == "madHcNetQueueWindow"
-            ):
-                self._look_for_known_processes(other_component)
-            if other_component != self.__other_component:
-                self._handle_component_detection(other_component)
-        result = (
-            self.__other_component[0:2] != (None, None)
-            and not self.__other_component[2]
-        )
-        self._is_other_running_lock.release()
+        # Always release the lock, even if enumeration fails: a lock left held
+        # here would deadlock the next caller (the monitoring thread or the
+        # GUI thread, e.g. when the tray menu is opened).
+        with self._is_other_running_lock:
+            if enumerate_windows_and_processes:
+                # At launch, we won't be able to determine if madVR is running
+                # via the callback API, and we can only determine if another
+                # calibration solution is running by enumerating windows and
+                # processes anyway.
+                other_component = self.__other_component
+                self.__other_component = None, None, 0
+                # Look for known window classes
+                # Performance on C2D 3.16 GHz (Win7 x64, ~ 90 processes): ~ 1ms
+                self._hwnds_pids = set()
+                try:
+                    win32gui.EnumWindows(self._enumerate_windows_callback, None)
+                except Exception as exception:
+                    # pywin32 passes exceptions raised in the callback through
+                    # as-is, so this is not necessarily a pywintypes.error
+                    print("Enumerating windows failed:", exception)
+                if (
+                    not self.__other_component[1]
+                    or self.__other_component[1] == "madHcNetQueueWindow"
+                ):
+                    self._look_for_known_processes(other_component)
+                if other_component != self.__other_component:
+                    self._handle_component_detection(other_component)
+            result = (
+                self.__other_component[0:2] != (None, None)
+                and not self.__other_component[2]
+            )
         if self.__other_component[1] == "madHcNetQueueWindow":
             if enumerate_windows_and_processes:
                 # Check if gamma ramps were reset for current display
