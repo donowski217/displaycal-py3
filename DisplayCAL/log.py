@@ -1121,7 +1121,7 @@ class StdioToLog:
 
     Args:
         level (int): The log level for lines written to this stream.
-        original (None | TextIO): The stream object that is replaced.
+        original (TextIO | None): The stream object that is replaced.
         passthrough (bool, optional): Also write everything to the original
             stream. Text is always passed through to the original stream if
             there is no application log file handler. Defaults to False.
@@ -1137,7 +1137,7 @@ class StdioToLog:
     def __init__(
         self,
         level: int,
-        original: None | TextIO = None,
+        original: TextIO | None = None,
         passthrough: bool = False,
     ) -> None:
         self.level = level
@@ -1403,11 +1403,11 @@ class StdioToLog:
         return f'(previous line repeated {count} {times}: "{line}")', self._repeat_last
 
 
-def _discards_output(stream: None | TextIO, shim_name: str) -> bool:
+def _discards_output(stream: TextIO | None, shim_name: str) -> bool:
     """Return whether everything written to a standard stream is lost.
 
     Args:
-        stream (None | TextIO): The stream (sys.stdout or sys.stderr).
+        stream (TextIO | None): The stream (sys.stdout or sys.stderr).
         shim_name (str): Class name of the py2exe replacement for the stream:
             "Blackhole" for sys.stdout, "Stderr" for sys.stderr.
 
@@ -1423,7 +1423,7 @@ def _discards_output(stream: None | TextIO, shim_name: str) -> bool:
 
 def _flush_stdio_log_streams() -> None:
     """Log pending partial lines and repeat summaries of all redirections."""
-    for stream in list(_STDIO_LOG_STREAMS):
+    for stream in _STDIO_LOG_STREAMS.copy():
         stream.flush_pending()
 
 
