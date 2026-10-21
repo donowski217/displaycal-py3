@@ -85,6 +85,13 @@ class MonitorHarness:
         pl._check_keep_running = lambda: True
         pl.shutdown = lambda: self.shutdown_threads.append(threading.current_thread())
         monkeypatch.setattr(profile_loader.time, "sleep", lambda seconds: None)
+        # Never query the real WCS worker process
+        self.calibration_management_queries = []
+        monkeypatch.setattr(
+            profile_loader,
+            "calibration_management_isenabled",
+            lambda: self.calibration_management_queries.append(None) or False,
+        )
 
     def _check_profile_associations(self, first_run, idle, *args):
         assert self.pl.lock.locked(), "iteration must run with self.lock held"
@@ -404,6 +411,69 @@ def test_displaycal_start_and_exit_are_reported_once(monkeypatch, capsys):
     ]
     out = capsys.readouterr().out
     assert out.count("app.detected.calibration_loading_disabled") == 1
+
+
+def _run_harness_in_monitor_thread(harness):
+    thread = threading.Thread(
+        target=harness.run, name="DisplayConfigurationMonitoring", daemon=True
+    )
+    thread.start()
+    thread.join(10)
+    assert not thread.is_alive()
+
+
+def test_calibration_management_state_is_refreshed_every_iteration(monkeypatch):
+    """Also while _should_apply_profiles short-circuits before querying it.
+
+    E.g. while DisplayCAL or another calibration app runs, or with loading on
+    login disabled. The GUI thread only reads the last known state.
+    """
+    harness = MonitorHarness(monkeypatch, [OK, OK, STOP])
+    pl = harness.pl
+    state = {"value": False}
+    queries = []
+
+    def calibration_management_isenabled():
+        queries.append(threading.current_thread().name)
+        return state["value"]
+
+    monkeypatch.setattr(
+        profile_loader,
+        "calibration_management_isenabled",
+        calibration_management_isenabled,
+    )
+    check_profile_associations = pl._check_profile_associations
+
+    def check_profile_associations_cm_toggled(*args):
+        # The user enables Windows calibration management after iteration 1
+        state["value"] = harness.calls >= 1
+        return check_profile_associations(*args)
+
+    pl._check_profile_associations = check_profile_associations_cm_toggled
+    _run_harness_in_monitor_thread(harness)
+
+    assert queries == ["DisplayConfigurationMonitoring"] * 3
+    assert pl._calibration_management_state is True
+    # What the tray menu etc. see on the GUI thread, without a WCS query
+    assert pl._calibration_management_isenabled() is True
+    assert len(queries) == 3
+
+
+def test_calibration_management_state_is_not_queried_twice(monkeypatch):
+    """No extra query when the iteration already queried the state."""
+    harness = MonitorHarness(monkeypatch, [OK, OK, STOP])
+    pl = harness.pl
+    check_profile_associations = pl._check_profile_associations
+
+    def check_profile_associations_querying_cm(*args):
+        # As _should_apply_profiles does when it gets that far
+        pl._calibration_management_isenabled()
+        return check_profile_associations(*args)
+
+    pl._check_profile_associations = check_profile_associations_querying_cm
+    _run_harness_in_monitor_thread(harness)
+
+    assert len(harness.calibration_management_queries) == 3
 
 
 def test_steady_state_iteration_is_quiet(monkeypatch, capsys):

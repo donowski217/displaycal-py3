@@ -2095,6 +2095,7 @@ class ProfileLoader:
         # Last known Windows calibration management state and WCS query error,
         # see _calibration_management_isenabled()
         self._calibration_management_state = None
+        self._calibration_management_state_checked = None
         self._last_wcs_error = None
         # Whether the GraphicsDrivers\Configuration registry key turned out to
         # be inaccessible (see _check_display_changed)
@@ -3396,6 +3397,7 @@ class ProfileLoader:
                 was set (the caller should run the next iteration right away),
                 True otherwise.
         """
+        started = time.perf_counter()
         result = None
         results = []
         errors = []
@@ -3457,7 +3459,26 @@ class ProfileLoader:
             self._manual_restore = False
             self._skip = False
             debug_print("DisplayConfigurationMonitoringThread: Releasing lock")
+        self._refresh_calibration_management_state(started)
         return True
+
+    def _refresh_calibration_management_state(self, since: float) -> None:
+        """Query Windows calibration management unless done since ``since``.
+
+        The GUI thread only ever reads the last known state (see
+        :meth:`_calibration_management_isenabled`), which normally the
+        monitoring iteration's :meth:`_should_apply_profiles` refreshes. That
+        check is skipped when its result is already decided otherwise (e.g.
+        while DisplayCAL or another calibration app is running, or when
+        loading calibration on login is disabled), so query the state here
+        then, i.e. at most once per iteration.
+
+        Args:
+            since (float): ``time.perf_counter()`` when the iteration started.
+        """
+        checked = getattr(self, "_calibration_management_state_checked", None)
+        if checked is None or checked < since:
+            self._query_calibration_management_state()
 
     def _wait_for_next_iteration(self) -> None:
         """Wait (up to three seconds) before the next monitoring iteration.
@@ -5417,6 +5438,20 @@ class ProfileLoader:
         state = getattr(self, "_calibration_management_state", None)
         if state is not None and self._is_gui_thread():
             return state
+        return self._query_calibration_management_state()
+
+    def _query_calibration_management_state(self) -> bool:
+        """Query and remember whether Windows manages display calibration.
+
+        Never raises: on error, the error is printed (each distinct one once)
+        and the last known state is returned.
+
+        Returns:
+            bool: True if Windows calibration management is enabled.
+        """
+        # When the state was last queried (successfully or not), see
+        # _refresh_calibration_management_state
+        self._calibration_management_state_checked = time.perf_counter()
         try:
             state = bool(calibration_management_isenabled())
         except Exception as exception:
