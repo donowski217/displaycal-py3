@@ -28,6 +28,7 @@ from DisplayCAL.debughelpers import (
     Error,
     format_error_traceback,
     handle_error,
+    log_error_traceback,
     print_error_traceback,
 )
 
@@ -377,3 +378,67 @@ def test_worker_base_log_does_not_print_nonetype_none(capsys):
     assert "NoneType: None" not in err
     assert "argyll tool failed" in out
     assert "ValueError: raised elsewhere" in err
+
+
+def test_log_error_traceback_in_except_block(app_log, capsys):
+    """A recovered error is recorded in the app log, and shown on a console."""
+    try:
+        raise KeyError("recovered")
+    except KeyError:
+        log_error_traceback()
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "KeyError: 'recovered'" in err
+    logged = "\n".join(r.getMessage() for r in app_log.records)
+    assert "KeyError: 'recovered'" in logged
+    assert "test_log_error_traceback_in_except_block" in logged
+
+
+def test_log_error_traceback_outside_except_records_nothing(app_log, capsys):
+    """Without a current exception there is nothing to record."""
+    log_error_traceback()
+    out, err = capsys.readouterr()
+    assert (out, err) == ("", "")
+    assert app_log.records == []
+
+
+def test_log_error_traceback_does_not_write_to_the_py2exe_shim(app_log, monkeypatch):
+    """With stderr redirected to the log, the traceback is logged only once."""
+
+    class LogStream:
+        is_log_stream = True
+
+        def __init__(self):
+            self.written = []
+
+        def write(self, text):
+            self.written.append(text)
+
+    stream = LogStream()
+    monkeypatch.setattr(sys, "stderr", stream)
+    log_error_traceback(_raise_and_catch("recovered in the loader"))
+    assert stream.written == []
+    assert len(app_log.records) == 1
+    assert "ValueError: recovered in the loader" in app_log.records[0].getMessage()
+
+
+def test_importing_debughelpers_does_not_import_log():
+    """Library modules importing debughelpers must not pull in DisplayCAL.log.
+
+    DisplayCAL.log replaces warnings.showwarning and sets
+    logging.raiseExceptions = 0 when imported.
+    """
+    import subprocess
+
+    code = (
+        "import sys; import DisplayCAL.debughelpers; "
+        "print('DisplayCAL.log' in sys.modules)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    assert result.stdout.strip() == "False"

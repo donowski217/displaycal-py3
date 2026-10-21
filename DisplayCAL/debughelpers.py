@@ -12,7 +12,6 @@ import sys
 import traceback
 from typing import TYPE_CHECKING
 
-from DisplayCAL.log import log_error
 from DisplayCAL.meta import WX_RECVERSION
 from DisplayCAL.options import DEBUG
 from DisplayCAL.util_str import box
@@ -183,6 +182,52 @@ def print_error_traceback(
     if tbstr and sys.stderr:
         with contextlib.suppress(Exception):
             sys.stderr.write(tbstr)
+
+
+def log_error(text: str) -> bool:
+    """Record text in the application log file (see DisplayCAL.log.log_error).
+
+    Imported lazily: importing DisplayCAL.log has global side effects
+    (warnings.showwarning, logging.raiseExceptions) that library modules which
+    only import this module for its exception classes should not trigger.
+
+    Args:
+        text (str): The text to record. May span multiple lines.
+
+    Returns:
+        bool: True if the text was recorded in the application log file.
+    """
+    from DisplayCAL.log import log_error as _log_error
+
+    return _log_error(text)
+
+
+def log_error_traceback(
+    error: None | tuple[type, BaseException, TracebackType] | BaseException = None,
+) -> None:
+    """Record the traceback of a handled error in the application log.
+
+    For errors that are caught and recovered from. Unlike
+    traceback.print_exc(), this does not write to the py2exe stderr shim of
+    windowed builds (whose first write arms an "Errors in ..." message box at
+    exit), and it never prints "NoneType: None". On a console, the traceback is
+    also shown on stderr, as before. Never raises.
+
+    Args:
+        error (None | tuple[type, BaseException, TracebackType] | BaseException):
+            The error, or None for the exception currently being handled.
+    """
+    try:
+        tbstr = format_error_traceback(sys.exc_info() if error is None else error)
+        if not tbstr:
+            return
+        logged = log_error(tbstr)
+        stderr = sys.stderr
+        if logged and stderr is not None and not _is_log_stream(stderr):
+            stderr.write(tbstr)
+            stderr.flush()
+    except Exception:
+        pass
 
 
 def _is_log_stream(stream: object) -> bool:
