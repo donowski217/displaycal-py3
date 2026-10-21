@@ -160,6 +160,24 @@ def test_read_tells_timeout_from_eof(main, server):
         appsocket.close()
 
 
+def test_read_keeps_partial_reply_after_timeout(main, server):
+    """A read() that times out must not lose what already arrived."""
+
+    def slow_reply(conn: socket.socket, fake: FakeServer) -> None:
+        fake.received.append(_recv_line(conn))
+        conn.sendall("DisplayCAL-apply-".encode())
+        time.sleep(1.0)
+        conn.sendall("profiles ✓\x04".encode())
+
+    fake = server(slow_reply)
+    appsocket = _connect(main, fake.port)
+    try:
+        assert appsocket.read(timeout=0.3) is None
+        assert appsocket.read(timeout=10) == "DisplayCAL-apply-profiles ✓\x04"
+    finally:
+        appsocket.close()
+
+
 class _Lock:
     def __init__(self) -> None:
         self.unlocked = 0
@@ -214,13 +232,64 @@ def test_probe_treats_foreign_reply_as_not_our_instance(main, server):
     assert fake.received == ["getappname"]
 
 
-def test_probe_gives_up_on_silent_listener(main, server, monkeypatch):
+def _port_owner(monkeypatch, main, ours: bool) -> list[int]:
+    """Make is_port_of_running_instance() answer `ours`; return the ports asked."""
+    asked = []
+
+    def is_port_of_running_instance(port: int) -> bool:
+        asked.append(port)
+        return ours
+
+    monkeypatch.setattr(
+        main, "is_port_of_running_instance", is_port_of_running_instance
+    )
+    return asked
+
+
+def test_probe_gives_up_on_silent_foreign_listener(main, server, monkeypatch):
     monkeypatch.setattr(main.AppSocket, "PROBE_TIMEOUT", 0.3)
+    asked = _port_owner(monkeypatch, main, ours=False)
     fake = server(silent_listener)
     result, lock, elapsed = _run_probe(main, "apply-profiles", fake.port)
     assert result is None
     assert lock.unlocked == 0
     assert elapsed < 5
+    assert asked == [fake.port]
+
+
+def test_probe_waits_for_our_instance_that_is_still_starting(
+    main, server, monkeypatch
+):
+    """An instance listens early, but only replies once its UI is set up.
+
+    That can take longer than the probe's time limit (splash screen, display
+    and instrument enumeration, first-run dialogs). It must still be notified
+    instead of being mistaken for a foreign service, which would start a
+    second instance.
+    """
+    monkeypatch.setattr(main, "PYNAME", "DisplayCAL")
+    monkeypatch.setattr(main.AppSocket, "PROBE_TIMEOUT", 0.3)
+    monkeypatch.setattr(sys, "argv", ["DisplayCAL.exe"])
+    asked = _port_owner(monkeypatch, main, ours=True)
+
+    def starting_gui_instance(conn: socket.socket, fake: FakeServer) -> None:
+        fake.received.append(_recv_line(conn))
+        time.sleep(0.5)
+        conn.sendall(b"Display")
+        time.sleep(0.5)
+        conn.sendall(b"CAL\x04")
+        fake.received.append(_recv_line(conn))
+        conn.sendall(b"ok\x04")
+
+    fake = server(starting_gui_instance)
+    result, lock, elapsed = _run_probe(main, None, fake.port)
+
+    assert fake.received == ["getappname", "DisplayCAL"]
+    assert result == "ok"
+    assert lock.unlocked == 0
+    assert elapsed >= 1.0
+    assert len(asked) >= 2
+    assert set(asked) == {fake.port}
 
 
 def _our_instance(reply_to_exit: bytes, delay: float):

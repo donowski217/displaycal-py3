@@ -9,6 +9,8 @@ import ast
 import faulthandler
 import os
 import pathlib
+import socket
+import subprocess
 import sys
 import types
 
@@ -256,3 +258,278 @@ def test_is_other_instance_process(main, fake_processes):
     assert main.is_other_instance_process(WORKER_PID) is False
     assert main.is_other_instance_process(GONE_PID) is False
     assert main.is_other_instance_process(PROTECTED_PID) is True
+
+
+# Who listens on the port of an instance that does not reply in time?
+
+PORT = 15411
+OTHER_PORT = 49152
+GUI_EXE = r"C:\Program Files\DisplayCAL\DisplayCAL.exe"
+
+
+class FakeListener:
+    """A process for the fake psutil of the `system` fixture.
+
+    Args:
+        pid: Process ID.
+        name: Process name, or the exception that name() raises.
+        cmdline: Command line, or the exception that cmdline() raises.
+        ports: Ports it listens on, or the exception that its
+            net_connections() raises.
+        hidden: Its sockets are listed without PID by psutil.net_connections()
+            (e.g. a process of another user under Linux).
+        old_psutil: Only has connections() (psutil < 6.0).
+    """
+
+    def __init__(
+        self,
+        pid: int,
+        name: str | Exception,
+        cmdline: list[str] | Exception,
+        ports: list[int] | Exception = (),
+        hidden: bool = False,
+        old_psutil: bool = False,
+    ) -> None:
+        self.pid = pid
+        self._name = name
+        self._cmdline = cmdline
+        self.ports = ports
+        self.hidden = hidden
+        if old_psutil:
+            self.connections = self._get_connections
+        else:
+            self.net_connections = self._get_connections
+
+    @staticmethod
+    def _value(value):
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def name(self) -> str:
+        return self._value(self._name)
+
+    def cmdline(self) -> list[str]:
+        return self._value(self._cmdline)
+
+    def _get_connections(self, kind: str = "inet") -> list:
+        assert kind == "tcp"
+        return _listening(self._value(self.ports))
+
+
+def _listening(ports, pid=None) -> list:
+    import psutil
+
+    return [
+        types.SimpleNamespace(
+            pid=pid,
+            status=psutil.CONN_LISTEN,
+            laddr=types.SimpleNamespace(ip="127.0.0.1", port=port),
+        )
+        for port in ports
+    ]
+
+
+@pytest.fixture
+def system(monkeypatch):
+    """Fake psutil process and connection listings."""
+    psutil = pytest.importorskip("psutil")
+    env = types.SimpleNamespace(
+        processes=[], gone=set(), scans=0, net_connections_error=None
+    )
+
+    def net_connections(kind: str = "inet") -> list:
+        assert kind == "tcp"
+        if env.net_connections_error:
+            raise env.net_connections_error
+        connections = []
+        for process in env.processes:
+            if isinstance(process.ports, Exception):
+                continue
+            pid = None if process.hidden else process.pid
+            connections += _listening(process.ports, pid)
+        return connections
+
+    def process(pid: int) -> FakeListener:
+        for candidate in env.processes:
+            if candidate.pid == pid and pid not in env.gone:
+                return candidate
+        raise psutil.NoSuchProcess(pid)
+
+    def process_iter():
+        env.scans += 1
+        return iter([p for p in env.processes if p.pid not in env.gone])
+
+    monkeypatch.setattr(psutil, "net_connections", net_connections)
+    monkeypatch.setattr(psutil, "Process", process)
+    monkeypatch.setattr(psutil, "process_iter", process_iter)
+    return env
+
+
+def _gui(ports, pid=5555, **kwargs) -> FakeListener:
+    return FakeListener(pid, "DisplayCAL.exe", [GUI_EXE], ports, **kwargs)
+
+
+def _foreign(ports, pid=6666, **kwargs) -> FakeListener:
+    return FakeListener(pid, "svchost.exe", ["svchost.exe", "-k"], ports, **kwargs)
+
+
+def _python(cmdline, ports, pid=7777, **kwargs) -> FakeListener:
+    return FakeListener(pid, "python.exe", cmdline, ports, **kwargs)
+
+
+def test_port_of_our_starting_instance(main, system):
+    system.processes += [_foreign([OTHER_PORT]), _gui([PORT])]
+    assert main.is_port_of_running_instance(PORT) is True
+    # The listener is known, so the command lines of all processes (which
+    # takes seconds) are not read
+    assert system.scans == 0
+
+
+def test_port_of_our_instance_from_a_source_install(main, system):
+    script = r"C:\DisplayCAL\scripts\displaycal-apply-profiles"
+    system.processes.append(_python(["python.exe", script], [PORT]))
+    assert main.is_port_of_running_instance(PORT) is True
+
+
+def test_port_taken_over_by_a_foreign_service(main, system):
+    """Our instance listens elsewhere; a foreign service has the old port."""
+    system.processes += [_gui([OTHER_PORT]), _foreign([PORT])]
+    assert main.is_port_of_running_instance(PORT) is False
+
+
+def test_port_taken_over_by_another_python_program(main, system):
+    system.processes.append(_python(["python.exe", "other_service.py"], [PORT]))
+    assert main.is_port_of_running_instance(PORT) is False
+
+
+def test_port_of_python_with_unreadable_command_line_counts(main, system):
+    """It may be a source install of ours: keep waiting as before."""
+    psutil = pytest.importorskip("psutil")
+    system.processes.append(_python(psutil.AccessDenied(7777), [PORT]))
+    assert main.is_port_of_running_instance(PORT) is True
+
+
+def test_port_of_this_process_does_not_count(main, system):
+    system.processes.append(_gui([PORT], pid=os.getpid()))
+    assert main.is_port_of_running_instance(PORT) is False
+
+
+def test_port_of_vanished_process_does_not_count(main, system):
+    system.processes.append(_gui([PORT]))
+    system.gone.add(5555)
+    assert main.is_port_of_running_instance(PORT) is False
+
+
+def test_port_nobody_listens_on_does_not_count(main, system):
+    system.processes.append(_gui([OTHER_PORT]))
+    assert main.is_port_of_running_instance(PORT) is False
+
+
+def _hide_listeners(system, how: str) -> None:
+    psutil = pytest.importorskip("psutil")
+    if how == "no-permission":
+        # psutil.net_connections() under macOS without root
+        system.net_connections_error = psutil.AccessDenied()
+    else:
+        for process in system.processes:
+            process.hidden = True
+
+
+hidden_listeners = pytest.mark.parametrize("how", ["no-permission", "no-pid"])
+
+
+@hidden_listeners
+def test_hidden_port_of_our_instance(main, system, how):
+    system.processes += [_foreign([OTHER_PORT]), _gui([PORT])]
+    _hide_listeners(system, how)
+    assert main.is_port_of_running_instance(PORT) is True
+    assert system.scans == 1
+
+
+@hidden_listeners
+def test_hidden_port_of_our_instance_with_old_psutil(main, system, how):
+    system.processes.append(_gui([PORT], old_psutil=True))
+    _hide_listeners(system, how)
+    assert main.is_port_of_running_instance(PORT) is True
+
+
+@hidden_listeners
+def test_hidden_port_taken_over_by_a_foreign_service(main, system, how):
+    system.processes += [_gui([OTHER_PORT]), _foreign([PORT])]
+    _hide_listeners(system, how)
+    assert main.is_port_of_running_instance(PORT) is False
+    assert system.scans == 1
+
+
+@hidden_listeners
+def test_hidden_port_of_uninspectable_instance_counts(main, system, how):
+    """If a process of ours cannot be inspected, keep waiting as before."""
+    psutil = pytest.importorskip("psutil")
+    system.processes += [_gui(psutil.AccessDenied(5555)), _foreign([PORT])]
+    _hide_listeners(system, how)
+    assert main.is_port_of_running_instance(PORT) is True
+
+
+def test_port_owner_without_psutil_counts(main, monkeypatch):
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    assert main.is_port_of_running_instance(PORT) is True
+
+
+def test_port_owner_when_nothing_can_be_listed(main, system, monkeypatch):
+    psutil = pytest.importorskip("psutil")
+
+    def process_iter():
+        raise psutil.AccessDenied()
+
+    system.net_connections_error = psutil.AccessDenied()
+    monkeypatch.setattr(psutil, "process_iter", process_iter)
+    assert main.is_port_of_running_instance(PORT) is True
+
+
+LISTENER_SCRIPT = """
+import socket
+import sys
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.bind(("127.0.0.1", 0))
+sock.listen(1)
+print(sock.getsockname()[1], flush=True)
+sys.stdin.read()
+"""
+
+
+def test_port_owner_with_real_psutil(main):
+    """The real psutil API: a child process "of ours" listening on loopback.
+
+    Its command line contains the application name, like a DisplayCAL
+    script run from a source install. The child only listens; nothing
+    connects to it, and it exits when its stdin is closed.
+    """
+    pytest.importorskip("psutil")
+    child = subprocess.Popen(
+        [sys.executable, "-c", LISTENER_SCRIPT, "DisplayCAL-port-owner-test"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        port = int(child.stdout.readline())
+        own = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            own.bind(("127.0.0.1", 0))
+            own.listen(1)
+            own_port = own.getsockname()[1]
+            assert main.is_port_of_running_instance(port) is True
+            # Only this (test) process listens on own_port
+            assert main.is_port_of_running_instance(own_port) is False
+        finally:
+            own.close()
+    finally:
+        child.stdin.close()
+        try:
+            child.wait(10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(10)
+        child.stdout.close()
