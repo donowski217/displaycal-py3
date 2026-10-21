@@ -636,6 +636,61 @@ def validate_and_rename_logfile(logfile: str, logbackup: str) -> None:
         # logging.handlers.TimedRotatingFileHandler.getFilesToDelete
 
 
+def open_fault_log(path: str, label: str, max_size: int = 1024 * 1024) -> TextIO:
+    """Open the faulthandler log for appending and write a start header.
+
+    The file is appended to rather than truncated, so the crash dump of a
+    previous run, or of another instance that is still running, is kept. If
+    the file is larger than max_size, it is first moved to "<path>.prev"
+    (this is skipped if it fails, e.g. while another instance holds the file
+    open).
+
+    Note that faulthandler never records a Py_FatalError (CPython disables
+    faulthandler before it aborts); that text only goes to the C-level stderr.
+
+    Args:
+        path (str): Path of the fault log file.
+        label (str): Identifies the process in the header, e.g. the
+            application name and version.
+        max_size (int, optional): Size in bytes above which the existing file
+            is moved aside. Defaults to 1 MiB.
+
+    Returns:
+        TextIO: The open file, to be passed to faulthandler.enable().
+    """
+    try:
+        if os.path.getsize(path) > max_size:
+            os.replace(path, f"{path}.prev")
+    except OSError:
+        pass
+    fault_log = open(path, "a", encoding="utf-8")  # noqa: SIM115
+    fault_log.write(
+        f"=== {strftime('%Y-%m-%d %H:%M:%S')} {label} PID {os.getpid()} started ===\n"
+    )
+    fault_log.flush()
+    return fault_log
+
+
+def write_fault_log_footer(fault_log: TextIO, label: str) -> None:
+    """Write an exit footer to the fault log. Never raises.
+
+    Meant to run at exit, so a start header without a matching footer means
+    that the process did not exit normally (e.g. it crashed or was killed).
+    Also tells real crashes apart from handled first-chance exceptions which
+    faulthandler logs on Windows as well.
+
+    Args:
+        fault_log (TextIO): The file returned by open_fault_log().
+        label (str): The label that was passed to open_fault_log().
+    """
+    with contextlib.suppress(Exception):
+        fault_log.write(
+            f"=== {strftime('%Y-%m-%d %H:%M:%S')} {label} PID {os.getpid()} "
+            "exited ===\n"
+        )
+        fault_log.flush()
+
+
 def setup_logging(
     logdir: str,
     name: str = APPNAME,

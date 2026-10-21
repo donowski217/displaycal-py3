@@ -50,7 +50,7 @@ from DisplayCAL.config import (
     initcfg,
 )
 from DisplayCAL.debughelpers import ResourceError, handle_error
-from DisplayCAL.log import LOG
+from DisplayCAL.log import LOG, open_fault_log, write_fault_log_footer
 from DisplayCAL.meta import (
     NAME as APPNAME,
 )
@@ -202,18 +202,29 @@ def print_system_version_information() -> None:
 
 
 def initialize_fault_handler() -> None:
-    """Initialize faulthandler to log crashes."""
+    """Initialize faulthandler to log crashes.
+
+    The fault log is appended to, with a header line for each process start
+    and a footer line at a normal exit, so the crash dump of a previous run
+    (or of another instance that is still running) is not wiped when the
+    application is started again.
+    """
     # Enable faulthandler
     try:
         import faulthandler
     except Exception as exception:
         print(exception)
     else:
+        label = f"{PYNAME}{RUNTYPE} {VERSION_STRING}"
         try:
-            faulthandler.enable(open(os.path.join(LOGDIR, f"{PYNAME}-fault.log"), "w"))  # noqa: SIM115
+            fault_log = open_fault_log(
+                os.path.join(LOGDIR, f"{PYNAME}-fault.log"), label
+            )
+            faulthandler.enable(fault_log, all_threads=True)
         except Exception as exception:
             print(exception)
         else:
+            atexit.register(write_fault_log_footer, fault_log, label)
             print("Faulthandler", getattr(faulthandler, "__version__", ""))
 
 

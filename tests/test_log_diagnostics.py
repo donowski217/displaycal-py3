@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import codecs
 import contextlib
+import faulthandler
 import gc
 import io
 import locale
 import logging
+import os
 import sys
 import threading
 import types
@@ -501,3 +503,66 @@ def test_unraisable_exception_reaches_app_log(stdio_env):
     text = stdio_env.path.read_text(encoding="utf-8")
     assert "Exception ignored in" in text
     assert "RuntimeError: del boom" in text
+
+
+# The faulthandler log is appended to, not truncated
+
+
+PREVIOUS_DUMP = (
+    "Windows fatal exception: access violation\n\n"
+    "Current thread 0x00001234 (most recent call first):\n"
+    '  File "mscms.py", line 42 in get_calibration_management_state\n'
+)
+
+
+def test_open_fault_log_keeps_previous_crash_dump(tmp_path):
+    path = tmp_path / "DisplayCAL-apply-profiles-fault.log"
+    path.write_text(PREVIOUS_DUMP, encoding="utf-8")
+
+    fault_log = log.open_fault_log(str(path), "DisplayCAL-apply-profiles.exe 3.10")
+    fault_log.close()
+
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith(PREVIOUS_DUMP)
+    header = text[len(PREVIOUS_DUMP) :]
+    assert header.startswith("=== ")
+    assert header.endswith(
+        f" DisplayCAL-apply-profiles.exe 3.10 PID {os.getpid()} started ===\n"
+    )
+
+
+def test_open_fault_log_moves_big_file_aside(tmp_path):
+    path = tmp_path / "DisplayCAL-fault.log"
+    path.write_text(PREVIOUS_DUMP * 100, encoding="utf-8")
+
+    fault_log = log.open_fault_log(str(path), "DisplayCAL", max_size=1000)
+    fault_log.close()
+
+    prev = tmp_path / "DisplayCAL-fault.log.prev"
+    assert prev.read_text(encoding="utf-8") == PREVIOUS_DUMP * 100
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith("=== ")
+    assert text.endswith(" started ===\n")
+    assert text.count("\n") == 1
+
+
+def test_open_fault_log_works_with_faulthandler(tmp_path):
+    """faulthandler writes to the file descriptor of the returned file."""
+    path = tmp_path / "DisplayCAL-fault.log"
+    fault_log = log.open_fault_log(str(path), "DisplayCAL")
+    try:
+        faulthandler.dump_traceback(file=fault_log, all_threads=False)
+        log.write_fault_log_footer(fault_log, "DisplayCAL")
+    finally:
+        fault_log.close()
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0].endswith(" started ===")
+    assert any("test_open_fault_log_works_with_faulthandler" in line for line in lines)
+    assert lines[-1].endswith(f" DisplayCAL PID {os.getpid()} exited ===")
+
+
+def test_write_fault_log_footer_never_raises(tmp_path):
+    fault_log = log.open_fault_log(str(tmp_path / "fault.log"), "DisplayCAL")
+    fault_log.close()
+    log.write_fault_log_footer(fault_log, "DisplayCAL")
