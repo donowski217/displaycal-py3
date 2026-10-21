@@ -371,6 +371,40 @@ def test_steady_state_iteration_is_quiet(monkeypatch, capsys):
     assert "lock" not in out.lower()
 
 
+def test_repeated_gamma_ramp_read_error_is_logged_once(monkeypatch, capsys):
+    pl = _make_pl()
+    pl._manual_restore = False
+    pl._last_exception_args = ()
+    monkeypatch.setattr(profile_loader, "DEBUG", False)
+    monkeypatch.setattr(profile_loader, "getcfg", lambda name, *args, **kwargs: 1)
+    # Never touch a real display device context
+    monkeypatch.setattr(profile_loader.win32gui, "CreateDC", lambda *args: 1234)
+    monkeypatch.setattr(profile_loader.win32gui, "DeleteDC", lambda hdc: None)
+
+    class FailingGDI32:
+        @staticmethod
+        def GetDeviceGammaRamp(hdc, ramp):  # noqa: N802
+            raise OSError("exception: access violation reading 0x0")
+
+    pl.gdi32 = FailingGDI32()
+    for _ in range(3):
+        idle, do_continue = pl._check_gamma_ramp_status(
+            display="Display 1",
+            idle=True,
+            i=0,
+            moninfo={"Device": r"\\.\DISPLAY1"},
+            display_desc="1. Display 1",
+            key="key0",
+            profile_association_changed=False,
+            apply_profiles=True,
+            vcgt_values=([], [], []),
+            hwnds_pids_changed=False,
+        )
+        assert (idle, do_continue) == (True, True)
+
+    assert capsys.readouterr().out.count("Handled exception") == 1
+
+
 def test_apply_profiles_releases_lock_on_error(monkeypatch):
     from DisplayCAL import worker
 

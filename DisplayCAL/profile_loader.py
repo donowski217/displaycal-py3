@@ -4290,7 +4290,10 @@ class ProfileLoader:
             try:
                 result = self.gdi32.GetDeviceGammaRamp(hdc, ramp)
             except Exception as e:
-                print("Handled exception:", e)
+                # Runs every three seconds: only log an error when it changes
+                if e.args != self._last_exception_args or DEBUG:
+                    self._last_exception_args = e.args
+                    print("Handled exception:", e)
                 # continue
                 return idle, True
             finally:
