@@ -16,10 +16,12 @@ import io
 import locale
 import logging
 import os
+import subprocess
 import sys
 import threading
 import types
 import uuid
+import weakref
 
 import pytest
 
@@ -503,6 +505,196 @@ def test_unraisable_exception_reaches_app_log(stdio_env):
     text = stdio_env.path.read_text(encoding="utf-8")
     assert "Exception ignored in" in text
     assert "RuntimeError: del boom" in text
+
+
+# A write from a finalizer while the stream holds its lock must not deadlock
+
+
+class _WritesWhileLocked(weakref.WeakSet):
+    """The set of line buffers of a StdioToLog stream, used under its lock.
+
+    Writes to the stream once, the first time it is used while armed. That is
+    what a finalizer does if a garbage collection runs it in the middle of the
+    stream's bookkeeping: e.g. the default sys.unraisablehook writes
+    "Exception ignored in ..." to sys.stderr.
+    """
+
+    def __init__(self, stream: log.StdioToLog, text: str) -> None:
+        super().__init__()
+        self.stream = stream
+        self.text = text
+        self.armed = True
+
+    def _finalizer_writes(self) -> None:
+        if self.armed:
+            self.armed = False
+            self.stream.write(self.text)
+
+    def add(self, item: object) -> None:
+        self._finalizer_writes()
+        super().add(item)
+
+    def __iter__(self):
+        self._finalizer_writes()
+        yield from super().__iter__()
+
+
+FINALIZER_TEXT = "Exception ignored in: <function Finalizer.__del__>\n"
+
+
+def _run_with_time_limit(target, *args) -> threading.Thread:
+    thread = threading.Thread(target=target, args=args, daemon=True)
+    thread.start()
+    thread.join(10)
+    return thread
+
+
+def test_stdio_to_log_write_from_finalizer_on_first_write(stdio_env):
+    """A thread's first write registers its buffer under the stream's lock."""
+    stream = log.StdioToLog(logging.ERROR, stdio_env.shim, passthrough=True)
+    stream._buffers = _WritesWhileLocked(stream, FINALIZER_TEXT)
+
+    thread = _run_with_time_limit(stream.write, "first line of a new thread\n")
+
+    assert not thread.is_alive(), "the thread deadlocked on the stream's own lock"
+    assert not stream._buffers.armed
+    assert [m for _, m in _messages(stdio_env.logger)] == [
+        "first line of a new thread",
+        FINALIZER_TEXT.rstrip(),
+    ]
+    assert "".join(stdio_env.shim.written) == (
+        f"first line of a new thread\n{FINALIZER_TEXT}"
+    )
+
+
+def test_stdio_to_log_write_from_finalizer_while_flushing(stdio_env):
+    """flush_pending() (at exit) goes through all buffers under the lock."""
+    stream = log.StdioToLog(logging.ERROR, stdio_env.shim, passthrough=True)
+    stream._buffers = _WritesWhileLocked(stream, FINALIZER_TEXT)
+    stream._buffers.armed = False
+    stream.write("partial line at exit")
+    stream._buffers.armed = True
+
+    thread = _run_with_time_limit(stream.flush_pending)
+
+    assert not thread.is_alive(), "flush_pending() deadlocked on the stream's lock"
+    assert not stream._buffers.armed
+    assert [m for _, m in _messages(stdio_env.logger)] == [
+        "partial line at exit",
+        FINALIZER_TEXT.rstrip(),
+    ]
+
+
+GC_FINALIZER_CHAIN_SCRIPT = """
+import faulthandler
+import gc
+import logging
+import sys
+import threading
+
+from DisplayCAL import log
+
+scenario, log_path, dump_path = sys.argv[1:4]
+dump = open(dump_path, "w", encoding="utf-8")
+faulthandler.dump_traceback_later(20, exit=True, file=dump)
+
+logger = logging.getLogger("gc_finalizer_chain")
+logger.propagate = False
+logger.setLevel(logging.DEBUG)
+logger.addHandler(logging.FileHandler(log_path, encoding="utf-8"))
+log.LOGGER = logger
+
+
+class Stderr:
+    def write(self, text):
+        pass
+
+    def flush(self):
+        pass
+
+
+sys.stderr = log.StdioToLog(logging.ERROR, Stderr(), passthrough=True)
+sys.unraisablehook = sys.__unraisablehook__
+STOP = False
+
+
+class GarbageChain:
+    # Cyclic garbage whose finalizer raises and leaves the next cycle behind,
+    # so a garbage collection can run a finalizer at nearly any allocation.
+
+    def __init__(self, remaining):
+        self.remaining = remaining
+        self.cycle = self
+
+    def __del__(self):
+        if self.remaining and not STOP:
+            GarbageChain(self.remaining - 1)
+        raise RuntimeError(f"chain link {self.remaining}")
+
+
+def first_write():
+    GarbageChain(2000)
+    sys.stderr.write("first line of a new thread\\n")
+
+
+def flush_at_exit():
+    GarbageChain(2000)
+    sys.stderr.flush_pending()
+
+
+if scenario == "flush":
+    sys.stderr.write("partial line at exit")
+    target = flush_at_exit
+else:
+    target = first_write
+gc.set_threshold(1)
+thread = threading.Thread(target=target, daemon=True)
+thread.start()
+thread.join()
+STOP = True
+gc.set_threshold(700, 10, 10)
+gc.collect()
+faulthandler.cancel_dump_traceback_later()
+"""
+
+
+@pytest.mark.parametrize("scenario", ["first-write", "flush"])
+def test_stdio_to_log_survives_gc_finalizers_writing_to_stderr(tmp_path, scenario):
+    """The real thing: the default sys.unraisablehook run by the garbage collector.
+
+    With gc.set_threshold(1), nearly every allocation can run a finalizer,
+    also while the stream holds its lock. Runs in a child process, so a
+    deadlock cannot hang the test run (faulthandler ends it after 20 s and
+    dumps the stacks).
+    """
+    log_path = tmp_path / "app.log"
+    dump_path = tmp_path / "stacks.txt"
+    root = os.path.dirname(os.path.dirname(os.path.abspath(log.__file__)))
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            GC_FINALIZER_CHAIN_SCRIPT,
+            scenario,
+            str(log_path),
+            str(dump_path),
+        ],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=90,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+    )
+    stacks = dump_path.read_text(encoding="utf-8") if dump_path.exists() else ""
+    assert result.returncode == 0, f"deadlocked or failed:\n{stacks}{result.stderr}"
+    text = log_path.read_text(encoding="utf-8")
+    if scenario == "flush":
+        assert "partial line at exit" in text
+    else:
+        assert "first line of a new thread" in text
+    assert "Exception ignored in" in text
+    assert "RuntimeError: chain link" in text
 
 
 # The faulthandler log is appended to, not truncated

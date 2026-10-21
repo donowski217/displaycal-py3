@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import collections
 import contextlib
 import logging
 import logging.handlers
@@ -752,6 +753,21 @@ def setup_logging(
 # set (e.g. by a handler reporting its own error to sys.stderr) is only passed
 # through to the original stream, so emitting can never recurse.
 _EMITTING = threading.local()
+# Per-thread state while a StdioToLog stream holds its lock: .active is set
+# meanwhile, and .deferred queues (stream, text) of every write to a
+# redirected stream that happens on the same thread in that time. Such a write
+# can only come from code that interrupts the bookkeeping: a finalizer run by
+# a garbage collection at any allocation (e.g. the default sys.unraisablehook
+# reporting "Exception ignored in ..." to sys.stderr), or a signal handler.
+# Taking the lock again there would deadlock the thread on its own lock (and
+# with it every other thread that writes to that stream), and emitting there
+# would emit with the lock held, so the outer call logs the queued text once
+# it has released the lock.
+_BOOKKEEPING = threading.local()
+# Upper bound of queued writes that one call logs, so a finalizer that keeps
+# writing on every garbage collection cannot keep the writing thread busy
+# forever. Anything left is logged by the next write on that thread.
+_MAX_DEFERRED_WRITES = 1000
 # StdioToLog instances installed by redirect_stdio_to_log()
 _STDIO_LOG_STREAMS: list[StdioToLog] = []
 
@@ -845,6 +861,33 @@ class _LineBuffer:
         self.pending = ""
 
 
+def _begin_bookkeeping() -> None:
+    """Mark the calling thread as holding (or about to take) a stream lock.
+
+    The deferral queue is created before the flag is set, so a write that
+    interrupts this (and sees the flag) always finds the queue.
+    """
+    if getattr(_BOOKKEEPING, "deferred", None) is None:
+        _BOOKKEEPING.deferred = collections.deque()
+    _BOOKKEEPING.active = True
+
+
+def _log_deferred_writes() -> None:
+    """Log the text that was written during the calling thread's bookkeeping.
+
+    Must be called while the calling thread holds no StdioToLog lock.
+    """
+    deferred = getattr(_BOOKKEEPING, "deferred", None)
+    for _ in range(_MAX_DEFERRED_WRITES):
+        if not deferred:
+            break
+        try:
+            stream, text = deferred.popleft()
+        except IndexError:
+            break
+        stream._log_text(text)
+
+
 class StdioToLog:
     """Standard stream replacement that sends whole lines to the app log.
 
@@ -857,7 +900,12 @@ class StdioToLog:
 
     Partial lines are buffered per thread, and no lock is held while a
     record is emitted, so there is no lock-order inversion with the handlers'
-    locks. Consecutive identical lines (like the profile loader's monitoring
+    locks. A write on a thread whose bookkeeping it interrupts (a finalizer
+    run by the garbage collector, e.g. the default sys.unraisablehook, or a
+    signal handler) is queued and logged once the lock is released, instead
+    of deadlocking on the lock (see _BOOKKEEPING).
+
+    Consecutive identical lines (like the profile loader's monitoring
     thread "Acquired lock" message every few seconds) are collapsed into
     "(last message repeated N times)", which is still written at least every
     ``repeat_summary_interval`` seconds while the repetition goes on, so the
@@ -891,8 +939,10 @@ class StdioToLog:
         self.original = original
         self.passthrough = passthrough
         self._local = threading.local()
-        # Only protects the bookkeeping below. Never held while emitting.
-        self._lock = threading.Lock()
+        # Only protects the bookkeeping below. Never held while emitting, and
+        # never taken again by the thread holding it (_BOOKKEEPING defers such
+        # writes). Reentrant only as a safety net against a permanent freeze.
+        self._lock = threading.RLock()
         self._buffers = weakref.WeakSet()
         self._last_line = None
         self._repeat_count = 0
@@ -924,7 +974,12 @@ class StdioToLog:
                 return len(text)
             if self.passthrough:
                 self._write_original(text)
-            self._log_lines(self._take_lines(text))
+            if getattr(_BOOKKEEPING, "active", False):
+                # This interrupted a stream's bookkeeping on this thread
+                _BOOKKEEPING.deferred.append((self, text))
+                return len(text)
+            self._log_text(text)
+            _log_deferred_writes()
         except Exception:
             pass
         return len(text)
@@ -953,20 +1008,27 @@ class StdioToLog:
         try:
             if (
                 getattr(_EMITTING, "active", False)
+                or getattr(_BOOKKEEPING, "active", False)
                 or sys.is_finalizing()
                 or not _app_file_handlers()
             ):
                 return
-            with self._lock:
-                messages = []
-                if self._repeat_count:
-                    messages.append(self._take_repeat_summary(time()))
-                for buffer in list(self._buffers):
-                    pending, buffer.pending = buffer.pending, ""
-                    if pending.strip():
-                        messages.append(pending.rstrip())
+            _begin_bookkeeping()
+            try:
+                with self._lock:
+                    messages = []
+                    if self._repeat_count:
+                        messages.append(self._take_repeat_summary(time()))
+                    for buffer in list(self._buffers):
+                        pending, buffer.pending = buffer.pending, ""
+                        if pending.strip():
+                            messages.append(pending.rstrip())
+            finally:
+                _BOOKKEEPING.active = False
+            # Emit without holding the lock
             for message in messages:
                 _emit_to_app_log(self.level, message)
+            _log_deferred_writes()
         except Exception:
             pass
 
@@ -981,8 +1043,28 @@ class StdioToLog:
             with contextlib.suppress(Exception):
                 original.write(text)
 
+    def _log_text(self, text: str) -> None:
+        """Send the whole lines of text to the log (without passthrough).
+
+        Must be called while the calling thread holds no StdioToLog lock.
+
+        Args:
+            text (str): The text to add to the calling thread's buffer.
+        """
+        _begin_bookkeeping()
+        try:
+            with self._lock:
+                messages = self._collapse(self._take_lines(text), time())
+        finally:
+            _BOOKKEEPING.active = False
+        # Emit without holding the lock
+        for message in messages:
+            _emit_to_app_log(self.level, message)
+
     def _take_lines(self, text: str) -> list[str]:
         """Add text to the calling thread's buffer and take the whole lines.
+
+        Must be called with the lock held.
 
         Args:
             text (str): The text to add.
@@ -993,8 +1075,7 @@ class StdioToLog:
         buffer = getattr(self._local, "buffer", None)
         if buffer is None:
             buffer = self._local.buffer = _LineBuffer()
-            with self._lock:
-                self._buffers.add(buffer)
+            self._buffers.add(buffer)
         text = (buffer.pending + text).replace("\r\n", "\n").replace("\r", "\n")
         *lines, pending = text.split("\n")
         if len(pending) > self.max_line_length:
@@ -1003,32 +1084,34 @@ class StdioToLog:
         buffer.pending = pending
         return lines
 
-    def _log_lines(self, lines: list[str]) -> None:
-        """Send lines to the log, collapsing consecutive identical lines.
+    def _collapse(self, lines: list[str], now: float) -> list[str]:
+        """Return the messages to log, collapsing consecutive identical lines.
+
+        Must be called with the lock held.
 
         Args:
             lines (list[str]): The lines to log.
+            now (float): The current time.
+
+        Returns:
+            list[str]: The messages to log.
         """
         messages = []
-        now = time()
-        with self._lock:
-            for line in lines:
-                line = line.rstrip()  # noqa: PLW2901
-                if not line:
-                    continue
-                if line == self._last_line:
-                    self._repeat_count += 1
-                    if now - self._repeat_time >= self.repeat_summary_interval:
-                        messages.append(self._take_repeat_summary(now))
-                    continue
-                if self._repeat_count:
+        for line in lines:
+            line = line.rstrip()  # noqa: PLW2901
+            if not line:
+                continue
+            if line == self._last_line:
+                self._repeat_count += 1
+                if now - self._repeat_time >= self.repeat_summary_interval:
                     messages.append(self._take_repeat_summary(now))
-                self._last_line = line
-                self._repeat_time = now
-                messages.append(line)
-        # Emit without holding the lock
-        for message in messages:
-            _emit_to_app_log(self.level, message)
+                continue
+            if self._repeat_count:
+                messages.append(self._take_repeat_summary(now))
+            self._last_line = line
+            self._repeat_time = now
+            messages.append(line)
+        return messages
 
     def _take_repeat_summary(self, now: float) -> str:
         """Return the repeat summary message and reset the repeat count.
