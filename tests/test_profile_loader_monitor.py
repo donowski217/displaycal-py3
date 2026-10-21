@@ -34,6 +34,10 @@ def _make_pl():
     pl = ProfileLoader.__new__(ProfileLoader)
     pl.lock = threading.Lock()
     pl._is_other_running_lock = threading.Lock()
+    pl._shutdown_lock = threading.Lock()
+    pl._shutdown_done = threading.Event()
+    pl._shutdown_thread = None
+    pl._ui_torn_down = False
     pl._shutdown = False
     pl.monitoring = True
     pl._hwnds_pids = set()
@@ -47,7 +51,52 @@ def _make_pl():
     pl._madvr_reset_cal = {}
     pl.monitors = []
     pl._current_display_key = None
+    # State that ProfileLoader.__init__ initializes
+    pl._display_conf_key_unavailable = False
+    pl._calibration_management_state = None
+    pl._calibration_management_state_checked = None
+    pl._last_wcs_error = None
+    pl._window_count_drop_seen = False
+    pl._window_count_request = None
+    pl._last_window_count_error = None
+    pl._last_monitor_traceback = None
+    pl._process_filename_errors = set()
+    pl._deferred_locked_calls = []
     return pl
+
+
+def test_init_initializes_monitoring_state(monkeypatch):
+    """The real __init__, without app, tray icon or thread (toolkit hooks)."""
+
+    class HeadlessLoader(ProfileLoader):
+        def _bootstrap_app(self):
+            self._app = None
+
+        def _setup_ui(self):
+            pass
+
+    queries = []
+    monkeypatch.setattr(
+        profile_loader,
+        "calibration_management_isenabled",
+        lambda: queries.append(None) or False,
+    )
+    monkeypatch.setattr(sys, "argv", [sys.argv[0]])
+
+    pl = HeadlessLoader()
+
+    assert pl._window_count_drop_seen is False
+    assert pl._window_count_request is None
+    assert pl._last_window_count_error is None
+    assert pl._last_monitor_traceback is None
+    assert pl._process_filename_errors == set()
+    assert pl._deferred_locked_calls == []
+    assert pl._ui_torn_down is False
+    assert not pl._shutdown_done.is_set()
+    # Windows calibration management is queried once, at startup
+    if sys.getwindowsversion() >= (6, 1):
+        assert queries == [None]
+        assert pl._calibration_management_state is False
 
 
 STOP = "stop"
@@ -167,6 +216,47 @@ def test_is_other_running_with_exiting_process_of_known_window(monkeypatch):
     assert pl._is_other_running(True) is False
     assert not pl._is_other_running_lock.locked()
     assert pl._hwnds_pids == set()
+
+
+def _scan_known_processes(monkeypatch, pl, error, times=3):
+    """Run _look_for_known_processes with one known app failing with error."""
+    monkeypatch.setattr(
+        profile_loader.win32ts,
+        "WTSEnumerateProcesses",
+        lambda: [(1, 4242, "explorer.exe", "S-1-5-21-1")],
+    )
+
+    def get_process_filename(pid):
+        raise error
+
+    monkeypatch.setattr(profile_loader, "get_process_filename", get_process_filename)
+    pl._known_apps = {"explorer.exe"}
+    for _ in range(times):
+        pl._look_for_known_processes((None, None, 0))
+
+
+@pytest.mark.parametrize(
+    "winerror_code",
+    [5, 299, 87, 31],  # access denied, partial copy, invalid param, gen failure
+)
+def test_expected_process_filename_errors_are_not_logged(
+    monkeypatch, capsys, winerror_code
+):
+    """ctypes.WinError's args[0] is the errno, not the Windows error code."""
+    pl = _make_pl()
+
+    _scan_known_processes(monkeypatch, pl, ctypes.WinError(winerror_code))
+
+    assert "Couldn't get filename" not in capsys.readouterr().out
+
+
+def test_unexpected_process_filename_error_is_logged_once(monkeypatch, capsys):
+    """Not every three seconds for as long as the process exists."""
+    pl = _make_pl()
+
+    _scan_known_processes(monkeypatch, pl, ctypes.WinError(6))  # invalid handle
+
+    assert capsys.readouterr().out.count("Couldn't get filename of process 4242") == 1
 
 
 def test_enumerate_windows_callback_skips_vanished_window(monkeypatch):
@@ -327,6 +417,116 @@ def test_failed_display_change_is_redone(monkeypatch):
     assert event is True
     assert active_displays == []
     assert not harness.fatal_posted
+
+
+@pytest.fixture
+def frozen_stderr(monkeypatch):
+    """Emulate a windowed (frozen) build's stderr and app log.
+
+    There, sys.stderr is the app log redirector (log.StdioToLog), which
+    records each line written to it as its own log record. Handled errors
+    should instead be recorded as one record via log.log_error(), which is
+    recorded here (``records``); writes to stderr are in ``writes``.
+
+    Use ``with frozen_stderr:`` in the test body to install the stream
+    (pytest's output capturing re-installs its own sys.stderr when the test
+    call starts, so it cannot be done in the fixture).
+    """
+    from DisplayCAL import log
+
+    class LogStream:
+        is_log_stream = True
+
+        def __init__(self):
+            self.writes = []
+            self.records = []
+            self._saved = None
+
+        def write(self, text):
+            self.writes.append(text)
+            return len(text)
+
+        def flush(self):
+            pass
+
+        def __enter__(self):
+            self._saved = sys.stderr
+            sys.stderr = self
+            return self
+
+        def __exit__(self, *exc_info):
+            sys.stderr = self._saved
+
+    stream = LogStream()
+    monkeypatch.setattr(
+        log, "log_error", lambda text: stream.records.append(text) or True
+    )
+    return stream
+
+
+def test_recovered_error_traceback_is_one_log_record(monkeypatch, frozen_stderr):
+    harness = MonitorHarness(monkeypatch, [RuntimeError("transient"), STOP])
+    with frozen_stderr:
+        harness.run()
+
+    assert not harness.fatal_posted
+    assert len(frozen_stderr.records) == 1
+    assert "RuntimeError: transient" in frozen_stderr.records[0]
+    assert "Traceback" in frozen_stderr.records[0]
+    assert frozen_stderr.writes == []
+
+
+def test_fatal_error_traceback_is_left_to_handle_error(monkeypatch, frozen_stderr):
+    """handle_error() on the GUI thread logs it: not twice."""
+    harness = MonitorHarness(monkeypatch, [])
+
+    def check_display_conf():
+        raise RuntimeError("fatal")
+
+    harness.pl._check_display_conf = check_display_conf
+    with frozen_stderr:
+        harness.run()
+
+    assert harness.fatal_posted
+    assert frozen_stderr.records == []
+    assert frozen_stderr.writes == []
+
+
+def test_fatal_error_while_shutting_down_is_logged(monkeypatch, frozen_stderr):
+    """No error dialog then, so the traceback is logged right away."""
+    harness = MonitorHarness(monkeypatch, [])
+    harness.pl._shutdown = True
+
+    def check_display_conf():
+        raise RuntimeError("fatal during shutdown")
+
+    harness.pl._check_display_conf = check_display_conf
+    with frozen_stderr:
+        harness.run()
+
+    assert harness.posted == []
+    assert len(frozen_stderr.records) == 1
+    assert "RuntimeError: fatal during shutdown" in frozen_stderr.records[0]
+    assert frozen_stderr.writes == []
+
+
+def test_handled_errors_are_not_printed_with_print_exc():
+    """traceback.print_exc() writes handled errors to stderr, line by line."""
+    import ast
+    import inspect
+
+    from DisplayCAL import systrayicon
+
+    for module in (profile_loader, systrayicon):
+        tree = ast.parse(inspect.getsource(module))
+        print_exc_lines = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "print_exc"
+        ]
+        assert print_exc_lines == [], module.__name__
 
 
 def test_backoff_grows_and_is_capped(monkeypatch, capsys):
@@ -704,10 +904,15 @@ class ShutdownHarness:
         self.pl = pl = _make_pl()
         self.events = []
         self.posted = []
-        pl._shutdown_lock = threading.Lock()
-        pl._reset_display_profile_associations = lambda: self.events.append(
-            ("reset_associations", threading.current_thread())
-        )
+        self.reset_with_lock_held = []
+        pl.MONITOR_JOIN_TIMEOUT = 5.0
+        pl.SHUTDOWN_LOCK_TIMEOUT = 0.2
+
+        def reset_display_profile_associations(force=False):
+            self.reset_with_lock_held.append(pl.lock.locked())
+            self.events.append(("reset_associations", threading.current_thread()))
+
+        pl._reset_display_profile_associations = reset_display_profile_associations
         pl.writecfg = lambda: self.events.append(
             ("writecfg", threading.current_thread())
         )
@@ -715,6 +920,12 @@ class ShutdownHarness:
             ("teardown_ui", threading.current_thread())
         )
         pl._post_to_gui_thread = lambda func, *args: self.posted.append(func)
+        # Never shut down a real WCS manager from these tests
+        monkeypatch.setattr(
+            profile_loader,
+            "shutdown_wcs_manager",
+            lambda: self.events.append(("wcs_shutdown", threading.current_thread())),
+        )
         monkeypatch.setattr(
             profile_loader,
             "getcfg",
@@ -732,9 +943,19 @@ def test_shutdown_tears_down_ui_on_gui_thread(monkeypatch):
     harness.pl.shutdown()
     harness.pl.shutdown()
 
-    assert harness.names() == ["reset_associations", "writecfg", "teardown_ui"]
+    # The configuration first: it does not depend on the WCS worker process.
+    # The WCS manager is closed after the last WCS use (the reset).
+    assert harness.names() == [
+        "writecfg",
+        "reset_associations",
+        "wcs_shutdown",
+        "teardown_ui",
+    ]
     assert harness.events[-1][1] is threading.main_thread()
     assert harness.pl.monitoring is False
+    # Never interleaved with a monitoring iteration
+    assert harness.reset_with_lock_held == [True]
+    assert not harness.pl.lock.locked()
 
 
 def test_shutdown_off_gui_thread_posts_ui_teardown(monkeypatch):
@@ -749,8 +970,62 @@ def test_shutdown_off_gui_thread_posts_ui_teardown(monkeypatch):
     assert harness.events[-1] == ("teardown_ui", threading.main_thread())
 
 
+def test_gui_thread_shutdown_completes_one_started_elsewhere(monkeypatch):
+    """The exit handlers' call must not return early and skip the teardown.
+
+    The main loop ends right after it, so the teardown that the other
+    thread posted to the GUI thread would never run.
+    """
+    harness = ShutdownHarness(monkeypatch)
+    pl = harness.pl
+    writing = threading.Event()
+    release = threading.Event()
+
+    def slow_writecfg():
+        writing.set()
+        release.wait(5)
+        harness.events.append(("writecfg", threading.current_thread()))
+
+    pl.writecfg = slow_writecfg
+    other = threading.Thread(target=pl.shutdown, name="OtherShutdownCaller")
+    other.start()
+    assert writing.wait(5)
+    threading.Timer(0.2, release.set).start()
+
+    pl.shutdown()  # on the GUI thread, while the other one is still running
+
+    assert harness.names() == [
+        "writecfg",
+        "reset_associations",
+        "wcs_shutdown",
+        "teardown_ui",
+    ]
+    assert harness.events[-1][1] is threading.main_thread()
+    other.join(5)
+    # The teardown the other thread posted is a no-op now
+    for func in harness.posted:
+        func()
+    assert harness.names().count("teardown_ui") == 1
+
+
 def test_shutdown_runs_once_when_called_concurrently(monkeypatch):
     harness = ShutdownHarness(monkeypatch)
+
+    class SlowFlagLoader(ProfileLoader):
+        # Widen the check-then-set window: every caller reads the flag, then
+        # yields long enough for the others to read it too, unless
+        # _shutdown_lock serialises them.
+        @property
+        def _shutdown(self):
+            value = self.__dict__.get("_shutdown_flag", False)
+            time.sleep(0.05)
+            return value
+
+        @_shutdown.setter
+        def _shutdown(self, value):
+            self.__dict__["_shutdown_flag"] = value
+
+    harness.pl.__class__ = SlowFlagLoader
     barrier = threading.Barrier(5)
 
     def call_shutdown():
@@ -783,21 +1058,74 @@ def test_shutdown_waits_for_monitoring_thread(monkeypatch):
     pl.shutdown()
 
     assert not pl._check_display_conf_thread.is_alive()
-    # The monitoring thread is gone before associations are reset
-    assert harness.names()[0] == "monitor_exited"
+    # The configuration is written without waiting for the monitoring
+    # thread, which is gone before associations are reset
+    assert harness.names() == [
+        "writecfg",
+        "monitor_exited",
+        "reset_associations",
+        "wcs_shutdown",
+        "teardown_ui",
+    ]
+
+
+def test_shutdown_skips_reset_while_an_iteration_holds_the_lock(monkeypatch, capsys):
+    """E.g. an iteration stalled in a WCS call past the join timeout."""
+    harness = ShutdownHarness(monkeypatch)
+    pl = harness.pl
+    pl.MONITOR_JOIN_TIMEOUT = 0.2
+    holding = threading.Event()
+    release = threading.Event()
+
+    def stalled_iteration():
+        with pl.lock:
+            holding.set()
+            release.wait(10)
+
+    pl._check_display_conf_thread = threading.Thread(
+        target=stalled_iteration, name="DisplayConfigurationMonitoring"
+    )
+    pl._check_display_conf_thread.start()
+    assert holding.wait(5)
+    try:
+        started = time.monotonic()
+        pl.shutdown()
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        pl._check_display_conf_thread.join(5)
+
+    assert harness.names() == ["writecfg", "wcs_shutdown", "teardown_ui"]
+    assert elapsed < 2
+    assert "not resetting profile associations" in capsys.readouterr().out
 
 
 def test_shutdown_still_writes_config_if_reset_fails(monkeypatch, capsys):
     harness = ShutdownHarness(monkeypatch)
 
-    def reset_display_profile_associations():
+    def reset_display_profile_associations(force=False):
         raise TimeoutError("WCS worker did not answer")
 
     harness.pl._reset_display_profile_associations = reset_display_profile_associations
     harness.pl.shutdown()
 
-    assert harness.names() == ["writecfg", "teardown_ui"]
+    assert harness.names() == ["writecfg", "wcs_shutdown", "teardown_ui"]
     assert "TimeoutError" in capsys.readouterr().err
+
+
+def test_shutdown_logs_failed_reset_as_one_record(monkeypatch, frozen_stderr):
+    harness = ShutdownHarness(monkeypatch)
+
+    def reset_display_profile_associations(force=False):
+        raise TimeoutError("WCS worker did not answer")
+
+    harness.pl._reset_display_profile_associations = reset_display_profile_associations
+    with frozen_stderr:
+        harness.pl.shutdown()
+
+    assert len(frozen_stderr.records) == 1
+    assert "TimeoutError: WCS worker did not answer" in frozen_stderr.records[0]
+    assert frozen_stderr.writes == []
 
 
 def test_forced_shutdown_shuts_down_before_closing_frame(monkeypatch):
@@ -811,12 +1139,692 @@ def test_forced_shutdown_shuts_down_before_closing_frame(monkeypatch):
     harness.pl._request_forced_shutdown()
 
     assert harness.names() == [
-        "reset_associations",
         "writecfg",
+        "reset_associations",
+        "wcs_shutdown",
         "teardown_ui",
         "close_frame",
     ]
     assert harness.events[-1] == ("close_frame", True)
+
+
+def test_shutdown_still_tears_down_ui_if_closing_wcs_fails(monkeypatch, capsys):
+    harness = ShutdownHarness(monkeypatch)
+
+    def shutdown_wcs_manager():
+        raise RuntimeError("could not stop the WCS worker")
+
+    monkeypatch.setattr(profile_loader, "shutdown_wcs_manager", shutdown_wcs_manager)
+    harness.pl.shutdown()
+
+    assert harness.names() == ["writecfg", "reset_associations", "teardown_ui"]
+    assert "could not stop the WCS worker" in capsys.readouterr().err
+
+
+def test_shutdown_wcs_manager_never_starts_one(monkeypatch):
+    from DisplayCAL import mscms, util_win
+
+    monkeypatch.setattr(mscms.WCSManagerProxy, "_instance", None)
+    util_win.shutdown_wcs_manager()
+    assert mscms.WCSManagerProxy._instance is None
+
+    calls = []
+
+    class FakeManager:
+        def shutdown(self):
+            calls.append("shutdown")
+
+    monkeypatch.setattr(mscms.WCSManagerProxy, "_instance", FakeManager())
+    util_win.shutdown_wcs_manager()
+    assert calls == ["shutdown"]
+
+
+# --- No display changes from the monitoring thread once shutdown began -------
+
+
+def _shut_down_now(pl):
+    """What shutdown() does first (and _stop_if_asked_to_exit)."""
+    pl._shutdown = True
+    pl.monitoring = False
+
+
+def test_monitor_does_not_fix_association_after_shutdown_began(monkeypatch):
+    """An association read that stalls past shutdown must not write after it."""
+    pl = _make_pl()
+    device = _FakeDevice("key1")
+    pl.devices2profiles = {"key1": (("Display 1",), "old.icc", "Old")}
+    pl._fixed_profile_associations = set()
+    reading = threading.Event()
+    resume = threading.Event()
+
+    def get_display_profile(**kwargs):
+        reading.set()
+        resume.wait(5)
+        return r"C:\x\good.icc"
+
+    writes = []
+    monkeypatch.setattr(profile_loader, "get_display_profile", get_display_profile)
+    monkeypatch.setattr(profile_loader, "is_superuser", lambda: True)
+    monkeypatch.setattr(
+        profile_loader, "set_display_profile", lambda *a, **k: writes.append(a)
+    )
+
+    thread, outcome = _run_in_monitor_thread(
+        lambda: pl._set_active_profile(device, "Display 1", [device])
+    )
+    assert reading.wait(5)
+    _shut_down_now(pl)
+    resume.set()
+    thread.join(5)
+
+    assert outcome == {"result": None}
+    assert writes == []
+    assert pl._fixed_profile_associations == set()
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_monitor_does_not_reset_associations_after_shutdown_began(monkeypatch, force):
+    pl = _make_pl()
+    pl._can_fix_profile_associations = lambda: True
+    pl.devices2profiles = {"key0": (("Display 1",), "right.icc", "Right")}
+    pl._fixed_profile_associations = {"key0"}
+    monkeypatch.setattr(
+        profile_loader, "get_display_profile", lambda **kwargs: r"C:\x\other.icc"
+    )
+    monkeypatch.setattr(profile_loader, "is_superuser", lambda: True)
+    writes = []
+    monkeypatch.setattr(
+        profile_loader, "set_display_profile", lambda *a, **k: writes.append("set")
+    )
+    monkeypatch.setattr(
+        profile_loader, "unset_display_profile", lambda *a, **k: writes.append("unset")
+    )
+    _shut_down_now(pl)
+
+    _in_thread(lambda: pl._reset_display_profile_associations(force=force))
+
+    # shutdown() itself passes force=True
+    assert writes == (["set", "unset"] if force else [])
+
+
+def test_set_display_profiles_stops_when_shutdown_began(monkeypatch):
+    pl = _make_pl()
+    pl._can_fix_profile_associations = lambda: True
+    pl.monitors = [("Display 1", None, {"Device": r"\\.\DISPLAY1"}, None)]
+    mapping = {"key0": (("Display 1",), "old.icc", "Old")}
+    pl.devices2profiles = dict(mapping)
+    enumerated = []
+    monkeypatch.setattr(
+        profile_loader, "get_display_devices", lambda name: enumerated.append(name)
+    )
+    _shut_down_now(pl)
+
+    _in_thread(pl._set_display_profiles)
+
+    assert enumerated == []
+    # Kept for shutdown's reset of the associations fixed so far
+    assert pl.devices2profiles == mapping
+
+
+class _FakeAssociationStore:
+    """In-memory display profile associations (device key -> default profile).
+
+    Stands in for every WCS read and write of the association code.
+    """
+
+    def __init__(self, monkeypatch, associations):
+        self.associations = dict(associations)
+        self.writes = []
+        # Called (on the monitoring thread) after its first unset, if set
+        self.after_monitor_unset = None
+        monkeypatch.setattr(profile_loader, "get_display_profile", self.get)
+        monkeypatch.setattr(profile_loader, "set_display_profile", self.set)
+        monkeypatch.setattr(profile_loader, "unset_display_profile", self.unset)
+        monkeypatch.setattr(profile_loader, "is_superuser", lambda: True)
+
+    def get(self, display_no=0, path_only=False, devicekey=None):
+        profile = self.associations.get(devicekey)
+        return profile and os.path.join(r"C:\x", profile)
+
+    def set(self, profile_name, display_no=0, devicekey=None):
+        self.writes.append(("set", devicekey, profile_name))
+        self.associations[devicekey] = profile_name
+
+    def unset(self, profile_name, display_no=0, devicekey=None):
+        self.writes.append(("unset", devicekey, profile_name))
+        if self.associations.get(devicekey) == profile_name:
+            self.associations[devicekey] = None
+        if (
+            self.after_monitor_unset
+            and threading.current_thread().name == "DisplayConfigurationMonitoring"
+        ):
+            after_monitor_unset, self.after_monitor_unset = (
+                self.after_monitor_unset,
+                None,
+            )
+            after_monitor_unset()
+
+
+@pytest.mark.parametrize("shutdown_begins", ["before_reset", "during_reset"])
+def test_shutdown_resets_fixes_after_a_display_change_iteration(
+    monkeypatch, shutdown_begins
+):
+    """A display change iteration that shutdown overtakes must not keep a fix.
+
+    The iteration resets the fixed associations and fixes them again (see
+    ``_check_display_changed``). Once shutdown began, it does neither (or
+    stops part-way), and shutdown's own reset must still undo every fix. It
+    found nothing to reset when the iteration had cleared the mapping of
+    original associations before stopping.
+    """
+    harness = ShutdownHarness(monkeypatch)
+    pl = harness.pl
+    del pl._reset_display_profile_associations  # the real one
+    pl._can_fix_profile_associations = lambda: True
+    pl._fixed_profile_associations = set()
+    pl.devices2profiles = {}
+    # Two monitors, each with two child devices. The 2nd is the active one;
+    # the 1st is the one GetICMProfile reads, whose association gets fixed.
+    devices = {
+        r"\\.\DISPLAY1": [_FakeDevice("a0"), _FakeDevice("a1")],
+        r"\\.\DISPLAY2": [_FakeDevice("b0"), _FakeDevice("b1")],
+    }
+    pl.monitors = [
+        (f"Display {i}", None, {"Device": name}, children[1])
+        for i, (name, children) in enumerate(devices.items(), 1)
+    ]
+    original = {
+        "a0": "oldA.icc",
+        "a1": "goodA.icc",
+        "b0": "oldB.icc",
+        "b1": "goodB.icc",
+    }
+    store = _FakeAssociationStore(monkeypatch, original)
+    monkeypatch.setattr(profile_loader, "get_display_devices", devices.get)
+    monkeypatch.setattr(
+        profile_loader,
+        "get_active_display_device",
+        lambda name, devices=None: devices[1],
+    )
+    monkeypatch.setattr(
+        profile_loader,
+        "get_display_name_edid",
+        lambda device, *args: (f"Display {device.DeviceKey}", {}),
+    )
+    monkeypatch.setattr(profile_loader, "get_profile_desc", lambda name: name)
+    monkeypatch.setattr(profile_loader, "lang", _FakeLang(), raising=False)
+    # A display change, detected without the registry key
+    pl._display_conf_key_unavailable = True
+    pl._active_displays = []
+    monkeypatch.setattr(
+        profile_loader, "get_active_display_devices", lambda attr: ["a1", "b1"]
+    )
+    pl._enumerate_monitors = lambda: None
+    pl._is_displaycal_running = lambda: False
+
+    # Startup: the first iteration fixes both monitors' associations
+    _in_thread(lambda: pl._check_display_changed(first_run=True))
+    assert store.associations == dict(original, a0="goodA.icc", b0="goodB.icc")
+    assert pl._fixed_profile_associations == {"a0", "b0"}
+
+    holding = threading.Event()
+    shutdown_began = threading.Event()
+    ready_for_shutdown = threading.Event()
+    waited = []
+    writecfg = pl.writecfg
+
+    def writecfg_after_shutdown_began():
+        # shutdown() has set _shutdown and stopped monitoring by now
+        writecfg()
+        shutdown_began.set()
+
+    pl.writecfg = writecfg_after_shutdown_began
+
+    def wait_for_shutdown():
+        ready_for_shutdown.set()
+        waited.append(shutdown_began.wait(5))
+
+    if shutdown_begins == "during_reset":
+        # Shutdown begins once the iteration has reset monitor 1's fix
+        store.after_monitor_unset = wait_for_shutdown
+
+    def display_change_iteration():
+        with pl.lock:
+            holding.set()
+            pl._display_changed_event = True
+            if shutdown_begins == "before_reset":
+                wait_for_shutdown()
+            pl._check_display_changed()
+
+    pl._check_display_conf_thread, outcome = _run_in_monitor_thread(
+        display_change_iteration
+    )
+    assert holding.wait(5)
+    assert ready_for_shutdown.wait(5)
+    pl.shutdown()
+    pl._check_display_conf_thread.join(5)
+
+    assert outcome == {"result": None}
+    assert waited == [True]
+    assert harness.names() == ["writecfg", "wcs_shutdown", "teardown_ui"]
+    # Every fix undone; nothing fixed again
+    assert store.associations == original
+    assert ("set", "a0", "goodA.icc") not in store.writes[2:]
+    assert ("set", "b0", "goodB.icc") not in store.writes[2:]
+
+
+class _RecordingGDI32:
+    def __init__(self):
+        self.ramps_set = []
+
+    def SetDeviceGammaRamp(self, hdc, ramp):  # noqa: N802
+        self.ramps_set.append(ramp)
+        return True
+
+
+@pytest.mark.parametrize("shutdown_began", [False, True])
+def test_monitor_does_not_set_gamma_ramp_after_shutdown_began(
+    monkeypatch, shutdown_began
+):
+    pl = _make_pl()
+    pl.monitors = [
+        ("Display 1", None, {"Device": r"\\.\DISPLAY1"}, _FakeDevice("key0"))
+    ]
+    pl.profile_associations = {}
+    pl.profiles = {}
+    pl.ramps = {}
+    pl.devices2profiles = {}
+    pl.setgammaramp_success = {}
+    pl._last_exception_args = ()
+    pl._has_display_changed = False
+    pl._manual_restore = True
+    pl._next = False
+    pl._reset_gamma_ramps = False
+    pl.gdi32 = gdi32 = _RecordingGDI32()
+    pl._should_apply_profiles = lambda *args, **kwargs: True
+    pl._generate_and_apply_profiles = lambda *args: (True, False, "ramp", "hack", [])
+    pl._track_process_changes = lambda previous: False
+    pl._check_gamma_ramp_status = lambda *args: (False, False)
+    pl._is_buggy_video_driver = lambda moninfo: False
+    pl._report_calibration_status = lambda *args: None
+
+    def reload_or_reset_calibration(*args):
+        # The last step before the gamma ramp is written
+        if shutdown_began:
+            _shut_down_now(pl)
+
+    pl._reload_or_reset_calibration = reload_or_reset_calibration
+    monkeypatch.setattr(profile_loader, "lang", _FakeLang(), raising=False)
+    monkeypatch.setattr(profile_loader, "getcfg", lambda name, *a, **k: 0)
+    monkeypatch.setattr(
+        profile_loader,
+        "get_display_profile",
+        lambda display_no=0, path_only=False, devicekey=None: r"C:\x\good.icc",
+    )
+    monkeypatch.setattr(profile_loader, "get_profile_desc", lambda name: name)
+    created_dcs = []
+    monkeypatch.setattr(
+        profile_loader.win32gui,
+        "CreateDC",
+        lambda *args: created_dcs.append(args) or 1234,
+    )
+    monkeypatch.setattr(profile_loader.win32gui, "DeleteDC", lambda hdc: None)
+
+    _in_thread(lambda: pl._check_profile_associations(True, False, set(), None, [], []))
+
+    if shutdown_began:
+        assert created_dcs == []
+        assert gdi32.ramps_set == []
+    else:
+        # The setup above does reach the gamma ramp write
+        assert gdi32.ramps_set == ["ramp"]
+
+
+# --- exit() while a modal dialog's event loop runs ---------------------------
+
+# Never let a wx.App created here be destroyed mid-session: dropping a wx.App
+# after it created windows leaves wx's hidden display window with a dangling
+# window procedure, and the next message pump on this thread crashes.
+_WX_APPS = []
+
+
+@pytest.fixture(scope="module")
+def wx_app():
+    wx = profile_loader.wx
+    app = wx.GetApp() or wx.App(False)
+    _WX_APPS.append(app)
+    return app
+
+
+def test_exit_leaves_main_loop_from_inside_a_modal_dialog(monkeypatch, wx_app):
+    """The fatal error path, while e.g. the profile associations dialog is open.
+
+    wx ignores ExitMainLoop() inside a nested (modal) event loop: the dialog
+    was ended, but the loader kept running without its monitoring thread and
+    shutdown() never ran. No window is shown; a nested GUIEventLoop stands in
+    for the dialog's modal loop.
+    """
+    from DisplayCAL.wx_windows import BaseApp
+
+    wx = profile_loader.wx
+    # MainLoop() calls OnExit(): never run exit handlers other tests left
+    # registered, should the shared app be a BaseApp
+    monkeypatch.setattr(BaseApp, "_exithandlers", [])
+    pl = _make_pl()
+    pl.frame = None
+    events = []
+    nested = {}
+
+    class FakeDialog:
+        def EndModal(self, code):  # noqa: N802
+            events.append("EndModal")
+            nested["loop"].Exit(code)
+
+        def RequestUserAttention(self):  # noqa: N802
+            pass
+
+    def get_dialogs():
+        loop = nested.get("loop")
+        return [FakeDialog()] if loop is not None and loop.IsRunning() else []
+
+    monkeypatch.setattr(profile_loader, "get_dialogs", get_dialogs)
+    monkeypatch.setattr(
+        profile_loader, "handle_error", lambda exc: events.append("handle_error")
+    )
+
+    def run_modal_loop():
+        nested["loop"] = wx.GUIEventLoop()
+        # What the monitoring thread posts after five failed iterations
+        wx.CallAfter(pl._handle_fatal_error, RuntimeError("monitoring failed"))
+        nested["loop"].Run()
+        events.append("modal loop returned")
+
+    def watchdog():
+        events.append("watchdog")
+        loop = nested.get("loop")
+        if loop is not None and loop.IsRunning():
+            loop.Exit()
+        wx.CallLater(50, wx_app.ExitMainLoop)
+
+    # wxPython's MainLoop() returns right away without a top-level window.
+    # This one (like the loader's PLFrame) is never shown.
+    frame = wx.Frame(None)
+    try:
+        wx.CallAfter(run_modal_loop)
+        timer = wx.CallLater(3000, watchdog)
+        started = time.monotonic()
+        wx_app.MainLoop()
+        elapsed = time.monotonic() - started
+        timer.Stop()
+    finally:
+        frame.Destroy()
+
+    assert events == ["handle_error", "EndModal", "modal loop returned"]
+    assert elapsed < 2
+
+
+def test_programmatic_exit_ends_exceptions_dialog(monkeypatch):
+    pl = _make_pl()
+    pl.frame = None
+    ended = []
+
+    class ExceptionsDialog(profile_loader.ProfileLoaderExceptionsDialog):
+        def __init__(self):  # never create the real (wx) dialog
+            pass
+
+        def EndModal(self, code):  # noqa: N802
+            ended.append(code)
+
+    monkeypatch.setattr(profile_loader, "get_dialogs", lambda: [ExceptionsDialog()])
+    exits = []
+    pl._exit_main_loop = lambda: exits.append(None)
+
+    pl.exit(None)
+
+    assert ended == [profile_loader.wx.ID_CANCEL]
+    assert exits == [None]
+
+
+# --- The GUI thread never waits long for self.lock ---------------------------
+
+
+class _StuckIteration:
+    """Hold pl.lock on another thread, like an iteration stuck in WCS calls.
+
+    Releases the lock by itself after ``timeout`` seconds (so code that does
+    wait for the lock cannot hang the test run), or on ``release()``.
+    """
+
+    def __init__(self, pl, timeout=3.0):
+        self._release = threading.Event()
+        holding = threading.Event()
+
+        def hold():
+            with pl.lock:
+                holding.set()
+                self._release.wait(timeout)
+
+        self.thread = threading.Thread(
+            target=hold, name="DisplayConfigurationMonitoring"
+        )
+        self.thread.start()
+        assert holding.wait(5)
+
+    def release(self):
+        self._release.set()
+        self.thread.join(5)
+
+
+def _make_gui_pl(monkeypatch):
+    pl = _make_pl()
+    pl._manual_restore = False
+    pl._reset_gamma_ramps = False
+    pl._next = False
+    pl._has_display_changed = True
+    pl._deferred_locked_calls = []
+    pl.GUI_LOCK_TIMEOUT = 0.05
+    pl.events = []
+    pl.delayed = []
+    pl._refresh_visual_state = lambda: pl.events.append("refresh")
+    pl.writecfg = lambda: pl.events.append("writecfg")
+    pl._post_to_gui_thread_delayed = lambda ms, func, *args: pl.delayed.append(func)
+    monkeypatch.setattr(
+        profile_loader, "setcfg", lambda name, value: pl.events.append((name, value))
+    )
+    monkeypatch.setattr(profile_loader, "getcfg", lambda name, *args, **kwargs: 1)
+    return pl
+
+
+def _run_delayed(pl):
+    """Run what was posted to the GUI thread's timer (like its event loop)."""
+    delayed, pl.delayed = pl.delayed, []
+    for func in delayed:
+        func()
+
+
+class _CheckedEvent:
+    def __init__(self, checked):
+        self.checked = checked
+
+    def IsChecked(self):  # noqa: N802
+        return self.checked
+
+
+def _process_display_changed_command(pl):
+    frame = profile_loader.PLFrame.__new__(profile_loader.PLFrame)
+    frame.pl = pl
+    pl._calibration_management_isenabled = lambda: False
+    pl._is_displaycal_running = lambda: False
+    pl._is_other_running = lambda enumerate_windows_and_processes=True: False
+    assert frame.process_data(["apply-profiles", "display-changed"]) == "ok"
+
+
+GUI_HANDLERS = {
+    "load calibration (menu)": (
+        lambda pl: pl._set_manual_restore(None),
+        {"_manual_restore": True, "_reset_gamma_ramps": False},
+    ),
+    "reset calibration (menu)": (
+        lambda pl: pl._set_reset_gamma_ramps(None),
+        {"_manual_restore": True, "_reset_gamma_ramps": True},
+    ),
+    "apply-profiles display-changed (scripting)": (
+        _process_display_changed_command,
+        {"_manual_restore": 2},
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(GUI_HANDLERS))
+def test_gui_handler_does_not_wait_for_a_stuck_iteration(monkeypatch, name):
+    handler, expected = GUI_HANDLERS[name]
+    pl = _make_gui_pl(monkeypatch)
+    pl._set_display_profiles = lambda dry_run=False: None
+    monkeypatch.setattr(profile_loader, "lang", _FakeLang(), raising=False)
+    stuck = _StuckIteration(pl)
+    try:
+        started = time.monotonic()
+        handler(pl)
+        elapsed = time.monotonic() - started
+        # Deferred: nothing changed while the iteration holds the lock
+        assert pl._manual_restore is False
+        assert "writecfg" not in pl.events
+        assert len(pl.delayed) == 1
+        _run_delayed(pl)  # still busy: retried later
+        assert pl._manual_restore is False
+        assert len(pl.delayed) == 1
+    finally:
+        stuck.release()
+    assert elapsed < 1
+
+    _run_delayed(pl)  # the iteration is done
+
+    for attr, value in expected.items():
+        assert getattr(pl, attr) == value
+    assert pl.delayed == []
+    assert not pl.lock.locked()
+
+
+def test_toggle_fix_profile_associations_does_not_wait(monkeypatch):
+    pl = _make_gui_pl(monkeypatch)
+    resets = []
+    pl._reset_display_profile_associations = lambda force=False: resets.append(
+        pl.lock.locked()
+    )
+    stuck = _StuckIteration(pl)
+    try:
+        started = time.monotonic()
+        result = pl._toggle_fix_profile_associations(_CheckedEvent(False))
+        elapsed = time.monotonic() - started
+        assert resets == []
+    finally:
+        stuck.release()
+
+    assert result is False
+    assert elapsed < 1
+    _run_delayed(pl)
+    # Applied holding the lock, between iterations, as before
+    assert resets == [True]
+    assert ("profile_loader.fix_profile_associations", 0) in pl.events
+    assert pl._manual_restore is True
+
+
+def test_deferred_gui_changes_run_in_order(monkeypatch):
+    pl = _make_gui_pl(monkeypatch)
+    stuck = _StuckIteration(pl)
+    try:
+        pl._set_reset_gamma_ramps(None)
+        pl._set_manual_restore(None)
+    finally:
+        stuck.release()
+    # One retry timer for both
+    assert len(pl.delayed) == 1
+
+    _run_delayed(pl)
+
+    # The last choice wins, as it would have without deferring
+    assert pl._reset_gamma_ramps is False
+    assert pl.events.count("writecfg") == 2
+
+
+def test_gui_handler_runs_right_away_when_the_lock_is_free(monkeypatch):
+    pl = _make_gui_pl(monkeypatch)
+
+    pl._set_reset_gamma_ramps(None)
+
+    assert pl._reset_gamma_ramps is True
+    assert pl.events == [
+        ("profile_loader.reset_gamma_ramps", 1),
+        "refresh",
+        "writecfg",
+    ]
+    assert pl.delayed == []
+
+
+def test_deferred_gui_changes_are_dropped_on_shutdown(monkeypatch):
+    pl = _make_gui_pl(monkeypatch)
+    stuck = _StuckIteration(pl)
+    try:
+        pl._set_reset_gamma_ramps(None)
+    finally:
+        stuck.release()
+    pl._shutdown = True
+
+    _run_delayed(pl)
+
+    assert pl._reset_gamma_ramps is False
+    assert pl._deferred_locked_calls == []
+    assert pl.delayed == []
+
+
+def test_tray_clicks_do_not_wait_for_a_stuck_iteration(monkeypatch):
+    pl = _make_gui_pl(monkeypatch)
+    pl._is_other_running = lambda enumerate_windows_and_processes=True: False
+    icon = profile_loader.TaskBarIcon.__new__(profile_loader.TaskBarIcon)
+    icon.pl = pl
+    icon._dclick = False
+    icon._notification = None
+    icon._show_notification_later = None
+    later = []
+    monkeypatch.setattr(
+        profile_loader.wx, "CallLater", lambda ms, func, *args: later.append(func)
+    )
+    monkeypatch.setattr(profile_loader.time, "sleep", lambda seconds: None)
+    stuck = _StuckIteration(pl)
+    try:
+        started = time.monotonic()
+        icon.on_left_up(None)  # single click: status notification
+        icon._dclick = False
+        icon.on_left_dclick(None)  # double click: load calibration now
+        elapsed = time.monotonic() - started
+    finally:
+        stuck.release()
+
+    assert elapsed < 1
+    # The notification shows what is known
+    assert later == [icon.show_notification]
+    _run_delayed(pl)
+    assert pl._manual_restore is True
+    assert pl._next is True
+
+
+def test_gui_thread_never_queries_unknown_calibration_management_state(monkeypatch):
+    """Not even when the startup query failed and the state is still unknown."""
+    pl = _make_pl()
+    pl._calibration_management_state = None
+    queries = []
+    monkeypatch.setattr(
+        profile_loader,
+        "calibration_management_isenabled",
+        lambda: queries.append(None) or True,
+    )
+
+    assert pl._calibration_management_isenabled() is False
+    assert queries == []
+    # The monitoring thread does query it
+    assert _in_thread(pl._calibration_management_isenabled) is True
+    assert pl._calibration_management_isenabled() is True
+    assert queries == [None]
 
 
 # --- WCS worker process IPC failures ----------------------------------------
@@ -894,6 +1902,9 @@ class _FakeDevice:
     def __init__(self, devicekey):
         self.DeviceKey = devicekey
         self.DeviceID = devicekey
+        self.DeviceName = devicekey
+        self.DeviceString = devicekey
+        self.StateFlags = 0
 
 
 def _wcs_write_fails(*args, **kwargs):
@@ -1061,9 +2072,7 @@ def test_registry_access_denied_uses_fallback_without_warning(
     )
     monkeypatch.setattr(profile_loader, "lang", _FakeLang(), raising=False)
     association_calls = []
-    pl._enumerate_monitors = lambda: setattr(
-        pl, "_active_displays", list(display_keys)
-    )
+    pl._enumerate_monitors = lambda: setattr(pl, "_active_displays", list(display_keys))
     pl._set_display_profiles = lambda dry_run=False: association_calls.append("set")
     pl._reset_display_profile_associations = lambda: association_calls.append("reset")
     pl._is_displaycal_running = lambda: False

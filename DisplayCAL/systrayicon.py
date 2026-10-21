@@ -12,13 +12,13 @@ import functools
 import operator
 import os
 import sys
-import traceback
 from typing import Any, Callable
 
 import win32api
 import win32con
 import win32gui
 
+from DisplayCAL.debughelpers import log_error_traceback
 from DisplayCAL.options import DEBUG, VERBOSE
 from DisplayCAL.wx_addons import IdFactory, wx
 
@@ -612,8 +612,10 @@ def _safe_wndproc(
     'WNDPROC return value cannot be converted to LRESULT' errors in 3.9.17 and
     earlier) or raising makes pywin32 print an error and call sys.excepthook,
     which shows an error dialog from inside the window procedure. The wrapped
-    handler returns 0 instead of None and prints the traceback of an escaping
-    exception (returning 0) instead of passing it to pywin32.
+    handler returns 0 instead of None and logs the traceback of an escaping
+    exception (returning 0) instead of passing it to pywin32. The traceback
+    goes to the application log as one record (debughelpers.
+    log_error_traceback), not line by line through stderr.
 
     Args:
         handler (Callable[[int, int, int, int], Any]): The message handler,
@@ -628,8 +630,8 @@ def _safe_wndproc(
         try:
             result = handler(hwnd, msg, wparam, lparam)
         except Exception:
-            with contextlib.suppress(Exception):
-                traceback.print_exc()
+            # Handled (never raises)
+            log_error_traceback()
             return 0
         if result is None:
             return 0

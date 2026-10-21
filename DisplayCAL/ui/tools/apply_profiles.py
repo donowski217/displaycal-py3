@@ -47,6 +47,7 @@ cross-platform equivalent.
 from __future__ import annotations
 
 import os
+import subprocess as sp
 import sys
 import threading
 from typing import Callable
@@ -67,7 +68,6 @@ from DisplayCAL import config, profile_loader
 from DisplayCAL import localization as lang
 from DisplayCAL.config import getcfg, setcfg
 from DisplayCAL.meta import NAME as APPNAME
-from DisplayCAL.profile_loader import calibration_management_isenabled
 from DisplayCAL.ui.application import Application
 from DisplayCAL.ui.assets import get_theme_pixmap, pil_to_qpixmap, rotate_hue
 from DisplayCAL.ui.scripting import ScriptingHostMixin
@@ -173,9 +173,13 @@ class _ScriptingHost(ScriptingHostMixin, QWidget):
             len(data) == 1
             or (len(data) == 2 and data[1] in ("force", "display-changed"))
         ):
+            # The sender may have changed profile associations: re-query the
+            # per-user profiles flags that association polling caches
+            profile_loader.invalidate_per_user_profiles_cache()
             if (
                 not ("--force" in sys.argv[1:] or len(data) == 2)
-                and calibration_management_isenabled()
+                # The last known state: never waits for the WCS worker
+                and pl._calibration_management_isenabled()
             ):
                 return lang.getstr("calibration.load.handled_by_os")
             if (len(data) == 1 and pl._is_displaycal_running()) or pl._is_other_running(
@@ -183,9 +187,8 @@ class _ScriptingHost(ScriptingHostMixin, QWidget):
             ):
                 return "forbidden"
             if data[-1] == "display-changed":
-                with pl.lock:
-                    if pl._has_display_changed:
-                        pl._manual_restore = getcfg("profile.load_on_login") and 2
+                # Not blocking behind a monitoring iteration
+                pl._call_with_lock(pl._override_on_display_change)
             elif data[0] == "reset-vcgt":
                 pl._set_reset_gamma_ramps(None, len(data))
             else:
@@ -275,7 +278,10 @@ class ApplyProfilesTrayIcon(QSystemTrayIcon):
         menu.clear()
 
         blocked = pl._is_displaycal_running() or pl._is_other_running(False)
-        managed = "--force" not in sys.argv[1:] and calibration_management_isenabled()
+        # The last known state: never waits for the WCS worker
+        managed = (
+            "--force" not in sys.argv[1:] and pl._calibration_management_isenabled()
+        )
 
         restore_group = QActionGroup(menu)
         restore_group.setExclusive(True)
@@ -433,10 +439,7 @@ class ApplyProfilesTrayIcon(QSystemTrayIcon):
         """
         pl = self.pl
         setcfg("profile_loader.quantize_bits", bits)
-        with pl.lock:
-            pl._quantize = 2**bits - 1.0
-            pl.ramps = {}
-            pl._manual_restore = True
+        pl._call_with_lock(lambda: pl._set_quantization(bits))
 
     # -- click handling --------------------------------------------------
 
@@ -448,11 +451,11 @@ class ApplyProfilesTrayIcon(QSystemTrayIcon):
                 activated.
         """
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
-            if self.pl._is_other_running(False):
+            pl = self.pl
+            if pl._is_other_running(False):
                 return
-            with self.pl.lock:
-                self.pl._manual_restore = True
-            self.pl.trigger_reapply()
+            pl._call_with_lock(lambda: setattr(pl, "_manual_restore", True))
+            pl.trigger_reapply()
         elif reason == QSystemTrayIcon.ActivationReason.Trigger:
             self.show_status(toggle=True)
 
@@ -684,10 +687,11 @@ class QtProfileLoader(profile_loader.ProfileLoader):
     def trigger_reapply(self) -> None:
         """Re-apply profiles/calibration in the background.
 
-        The Qt build has no continuous hot-plug polling thread (see module
-        docstring), so callers that would have merely flipped a flag for that
-        poller to notice (the ``apply-profiles``/``reset-vcgt`` IPC commands,
-        a tray double-click) call this instead to trigger the reload directly.
+        Off Windows, the Qt build has no hot-plug polling thread (see module
+        docstring), and on Windows it only acts on its ~3 second cycle, so
+        callers that flip a flag for that poller to notice (the
+        ``apply-profiles``/``reset-vcgt`` IPC commands, a tray double-click)
+        also call this to trigger the reload directly.
         """
         threading.Thread(
             target=self.apply_profiles_and_warn_on_error,
@@ -839,8 +843,9 @@ class QtProfileLoader(profile_loader.ProfileLoader):
         Returns:
             bool: The new "fix profile associations" state.
         """
-        print("Toggle fix profile associations", event.IsChecked())
-        if event.IsChecked():
+        checked = event.IsChecked()
+        print("Toggle fix profile associations", checked)
+        if checked:
             from DisplayCAL.ui.tools.fix_profile_associations import (
                 FixProfileAssociationsDialog,
             )
@@ -853,19 +858,36 @@ class QtProfileLoader(profile_loader.ProfileLoader):
             if result != QDialog.DialogCode.Accepted:
                 print("Cancelled toggling fix profile associations")
                 return False
-        if self.lock.locked():
-            print("Waiting to acquire lock...")
-        with self.lock:
-            print("Acquired lock")
-            setcfg("profile_loader.fix_profile_associations", int(event.IsChecked()))
-            if event.IsChecked():
-                self._set_display_profiles()
-            else:
-                self._reset_display_profile_associations()
-            self._manual_restore = True
-            self.writecfg()
-            print("Releasing lock")
-        return event.IsChecked()
+        # Holding self.lock, without blocking the GUI thread behind a
+        # monitoring iteration (see ProfileLoader._call_with_lock)
+        self._call_with_lock(lambda: self._apply_fix_profile_associations(checked))
+        return checked
+
+    def open_display_settings(self, checked: bool = False) -> None:
+        """Open the Windows display settings (tray menu, Windows only).
+
+        Mirrors wx's ``TaskBarIcon.open_display_settings``. The Qt tray menu
+        connected this on Windows, but it did not exist, so building the
+        menu (and with it the Qt tray icon) failed with AttributeError.
+
+        Args:
+            checked (bool): Passed by ``QAction.triggered``; unused.
+        """
+        print("Menu command: Open display settings")
+        try:
+            sp.call(
+                [  # noqa: S607
+                    "control",
+                    "/name",
+                    "Microsoft.Display",
+                    "/page",
+                    "Settings",
+                ],
+                close_fds=True,
+            )
+        except Exception as exception:
+            QApplication.beep()
+            print(exception)
 
     def exit(self, event: object = None) -> None:
         """Quit the daemon, confirming first unless the OS manages calibration.
@@ -881,7 +903,7 @@ class QtProfileLoader(profile_loader.ProfileLoader):
         """
         print(f"Executing QtProfileLoader.exit({event})")
         if event is not None and (
-            not calibration_management_isenabled()
+            not self._calibration_management_isenabled()
             or getcfg("profile_loader.fix_profile_associations")
         ):
             result = QMessageBox.question(

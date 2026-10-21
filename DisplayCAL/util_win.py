@@ -163,6 +163,20 @@ def _get_mscms_windll():
     return MSCMSLoader.get_mscms_windll()
 
 
+def shutdown_wcs_manager() -> None:
+    """Shut down the WCS manager and its worker process, if they were started.
+
+    Never starts them (unlike any attribute access through the ``mscms``
+    proxy). Afterwards, WCS calls fail right away with
+    ``WCSManagerShutdownError`` instead of starting a new worker process
+    (e.g. after ``main._exit`` terminated the worker while another thread
+    still used WCS).
+    """
+    instance = WCSManagerProxy._instance
+    if instance is not None:
+        instance.shutdown()
+
+
 def calibration_management_isenabled() -> bool:
     """Check if calibration is enabled under Windows 7.
 
@@ -522,11 +536,11 @@ def get_windows_error(errorcode: int) -> ctypes.WinError:
     return ctypes.WinError(errorcode)
 
 
-def invalidate_per_user_profiles_cache(devicekey: None | str = None) -> None:
+def invalidate_per_user_profiles_cache(devicekey: str | None = None) -> None:
     """Forget cached per-user profiles flags (see per_user_profiles_isenabled).
 
     Args:
-        devicekey (None | str): Only forget the flag of this device key.
+        devicekey (str | None): Only forget the flag of this device key.
             Defaults to None (forget all).
     """
     global _per_user_profiles_cache_generation
@@ -539,7 +553,7 @@ def invalidate_per_user_profiles_cache(devicekey: None | str = None) -> None:
 
 
 @contextlib.contextmanager
-def cached_per_user_profiles(max_age: None | float = None) -> Iterator[None]:
+def cached_per_user_profiles(max_age: float | None = None) -> Iterator[None]:
     """Let per_user_profiles_isenabled reuse cached flags in this thread.
 
     Opt-in for callers that poll the flag (the profile loader checks every
@@ -550,7 +564,7 @@ def cached_per_user_profiles(max_age: None | float = None) -> Iterator[None]:
     Management control panel, may have changed the flag).
 
     Args:
-        max_age (None | float, optional): How old (in seconds) a cached flag
+        max_age (float | None, optional): How old (in seconds) a cached flag
             may be. Defaults to None (``PER_USER_PROFILES_CACHE_TTL``).
 
     Yields:
@@ -567,7 +581,7 @@ def cached_per_user_profiles(max_age: None | float = None) -> Iterator[None]:
 
 
 def per_user_profiles_isenabled(
-    display_no: int = 0, devicekey: None | str = None, max_age: None | float = None
+    display_no: int = 0, devicekey: str | None = None, max_age: float | None = None
 ) -> bool:
     """Check if per user profiles is enabled under Vista/Windows 7.
 
@@ -583,7 +597,7 @@ def per_user_profiles_isenabled(
     Args:
         display_no (int): The display number.
         devicekey (str): The device key.
-        max_age (None | float, optional): How old (in seconds) a cached flag
+        max_age (float | None, optional): How old (in seconds) a cached flag
             may be; 0 always queries it. Defaults to None (the age allowed by
             an enclosing :func:`cached_per_user_profiles` block in this
             thread, otherwise 0).

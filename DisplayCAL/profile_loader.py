@@ -40,7 +40,12 @@ from DisplayCAL.config import (
     getcfg,
     setcfg,
 )
-from DisplayCAL.debughelpers import Error, UnloggedError, handle_error
+from DisplayCAL.debughelpers import (
+    Error,
+    UnloggedError,
+    handle_error,
+    log_error_traceback,
+)
 from DisplayCAL.edid import get_edid
 from DisplayCAL.icc_profile import (
     ADict,
@@ -118,6 +123,7 @@ if sys.platform == "win32":
         invalidate_per_user_profiles_cache,
         per_user_profiles_isenabled,
         run_as_admin,
+        shutdown_wcs_manager,
         win_ver,
     )
 
@@ -135,14 +141,17 @@ else:
         """Stub for non-Windows platforms."""
         return False
 
-    def invalidate_per_user_profiles_cache(devicekey: None | str = None) -> None:
+    def invalidate_per_user_profiles_cache(devicekey: str | None = None) -> None:
         """Stub for non-Windows platforms."""
 
     def cached_per_user_profiles(
-        max_age: None | float = None,
+        max_age: float | None = None,
     ) -> contextlib.AbstractContextManager[None]:
         """Stub for non-Windows platforms."""
         return contextlib.nullcontext()
+
+    def shutdown_wcs_manager() -> None:
+        """Stub for non-Windows platforms."""
 
 
 if TYPE_CHECKING:
@@ -265,9 +274,10 @@ def setup_profile_loader_task(exe: str, exedir: str, pydir: str) -> None:
                 triggers=[daily],
                 actions=actions,
             )
-        except Exception:
-            if DEBUG:
-                exception = traceback.format_exc()
+        except Exception as exc:
+            # "exception" is not bound here (the "as" name of an earlier
+            # handler is unbound when that handler ends)
+            exception = traceback.format_exc() if DEBUG else exc
             print(
                 f"Warning - Could not create task {taskname}:",
                 exception,
@@ -1010,7 +1020,7 @@ class ProfileAssociationsDialog(InfoDialog):
                 profile = ICCProfile(pth)
             except ICCProfileInvalidError as exception:
                 print(f"{pth}:", exception)
-                traceback.print_exc()
+                log_error_traceback()
                 continue
             except OSError as exception:
                 print(exception)
@@ -1363,15 +1373,7 @@ class ProfileAssociationsDialog(InfoDialog):
             wx.CallAfter(self._next)
 
     def _next(self) -> None:
-        locked = self.pl.lock.locked()
-        if locked:
-            print("ProfileAssociationsDialog: Waiting to acquire lock...")
-        with self.pl.lock:
-            if locked:
-                print("ProfileAssociationsDialog: Acquired lock")
-            self.pl._next = True
-            if locked:
-                print("ProfileAssociationsDialog: Releasing lock")
+        self.pl._call_with_lock(self.pl._request_next_iteration)
 
     def use_my_settings(self, event: wx.Event) -> None:
         """Enable or disable per-user profiles.
@@ -1432,16 +1434,9 @@ class PLFrame(BaseFrame):
             ) or self.pl._is_other_running(False):
                 return "forbidden"
             if data[-1] == "display-changed":
-                if self.pl.lock.locked():
-                    print("PLFrame.process_data: Waiting to acquire lock...")
-                with self.pl.lock:
-                    print("PLFrame.process_data: Acquired lock")
-                    if self.pl._has_display_changed:
-                        # Normally calibration loading is disabled while
-                        # DisplayCAL is running. Override this when the
-                        # display has changed
-                        self.pl._manual_restore = getcfg("profile.load_on_login") and 2
-                    print("PLFrame.process_data: Releasing lock")
+                # Without blocking the GUI thread (and the reply) behind a
+                # monitoring iteration (see ProfileLoader._call_with_lock)
+                self.pl._call_with_lock(self.pl._override_on_display_change)
             elif data[0] == "reset-vcgt":
                 self.pl._set_reset_gamma_ramps(None, len(data))
             else:
@@ -1776,25 +1771,19 @@ class TaskBarIcon(SysTrayIcon):
             self._dclick = False
             return
         if not getattr(self, "_notification", None):
-            # Make sure the displayed info is up-to-date
-            locked = self.pl.lock.locked()
-            if locked:
-                print("TaskBarIcon.on_left_down: Waiting to acquire lock...")
-            with self.pl.lock:
-                if locked:
-                    print("TaskBarIcon.on_left_down: Acquired lock")
-                self.pl._next = True
-                if locked:
-                    print("TaskBarIcon.on_left_down: Releasing lock")
-            time.sleep(0.11)
-            locked = self.pl.lock.locked()
-            if locked:
-                print("TaskBarIcon.on_left_down: Waiting to acquire lock...")
-            with self.pl.lock:
-                if locked:
-                    print("TaskBarIcon.on_left_down: Acquired lock")
-                if locked:
-                    print("TaskBarIcon.on_left_down: Releasing lock")
+            # Make sure the displayed info is up-to-date: have the next
+            # monitoring iteration run right away and wait for it. But never
+            # for long: an iteration stuck in a WCS worker call must not
+            # freeze the tray icon. Then show what is known.
+            lock = self.pl.lock
+            if lock.acquire(timeout=self.pl.GUI_LOCK_TIMEOUT):
+                try:
+                    self.pl._next = True
+                finally:
+                    lock.release()
+                time.sleep(0.11)
+                if lock.acquire(timeout=self.pl.GUI_LOCK_TIMEOUT):
+                    lock.release()
             self._show_notification_later = wx.CallLater(40, self.show_notification)
         else:
             self.show_notification(toggle=True)
@@ -1810,16 +1799,7 @@ class TaskBarIcon(SysTrayIcon):
             return
         if self._show_notification_later and self._show_notification_later.IsRunning():
             self._show_notification_later.Stop()
-        locked = self.pl.lock.locked()
-        if locked:
-            print("TaskBarIcon.on_left_dclick: Waiting to acquire lock...")
-        with self.pl.lock:
-            if locked:
-                print("TaskBarIcon.on_left_dclick: Acquired lock")
-            self.pl._manual_restore = True
-            self.pl._next = True
-            if locked:
-                print("TaskBarIcon.on_left_dclick: Releasing lock")
+        self.pl._call_with_lock(self.pl._request_manual_restore)
 
     def check_user_attention(self) -> None | wx.Dialog:
         """Check if any dialog needs user attention.
@@ -1885,13 +1865,7 @@ class TaskBarIcon(SysTrayIcon):
         config.setcfg("profile.load_on_login", int(event.IsChecked()))
         self.pl.writecfg()
         if event.IsChecked():
-            if self.pl.lock.locked():
-                print("TaskBarIcon: Waiting to acquire lock...")
-            with self.pl.lock:
-                print("TaskBarIcon: Acquired lock")
-                self.pl._manual_restore = True
-                self.pl._next = True
-                print("TaskBarIcon: Releasing lock")
+            self.pl._call_with_lock(self.pl._request_manual_restore)
         else:
             self.set_visual_state()
 
@@ -1910,10 +1884,7 @@ class TaskBarIcon(SysTrayIcon):
         """
         print("Menu command: Set quantization bitdepth", bits)
         setcfg("profile_loader.quantize_bits", bits)
-        with self.pl.lock:
-            self.pl._quantize = 2**bits - 1.0
-            self.pl.ramps = {}
-            self.pl._manual_restore = True
+        self.pl._call_with_lock(lambda: self.pl._set_quantization(bits))
 
     def set_exceptions(self, event: wx.Event) -> None:
         """Set application exceptions for profile loading.
@@ -2070,6 +2041,19 @@ class ProfileLoader:
     GUI_REQUEST_TIMEOUT = 1.0
     #: How long shutdown() waits for the monitoring thread to exit (seconds).
     MONITOR_JOIN_TIMEOUT = 10.0
+    #: How long shutdown() then waits for self.lock (held by a monitoring
+    #: iteration that outlived the wait above) before it skips resetting the
+    #: fixed profile associations (seconds).
+    SHUTDOWN_LOCK_TIMEOUT = 2.0
+    #: How often exit() retries leaving the main loop while a modal dialog's
+    #: nested event loop is still active (milliseconds).
+    EXIT_RETRY_MS = 50
+    #: How long a GUI-thread handler waits for self.lock before deferring its
+    #: change until the monitoring iteration holding the lock is done
+    #: (seconds), and how often deferred changes retry (milliseconds). See
+    #: _call_with_lock.
+    GUI_LOCK_TIMEOUT = 0.2
+    GUI_LOCK_RETRY_MS = 250
 
     def __init__(self) -> None:
         self._bootstrap_app()
@@ -2077,6 +2061,12 @@ class ProfileLoader:
         self.lock = threading.Lock()
         self._is_other_running_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
+        # Set once shutdown() has finished (see _finish_shutdown_on_gui_thread)
+        self._shutdown_done = threading.Event()
+        self._shutdown_thread = None
+        self._ui_torn_down = False
+        # GUI-thread changes waiting for self.lock (see _call_with_lock)
+        self._deferred_locked_calls = []
         self.monitoring = True
         # Whether a persistent tray icon is active on this platform/toolkit.
         # Set True by setup_taskbar_icon() (wx, win32-only) or overridden by
@@ -2090,6 +2080,12 @@ class ProfileLoader:
         self.child_devices_count = {}
         self._current_display_key = -1
         self.numwindows = 0
+        # Keep-running check state (see _check_keep_running)
+        self._window_count_drop_seen = False
+        self._window_count_request = None
+        self._last_window_count_error = None
+        # Last logged monitoring iteration traceback (_handle_monitor_error)
+        self._last_monitor_traceback = None
         self.profile_associations = {}
         self.profiles = {}
         self.devices2profiles = {}
@@ -2142,6 +2138,9 @@ class ProfileLoader:
         self._component_name = None
         self._app_detection_msg = None
         self._hwnds_pids = set()
+        # (pid, error code) pairs of known processes whose filename could not
+        # be read at the last check (see _look_for_known_processes)
+        self._process_filename_errors = set()
         self._fixed_profile_associations = set()
         self.__other_component = None, None, 0
         self.__apply_profiles = None
@@ -2149,7 +2148,9 @@ class ProfileLoader:
             sys.platform == "win32"
             and "--force" not in sys.argv[1:]
             and sys.getwindowsversion() >= (6, 1)
-            and self._calibration_management_isenabled()
+            # Query it (no tray yet that could freeze; the GUI thread's
+            # _calibration_management_isenabled() only reads this result)
+            and self._query_calibration_management_state()
         ):
             # Incase calibration loading is handled by Windows 7 and
             # isn't forced
@@ -2856,8 +2857,11 @@ class ProfileLoader:
         print(f"Executing ProfileLoader.exit({event})")
         dlg = None
         for dlg in get_dialogs():
-            if not isinstance(dlg, ProfileLoaderExceptionsDialog) or (
-                event and hasattr(event, "CanVeto") and not event.CanVeto()
+            if (
+                # Programmatic exit (fatal error, --oneshot): end every dialog
+                event is None
+                or not isinstance(dlg, ProfileLoaderExceptionsDialog)
+                or (event and hasattr(event, "CanVeto") and not event.CanVeto())
             ):
                 try:
                     dlg.EndModal(wx.ID_CANCEL)
@@ -2903,8 +2907,30 @@ class ProfileLoader:
             # Other event source
             event.Skip()
         else:
-            # Called from menu
-            wx.GetApp().ExitMainLoop()
+            # Called from the menu, or programmatically (fatal error, --oneshot)
+            self._exit_main_loop()
+
+    def _exit_main_loop(self) -> None:
+        """Exit the main loop, as soon as no nested event loop is active.
+
+        wx ignores ``ExitMainLoop()`` while a nested event loop runs, e.g. when
+        :meth:`exit` was posted (by the monitoring thread's fatal error
+        handling, or ``--oneshot``) while a modal dialog such as the profile
+        associations dialog was open: :meth:`exit` ends the dialog, but its
+        event loop is still the active one at that moment. The loader then
+        kept running without its monitoring thread, and :meth:`shutdown`
+        (association reset, configuration write) never ran. So retry from a
+        timer until the main loop is the active loop again. (``wx.CallAfter``
+        would be processed by the still active nested loop again and spin.)
+        """
+        app = wx.GetApp()
+        if not app:
+            return
+        main_loop = app.GetMainLoop()
+        if main_loop is not None and not main_loop.IsRunning():
+            wx.CallLater(self.EXIT_RETRY_MS, self._exit_main_loop)
+            return
+        app.ExitMainLoop()
 
     def get_title(self) -> str:
         """Get the title of the application.
@@ -2931,10 +2957,7 @@ class ProfileLoader:
         Returns:
             str: The notification body text.
         """
-        if (
-            "--force" not in sys.argv[1:]
-            and self._calibration_management_isenabled()
-        ):
+        if "--force" not in sys.argv[1:] and self._calibration_management_isenabled():
             text = lang.getstr("calibration.load.handled_by_os") + "\n"
         else:
             text = ""
@@ -3023,7 +3046,7 @@ class ProfileLoader:
         if numwindows is None:
             return True
         if numwindows < self.numwindows:
-            if not getattr(self, "_window_count_drop_seen", False):
+            if not self._window_count_drop_seen:
                 # Confirm on the next check before acting on it
                 self._window_count_drop_seen = True
                 debug_print(
@@ -3038,22 +3061,22 @@ class ProfileLoader:
         self.numwindows = numwindows
         return True
 
-    def _count_own_top_level_windows(self) -> None | int:
+    def _count_own_top_level_windows(self) -> int | None:
         """Count our own top-level windows. Must be called on the GUI thread.
 
         Returns:
-            None | int: The number of windows, or None if it could not be
+            int | None: The number of windows, or None if it could not be
                 determined.
         """
         try:
             return len(self._enumerate_own_top_level_windows())
         except Exception as exception:
-            if exception.args != getattr(self, "_last_window_count_error", None):
+            if exception.args != self._last_window_count_error:
                 self._last_window_count_error = exception.args
                 print("Could not enumerate own top-level windows:", exception)
             return None
 
-    def _count_own_top_level_windows_on_gui_thread(self) -> None | int:
+    def _count_own_top_level_windows_on_gui_thread(self) -> int | None:
         """Have the GUI thread count our own top-level windows.
 
         At most one request is outstanding at any time. If the GUI thread does
@@ -3062,17 +3085,17 @@ class ProfileLoader:
         the next call.
 
         Returns:
-            None | int: The number of windows, or None if it could not be
+            int | None: The number of windows, or None if it could not be
                 determined in time.
         """
-        request = getattr(self, "_window_count_request", None)
+        request = self._window_count_request
         if request is None or request[0].is_set():
             if not self.monitoring or self._shutdown:
                 # Do not leave requests queued for a GUI thread that is about
                 # to stop processing them
                 return None
             done = threading.Event()
-            result: list[None | int] = [None]
+            result: list[int | None] = [None]
 
             def count() -> None:
                 try:
@@ -3216,7 +3239,7 @@ class ProfileLoader:
         key_name = r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Configuration"
         key = None
         numsubkeys = 0
-        if not getattr(self, "_display_conf_key_unavailable", False):
+        if not self._display_conf_key_unavailable:
             try:
                 key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_name)
                 numsubkeys, numvalues, mtime = winreg.QueryInfoKey(key)
@@ -3240,14 +3263,13 @@ class ProfileLoader:
                         Warning,
                         stacklevel=2,
                     )
-        if key is None:
-            # get_active_display_devices takes around 3-10ms in contrast to
-            # querying registry which takes 1-3ms
-            if (
-                not self._active_displays
-                or self._active_displays != get_active_display_devices("DeviceKey")
-            ):
-                has_display_changed = True
+        # Without the registry key: get_active_display_devices takes around
+        # 3-10ms in contrast to querying registry which takes 1-3ms
+        if key is None and (
+            not self._active_displays
+            or self._active_displays != get_active_display_devices("DeviceKey")
+        ):
+            has_display_changed = True
         for i in range(numsubkeys):
             try:
                 subkey_name = winreg.EnumKey(key, i)
@@ -3320,19 +3342,27 @@ class ProfileLoader:
 
         Errors in individual iterations are handled (logged and retried) by
         :meth:`_check_display_conf` itself. Anything that still escapes it is
-        logged here and handed to the GUI thread as a fatal error.
+        handed to the GUI thread as a fatal error, whose ``handle_error()``
+        logs the traceback (once), or only logged if shutting down.
         """
         try:
             self._check_display_conf()
         except Exception as exception:
-            # Log the real traceback while it is still available
-            traceback.print_exc()
             # Note that self.lock is NOT released here: the monitoring loop
             # only ever holds it inside a "with" block, so it has already been
             # released. Releasing it here could only free a lock held by
             # another thread (the GUI thread or ProcessDisplayChangedEvent).
             if not self._shutdown:
-                self._post_to_gui_thread(self._handle_fatal_error, exception)
+                try:
+                    # handle_error() logs the traceback (from the exception
+                    # itself), so it is not logged here as well
+                    self._post_to_gui_thread(self._handle_fatal_error, exception)
+                except Exception:
+                    log_error_traceback()
+                else:
+                    return
+            # handle_error() will not run: log the traceback here
+            log_error_traceback(exception)
 
     def _handle_fatal_error(self, exception: Exception) -> None:
         handle_error(exception)
@@ -3486,7 +3516,7 @@ class ProfileLoader:
         Args:
             since (float): ``time.perf_counter()`` when the iteration started.
         """
-        checked = getattr(self, "_calibration_management_state_checked", None)
+        checked = self._calibration_management_state_checked
         if checked is None or checked < since:
             self._query_calibration_management_state()
 
@@ -3550,9 +3580,11 @@ class ProfileLoader:
             # Re-raise the exception being handled by our caller
             raise
         tb = traceback.format_exc()
-        if tb != getattr(self, "_last_monitor_traceback", None):
+        if tb != self._last_monitor_traceback:
             self._last_monitor_traceback = tb
-            traceback.print_exc()
+            # Handled: into the app log as one record (not line by line
+            # through stderr)
+            log_error_traceback()
         else:
             print(
                 "Display configuration monitoring error (same as before):",
@@ -3631,6 +3663,9 @@ class ProfileLoader:
         profile_associations_changed = 0
         apply_profiles = self._should_apply_profiles()
         for i, (display, _edid, moninfo, device) in enumerate(self.monitors):
+            if self._must_stop_writing():
+                # Shutting down: leave the remaining displays alone
+                break
             display_desc = display.replace("[PRIMARY]", lang.getstr("display.primary"))
             devicekey = device.DeviceKey if device else None
             key = devicekey or str(i)
@@ -3649,17 +3684,21 @@ class ProfileLoader:
                 debug_print(f"Display {key} ({display}) no longer present?")
                 self._next = False
                 break
-            except Exception as exception:
-                if (
-                    exception.args[0] != errno.ENOENT
-                    and exception.args != self._last_exception_args
-                ) or DEBUG:
-                    self._last_exception_args = exception.args
+            except Exception as exc:
+                # Not "except ... as exception": Python unbinds the "as" name
+                # when the handler ends, and "exception" is used below (this
+                # used to raise UnboundLocalError for every error, e.g. a WCS
+                # worker timeout, and fail the whole monitoring iteration)
+                exception = exc
+                # args may be empty (e.g. a bare TimeoutError())
+                is_enoent = exc.args[:1] == (errno.ENOENT,)
+                if (not is_enoent and exc.args != self._last_exception_args) or DEBUG:
+                    self._last_exception_args = exc.args
                     print(
                         f"Could not get display profile for display {key} ({display}):",
-                        exception,
+                        exc,
                     )
-                if exception.args[0] == errno.ENOENT:
+                if is_enoent:
                     # Unassigned - don't show error icon
                     self.setgammaramp_success[i] = True
                     exception = None
@@ -3668,7 +3707,10 @@ class ProfileLoader:
             else:
                 if profile_path:
                     profile_name = os.path.basename(profile_path)
-            profile_key = str(profile_name or exception or "")
+            if exception is not None:
+                profile_key = self._error_association_key(exception)
+            else:
+                profile_key = str(profile_name or "")
             association = self.profile_associations.get(key, (False, 0, ""))
             if (
                 getcfg("profile_loader.fix_profile_associations")
@@ -3788,6 +3830,9 @@ class ProfileLoader:
                 desc,
                 hwnds_pids_changed,
             )
+            if self._must_stop_writing():
+                # Shutdown began during this iteration: no gamma ramp changes
+                break
             try:
                 hdc = win32gui.CreateDC(moninfo["Device"], None, None)
             except Exception as exception:
@@ -3815,6 +3860,31 @@ class ProfileLoader:
             # We only arrive here if the loop was completed
             self._next = False
         return profile_associations_changed, apply_profiles, idle, result
+
+    @staticmethod
+    def _error_association_key(exception: BaseException) -> str:
+        """Return the association key recorded for a failed profile lookup.
+
+        The key is the same for every repeat of the same failure. The message
+        is not: e.g. a WCS worker TimeoutError names the request ID, which
+        changes with every call. Keyed on the message, every poll during a
+        WCS outage looked like a new profile association (logged as a
+        profile change, per-user profiles flag cache invalidated, gamma ramps
+        reloaded and, with "fix profile associations" enabled, a one-second
+        delay and an immediate re-poll).
+
+        Args:
+            exception (BaseException): The error of the profile lookup.
+
+        Returns:
+            str: E.g. "<TimeoutError>" or "<PermissionError 13>". Never empty
+                (an empty key means "no profile assigned").
+        """
+        key = type(exception).__name__
+        args = exception.args
+        if args and isinstance(args[0], int):
+            key += f" {args[0]}"
+        return f"<{key}>"
 
     def _generate_and_apply_profiles(
         self,
@@ -4030,7 +4100,8 @@ class ProfileLoader:
             return profile_associations_changed, profile_association_changed, desc
 
         if profile_name is None:
-            desc = str(exception or "?")
+            # repr() for an error without a message, e.g. TimeoutError()
+            desc = (str(exception) or repr(exception)) if exception else "?"
         else:
             desc = get_profile_desc(profile_name)
         if not first_run:
@@ -4534,33 +4605,128 @@ class ProfileLoader:
     def shutdown(self) -> None:
         """Shut down the profile loader.
 
-        Runs at most once. Stops the display configuration monitoring thread
-        and waits (up to ``MONITOR_JOIN_TIMEOUT`` seconds) for it to exit, so
-        it does not keep running into interpreter finalization, then resets
-        the fixed profile associations, writes the configuration and tears
-        down the UI. Normally called on the GUI thread from the application's
-        exit handlers. The UI is only ever torn down on the GUI thread.
+        Runs at most once. Stops the display configuration monitoring thread,
+        writes the configuration (first: it does not depend on the WCS worker
+        process, and at the end of a session there may be little time left),
+        waits (up to ``MONITOR_JOIN_TIMEOUT`` seconds) for the monitoring
+        thread to exit, resets the fixed profile associations, closes the WCS
+        manager (see :meth:`_shutdown_wcs`) and tears down the UI.
+
+        The association reset holds ``self.lock``, so it never interleaves
+        with a monitoring iteration that outlived the wait (e.g. stalled in a
+        WCS worker call). If the lock cannot be taken within
+        ``SHUTDOWN_LOCK_TIMEOUT`` seconds, the reset is skipped (and logged).
+        Once shutdown has begun, the monitoring thread writes neither profile
+        associations nor gamma ramps any more (see
+        :meth:`_must_stop_writing`), so it cannot undo the reset either.
+
+        Normally called on the GUI thread from the application's exit
+        handlers. The UI is only ever torn down on the GUI thread: when called
+        on another thread, the teardown is posted to the GUI thread, and a
+        GUI-thread call made meanwhile waits for that shutdown to finish and
+        tears down the UI itself (the posted teardown may never run once the
+        main loop has ended).
         """
         with self._shutdown_lock:
-            if self._shutdown:
-                return
+            first_call = not self._shutdown
             self._shutdown = True
-        print("Shutting down profile loader")
-        if self.monitoring:
-            print("Shutting down display configuration monitoring thread")
-            self.monitoring = False
-        self._join_monitoring_thread()
-        if getcfg("profile_loader.fix_profile_associations"):
+            if first_call:
+                self._shutdown_thread = threading.current_thread()
+        if not first_call:
+            if (
+                self._is_gui_thread()
+                and self._shutdown_thread is not threading.current_thread()
+            ):
+                self._finish_shutdown_on_gui_thread()
+            return
+        try:
+            print("Shutting down profile loader")
+            if self.monitoring:
+                print("Shutting down display configuration monitoring thread")
+                self.monitoring = False
             try:
-                self._reset_display_profile_associations()
+                self.writecfg()
             except Exception:
-                # Still write the configuration and remove the tray icon
-                traceback.print_exc()
-        self.writecfg()
+                # Still reset the associations and remove the tray icon
+                log_error_traceback()
+            self._join_monitoring_thread()
+            if getcfg("profile_loader.fix_profile_associations"):
+                self._reset_associations_on_shutdown()
+            self._shutdown_wcs()
+        finally:
+            self._shutdown_done.set()
         if self._is_gui_thread():
-            self._teardown_ui()
+            self._teardown_ui_once()
         else:
-            self._post_to_gui_thread(self._teardown_ui)
+            self._post_to_gui_thread(self._teardown_ui_once)
+
+    def _reset_associations_on_shutdown(self) -> None:
+        """Reset the fixed profile associations, holding ``self.lock``.
+
+        Skipped if a monitoring iteration still holds the lock after
+        ``SHUTDOWN_LOCK_TIMEOUT`` seconds (rather than interleaving with it).
+        """
+        if not self.lock.acquire(timeout=self.SHUTDOWN_LOCK_TIMEOUT):
+            print(
+                "Display configuration monitoring is still busy, not resetting "
+                "profile associations"
+            )
+            return
+        try:
+            self._reset_display_profile_associations(force=True)
+        except Exception:
+            # Still remove the tray icon
+            log_error_traceback()
+        finally:
+            self.lock.release()
+
+    def _shutdown_wcs(self) -> None:
+        """Close the WCS manager after shutdown's last use of it.
+
+        ``main._exit`` terminates every multiprocessing child (the WCS worker
+        process among them) after the exit handlers have run. A monitoring
+        iteration still running then made the WCS manager log an error and
+        start a new worker process during exit. Once the manager is closed,
+        such calls fail right away instead.
+        """
+        try:
+            shutdown_wcs_manager()
+        except Exception:
+            log_error_traceback()
+
+    def _finish_shutdown_on_gui_thread(self) -> None:
+        """Complete a shutdown that another thread started, on the GUI thread.
+
+        Waits for that shutdown to finish, then tears down the UI unless the
+        teardown that it posted to the GUI thread has already run.
+        """
+        timeout = self.MONITOR_JOIN_TIMEOUT + self.SHUTDOWN_LOCK_TIMEOUT + 5
+        if not self._shutdown_done.wait(timeout):
+            print("Shutdown on another thread is taking long, removing the UI now")
+        self._teardown_ui_once()
+
+    def _teardown_ui_once(self) -> None:
+        """Tear down the UI (see :meth:`_teardown_ui`) unless already done."""
+        if self._ui_torn_down:
+            return
+        self._ui_torn_down = True
+        self._teardown_ui()
+
+    def _must_stop_writing(self) -> bool:
+        """Return whether the calling thread must not change displays any more.
+
+        Once shutdown has begun (or monitoring was stopped), the display
+        configuration monitoring thread must write neither profile
+        associations nor gamma ramps: :meth:`shutdown` resets the
+        associations it fixed, and an iteration that outlived shutdown's wait
+        for it (e.g. stalled in a WCS worker call) would otherwise fix them
+        again after the reset, or reload calibration while the loader exits.
+        The GUI thread (the tray menu, shutdown itself) is not affected.
+
+        Returns:
+            bool: True if a non-GUI caller must stop changing displays.
+        """
+        return not self._is_gui_thread() and (self._shutdown or not self.monitoring)
 
     def _join_monitoring_thread(self) -> None:
         """Wait for the display configuration monitoring thread to exit."""
@@ -4899,6 +5065,10 @@ class ProfileLoader:
             return
 
         skip = False
+        # (pid, error code) pairs that failed this time; each is logged once
+        # while it keeps failing (this runs every three seconds)
+        filename_errors = set()
+        logged_filename_errors = self._process_filename_errors
         for _session_id, pid, basename, user_security_id in processes:
             name_lower = basename.lower()
             if name_lower != "madhcctrl.exe":
@@ -4917,16 +5087,9 @@ class ProfileLoader:
             try:
                 filename = get_process_filename(pid)
             except (OSError, pywintypes.error) as exception:
-                if exception.args[0] not in (
-                    winerror.ERROR_ACCESS_DENIED,
-                    winerror.ERROR_PARTIAL_COPY,
-                    winerror.ERROR_INVALID_PARAMETER,
-                    winerror.ERROR_GEN_FAILURE,
-                ):
-                    print(
-                        f"Couldn't get filename of process {pid}:",
-                        exception,
-                    )
+                self._note_process_filename_error(
+                    pid, exception, logged_filename_errors, filename_errors
+                )
                 continue
             enabled, reset, path = self._exceptions.get(filename.lower(), (0, 0, ""))
             if known_app or enabled:
@@ -4936,6 +5099,43 @@ class ProfileLoader:
                 elif other_component != (filename, None, reset):
                     self._reset_gamma_ramps = True
                 self.__other_component = filename, None, reset
+        self._process_filename_errors = filename_errors
+
+    @staticmethod
+    def _note_process_filename_error(
+        pid: int,
+        exception: Exception,
+        logged: set[tuple[int, object]],
+        failed: set[tuple[int, object]],
+    ) -> None:
+        """Log an unexpected failure to read a process's filename, once.
+
+        Expected errors (access denied, partial copy, invalid parameter, gen
+        failure, e.g. for a process that is exiting) are not logged.
+
+        Args:
+            pid (int): The process ID.
+            exception (Exception): The error (OSError or pywintypes.error).
+            logged (set[tuple[int, object]]): (pid, error code) pairs that
+                failed at the last check, i.e. that were already logged.
+            failed (set[tuple[int, object]]): (pid, error code) pairs that
+                failed at this check, to which this one is added.
+        """
+        # The Windows error code: args[0] of an OSError from ctypes.WinError
+        # is the errno it maps to (e.g. EACCES for ERROR_ACCESS_DENIED)
+        code = getattr(exception, "winerror", None)
+        if code is None and exception.args:
+            code = exception.args[0]
+        if code in (
+            winerror.ERROR_ACCESS_DENIED,
+            winerror.ERROR_PARTIAL_COPY,
+            winerror.ERROR_INVALID_PARAMETER,
+            winerror.ERROR_GEN_FAILURE,
+        ):
+            return
+        failed.add((pid, code))
+        if (pid, code) not in logged:
+            print(f"Couldn't get filename of process {pid}:", exception)
 
     def _handle_component_detection(
         self,
@@ -5075,15 +5275,24 @@ class ProfileLoader:
             return
         # Check if madVR did reset the video card gamma tables.
         # If it didn't, assume we can keep preserving calibration state
-        with self.lock:
-            self._next = True
+        # (runs on the GUI thread, from a timer)
+        self._call_with_lock(self._request_next_iteration)
 
-    def _reset_display_profile_associations(self) -> None:
-        """Reset display profile associations for all monitors."""
+    def _reset_display_profile_associations(self, force: bool = False) -> None:
+        """Reset display profile associations for all monitors.
+
+        Args:
+            force (bool): Reset even when called on the monitoring thread
+                after shutdown has begun (see :meth:`_must_stop_writing`), as
+                shutdown itself does.
+        """
         if not self._can_fix_profile_associations():
             return
-        for devicekey in self.devices2profiles:
-            display_edid, profile, desc = self.devices2profiles[devicekey]
+        # A copy: the monitoring thread may rebuild the mapping meanwhile
+        for devicekey, entry in list(self.devices2profiles.items()):
+            if not force and self._must_stop_writing():
+                break
+            display_edid, profile, _desc = entry
             if devicekey not in self._fixed_profile_associations or not profile:
                 continue
             try:
@@ -5102,6 +5311,9 @@ class ProfileLoader:
             current_profile = os.path.basename(current_profile)
             if not current_profile or current_profile == profile:
                 continue
+            if not force and self._must_stop_writing():
+                # Shutdown began while the association was being read
+                break
             print(
                 f"Resetting profile association for {display_edid[0]}:",
                 current_profile,
@@ -5125,16 +5337,30 @@ class ProfileLoader:
     def _set_display_profiles(self, dry_run: bool = False) -> None:
         """Set display profiles for all monitors.
 
+        Rebuilds ``devices2profiles``, the original associations that
+        :meth:`_reset_display_profile_associations` restores. Does nothing on
+        the monitoring thread once shutdown has begun (see
+        :meth:`_must_stop_writing`): shutdown's reset needs that mapping.
+
         Args:
             dry_run (bool): If True, do not actually set the profiles.
         """
         if not self._can_fix_profile_associations():
+            return
+        if self._must_stop_writing():
+            # Keep the mapping, e.g. when shutdown began during the reset that
+            # a display change does first: it may have left fixes in place
             return
         debug_print("-" * 80)
         debug_print("Checking profile associations")
         debug_print("")
         self.devices2profiles = {}
         for i, (display, _edid, moninfo, _device) in enumerate(self.monitors):
+            if self._must_stop_writing():
+                # Safe to stop with a partial mapping: only a reset that ran
+                # to the end (or nothing, on the first run) came before, so
+                # the monitors not processed yet are not fixed
+                break
             debug_print(
                 f"Enumerating display devices for monitor {i:d} {moninfo['Device']}"
             )
@@ -5252,6 +5478,11 @@ class ProfileLoader:
         device = devices[0]
         current_profile = self.devices2profiles[device.DeviceKey][1]
         if correct_profile and current_profile != correct_profile and not dry_run:
+            if self._must_stop_writing():
+                # Shutdown began (e.g. while the association was being read):
+                # do not fix it again after shutdown's reset
+                print(f"Not fixing profile association for {display}: exiting")
+                return
             print(
                 f"Fixing profile association for {display}:",
                 current_profile,
@@ -5285,16 +5516,13 @@ class ProfileLoader:
         if event:
             print("Menu command:", end=" ")
         print("Set calibration state to load profile vcgt")
-        if self.lock.locked():
-            print("Waiting to acquire lock...")
-        with self.lock:
-            print("Acquired lock")
-            setcfg("profile_loader.reset_gamma_ramps", 0)
+        setcfg("profile_loader.reset_gamma_ramps", 0)
+
+        def apply() -> None:
             self._manual_restore = manual_restore
             self._reset_gamma_ramps = False
-            print("Releasing lock")
-        self._refresh_visual_state()
-        self.writecfg()
+
+        self._call_with_lock(apply, self._after_calibration_state_change)
 
     def _set_reset_gamma_ramps(
         self, event: wx.Event, manual_restore: bool = True
@@ -5308,16 +5536,138 @@ class ProfileLoader:
         if event:
             print("Menu command:", end=" ")
         print("Set calibration state to reset vcgt")
-        if self.lock.locked():
-            print("Waiting to acquire lock...")
-        with self.lock:
-            print("Acquired lock")
-            setcfg("profile_loader.reset_gamma_ramps", 1)
+        setcfg("profile_loader.reset_gamma_ramps", 1)
+
+        def apply() -> None:
             self._manual_restore = manual_restore
             self._reset_gamma_ramps = True
-            print("Releasing lock")
+
+        self._call_with_lock(apply, self._after_calibration_state_change)
+
+    def _request_manual_restore(self) -> None:
+        """Load calibration at the next iteration, right away (holding lock)."""
+        self._manual_restore = True
+        self._next = True
+
+    def _request_next_iteration(self) -> None:
+        """Run the next monitoring iteration right away (holding self.lock)."""
+        self._next = True
+
+    def _set_quantization(self, bits: int) -> None:
+        """Quantize gamma ramps to ``bits`` bits from now on (holding lock).
+
+        Args:
+            bits (int): The bit depth.
+        """
+        self._quantize = 2**bits - 1.0
+        self.ramps = {}
+        self._manual_restore = True
+
+    def _override_on_display_change(self) -> None:
+        """Load calibration despite DisplayCAL running if the display changed.
+
+        For the ``apply-profiles display-changed`` scripting command. Called
+        holding ``self.lock``.
+        """
+        if self._has_display_changed:
+            # Normally calibration loading is disabled while DisplayCAL is
+            # running. Override this when the display has changed
+            self._manual_restore = getcfg("profile.load_on_login") and 2
+
+    def _after_calibration_state_change(self) -> None:
+        """Show and save a new calibration state (load or reset vcgt)."""
         self._refresh_visual_state()
         self.writecfg()
+
+    def _call_with_lock(
+        self,
+        func: Callable[[], object],
+        after: Callable[[], object] | None = None,
+    ) -> bool:
+        """Run ``func()`` holding ``self.lock``, then ``after()`` (if given).
+
+        The display configuration monitoring thread holds ``self.lock`` for a
+        whole iteration, which includes calls to the WCS worker process. With
+        a stalled worker that can take minutes, and a GUI-thread handler
+        waiting for the lock froze the tray icon and menu (and the scripting
+        host's replies) meanwhile. So on the GUI thread, if the lock is not
+        free within ``GUI_LOCK_TIMEOUT`` seconds, the call is deferred: it
+        runs (deferred calls in order) as soon as the lock is free, retried
+        every ``GUI_LOCK_RETRY_MS`` milliseconds from the GUI thread's event
+        loop. Either way ``func`` runs between monitoring iterations, as
+        before. On other threads, this waits for the lock.
+
+        Args:
+            func (Callable[[], object]): Called with the lock held.
+            after (Callable[[], object] | None): Called after ``func``, with
+                the lock released.
+
+        Returns:
+            bool: True if ``func`` ran right away, False if it was deferred.
+        """
+        if not self._is_gui_thread():
+            with self.lock:
+                func()
+            if after:
+                after()
+            return True
+        pending = getattr(self, "_deferred_locked_calls", None)
+        if pending is None:
+            pending = self._deferred_locked_calls = []
+        if not pending and self.lock.acquire(timeout=self.GUI_LOCK_TIMEOUT):
+            try:
+                func()
+            finally:
+                self.lock.release()
+            if after:
+                after()
+            return True
+        if not pending:
+            print(
+                "Display configuration monitoring is busy, the change is applied "
+                "when it is done"
+            )
+            self._post_to_gui_thread_delayed(
+                self.GUI_LOCK_RETRY_MS, self._run_deferred_locked_calls
+            )
+        pending.append((func, after))
+        return False
+
+    def _run_deferred_locked_calls(self) -> None:
+        """Run the calls :meth:`_call_with_lock` deferred, if the lock is free.
+
+        Runs on the GUI thread. Never waits for the lock: retries later.
+        """
+        pending = getattr(self, "_deferred_locked_calls", None)
+        if not pending:
+            return
+        if self._shutdown:
+            print(f"Shutting down, dropping {len(pending)} deferred change(s)")
+            pending.clear()
+            return
+        if not self.lock.acquire(blocking=False):
+            self._post_to_gui_thread_delayed(
+                self.GUI_LOCK_RETRY_MS, self._run_deferred_locked_calls
+            )
+            return
+        afters = []
+        try:
+            while pending:
+                func, after = pending.pop(0)
+                try:
+                    func()
+                except Exception:
+                    log_error_traceback()
+                else:
+                    if after:
+                        afters.append(after)
+        finally:
+            self.lock.release()
+        for after in afters:
+            try:
+                after()
+            except Exception:
+                log_error_traceback()
 
     def _refresh_visual_state(self) -> None:
         """Refresh the persistent UI's visual state (icon/tooltip), if any.
@@ -5372,8 +5722,8 @@ class ProfileLoader:
     def _request_forced_shutdown(self) -> None:
         """Toolkit-specific hook: force-close on the GUI thread, no confirmation.
 
-        Used by :meth:`_check_display_conf` when
-        :meth:`_check_keep_running` notices something external (e.g. a
+        Posted by :meth:`_stop_if_asked_to_exit` (on the monitoring thread)
+        when :meth:`_check_keep_running` notices something external (e.g. a
         Windows session shutdown/logoff) asked us to exit. This default (wx)
         implementation shuts down and force-closes the persistent frame.
         Overridden by toolkit subclasses (e.g. the Qt port).
@@ -5433,21 +5783,22 @@ class ProfileLoader:
     def _calibration_management_isenabled(self) -> bool:
         """Return whether Windows manages display calibration. Never raises.
 
-        The state is queried from the WCS worker process. If that fails (e.g.
-        the worker process is stalled, dead or being restarted), the error is
-        printed and the last known state is returned, so a WCS problem can
-        neither kill the display configuration monitoring thread nor raise
-        into the GUI. On the GUI thread, the last known state (refreshed by
-        the monitoring thread every few seconds) is returned right away
-        instead of waiting for the worker process, so a stalled worker cannot
-        freeze the tray icon or menu either.
+        On other threads, the state is queried from the WCS worker process.
+        If that fails (e.g. the worker process is stalled, dead or being
+        restarted), the error is printed and the last known state is
+        returned, so a WCS problem cannot kill the display configuration
+        monitoring thread. On the GUI thread, only the last known state
+        (refreshed by the monitoring thread every iteration) is returned,
+        False while it is still unknown (e.g. the startup query failed): the
+        GUI thread never waits for the worker process here, so this cannot
+        freeze the tray icon or menu. (Handlers that take ``self.lock`` are
+        kept from blocking by :meth:`_call_with_lock`.)
 
         Returns:
             bool: True if Windows calibration management is enabled.
         """
-        state = getattr(self, "_calibration_management_state", None)
-        if state is not None and self._is_gui_thread():
-            return state
+        if self._is_gui_thread():
+            return bool(self._calibration_management_state)
         return self._query_calibration_management_state()
 
     def _query_calibration_management_state(self) -> bool:
@@ -5466,10 +5817,10 @@ class ProfileLoader:
             state = bool(calibration_management_isenabled())
         except Exception as exception:
             error = f"{exception.__class__.__name__}: {exception}"
-            if error != getattr(self, "_last_wcs_error", None):
+            if error != self._last_wcs_error:
                 self._last_wcs_error = error
                 print("Could not query Windows calibration management state:", error)
-            return bool(getattr(self, "_calibration_management_state", None))
+            return bool(self._calibration_management_state)
         self._calibration_management_state = state
         self._last_wcs_error = None
         return state
@@ -5489,8 +5840,10 @@ class ProfileLoader:
         """
         if event:
             print("Menu command:", end=" ")
-        print("Toggle fix profile associations", event.IsChecked())
-        if event.IsChecked():
+        # The event may be gone by the time a deferred change runs
+        checked = event.IsChecked()
+        print("Toggle fix profile associations", checked)
+        if checked:
             dlg = FixProfileAssociationsDialog(self, parent)
             self.fix_profile_associations_dlg = dlg
             result = dlg.ShowModal()
@@ -5498,19 +5851,22 @@ class ProfileLoader:
             if result == wx.ID_CANCEL:
                 print("Cancelled toggling fix profile associations")
                 return False
-        if self.lock.locked():
-            print("Waiting to acquire lock...")
-        with self.lock:
-            print("Acquired lock")
-            setcfg("profile_loader.fix_profile_associations", int(event.IsChecked()))
-            if event.IsChecked():
-                self._set_display_profiles()
-            else:
-                self._reset_display_profile_associations()
-            self._manual_restore = True
-            self.writecfg()
-            print("Releasing lock")
-        return event.IsChecked()
+        self._call_with_lock(lambda: self._apply_fix_profile_associations(checked))
+        return checked
+
+    def _apply_fix_profile_associations(self, enable: bool) -> None:
+        """Enable or disable fixing profile associations (holding self.lock).
+
+        Args:
+            enable (bool): Whether to fix profile associations.
+        """
+        setcfg("profile_loader.fix_profile_associations", int(enable))
+        if enable:
+            self._set_display_profiles()
+        else:
+            self._reset_display_profile_associations()
+        self._manual_restore = True
+        self.writecfg()
 
     def _set_exceptions(self) -> None:
         """Set exceptions for profile loading."""
