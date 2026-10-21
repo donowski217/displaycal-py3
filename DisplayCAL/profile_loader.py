@@ -2076,6 +2076,9 @@ class ProfileLoader:
     GUI_REQUEST_TIMEOUT = 1.0
     #: How long shutdown() waits for the monitoring thread to exit (seconds).
     MONITOR_JOIN_TIMEOUT = 10.0
+    #: How often exit() retries leaving the main loop while a modal dialog's
+    #: nested event loop is still active (milliseconds).
+    EXIT_RETRY_MS = 50
 
     def __init__(self) -> None:
         self._bootstrap_app()
@@ -2862,8 +2865,11 @@ class ProfileLoader:
         print(f"Executing ProfileLoader.exit({event})")
         dlg = None
         for dlg in get_dialogs():
-            if not isinstance(dlg, ProfileLoaderExceptionsDialog) or (
-                event and hasattr(event, "CanVeto") and not event.CanVeto()
+            if (
+                # Programmatic exit (fatal error, --oneshot): end every dialog
+                event is None
+                or not isinstance(dlg, ProfileLoaderExceptionsDialog)
+                or (event and hasattr(event, "CanVeto") and not event.CanVeto())
             ):
                 try:
                     dlg.EndModal(wx.ID_CANCEL)
@@ -2909,8 +2915,30 @@ class ProfileLoader:
             # Other event source
             event.Skip()
         else:
-            # Called from menu
-            wx.GetApp().ExitMainLoop()
+            # Called from the menu, or programmatically (fatal error, --oneshot)
+            self._exit_main_loop()
+
+    def _exit_main_loop(self) -> None:
+        """Exit the main loop, as soon as no nested event loop is active.
+
+        wx ignores ``ExitMainLoop()`` while a nested event loop runs, e.g. when
+        :meth:`exit` was posted (by the monitoring thread's fatal error
+        handling, or ``--oneshot``) while a modal dialog such as the profile
+        associations dialog was open: :meth:`exit` ends the dialog, but its
+        event loop is still the active one at that moment. The loader then
+        kept running without its monitoring thread, and :meth:`shutdown`
+        (association reset, configuration write) never ran. So retry from a
+        timer until the main loop is the active loop again. (``wx.CallAfter``
+        would be processed by the still active nested loop again and spin.)
+        """
+        app = wx.GetApp()
+        if not app:
+            return
+        main_loop = app.GetMainLoop()
+        if main_loop is not None and not main_loop.IsRunning():
+            wx.CallLater(self.EXIT_RETRY_MS, self._exit_main_loop)
+            return
+        app.ExitMainLoop()
 
     def get_title(self) -> str:
         """Get the title of the application.

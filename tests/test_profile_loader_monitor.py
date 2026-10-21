@@ -944,6 +944,111 @@ def test_forced_shutdown_shuts_down_before_closing_frame(monkeypatch):
     assert harness.events[-1] == ("close_frame", True)
 
 
+# --- exit() while a modal dialog's event loop runs ---------------------------
+
+# Never let a wx.App created here be destroyed mid-session: dropping a wx.App
+# after it created windows leaves wx's hidden display window with a dangling
+# window procedure, and the next message pump on this thread crashes.
+_WX_APPS = []
+
+
+@pytest.fixture(scope="module")
+def wx_app():
+    wx = profile_loader.wx
+    app = wx.GetApp() or wx.App(False)
+    _WX_APPS.append(app)
+    return app
+
+
+def test_exit_leaves_main_loop_from_inside_a_modal_dialog(monkeypatch, wx_app):
+    """The fatal error path, while e.g. the profile associations dialog is open.
+
+    wx ignores ExitMainLoop() inside a nested (modal) event loop: the dialog
+    was ended, but the loader kept running without its monitoring thread and
+    shutdown() never ran. No window is shown; a nested GUIEventLoop stands in
+    for the dialog's modal loop.
+    """
+    from DisplayCAL.wx_windows import BaseApp
+
+    wx = profile_loader.wx
+    # MainLoop() calls OnExit(): never run exit handlers other tests left
+    # registered, should the shared app be a BaseApp
+    monkeypatch.setattr(BaseApp, "_exithandlers", [])
+    pl = _make_pl()
+    pl.frame = None
+    events = []
+    nested = {}
+
+    class FakeDialog:
+        def EndModal(self, code):  # noqa: N802
+            events.append("EndModal")
+            nested["loop"].Exit(code)
+
+        def RequestUserAttention(self):  # noqa: N802
+            pass
+
+    def get_dialogs():
+        loop = nested.get("loop")
+        return [FakeDialog()] if loop is not None and loop.IsRunning() else []
+
+    monkeypatch.setattr(profile_loader, "get_dialogs", get_dialogs)
+    monkeypatch.setattr(
+        profile_loader, "handle_error", lambda exc: events.append("handle_error")
+    )
+
+    def run_modal_loop():
+        nested["loop"] = wx.GUIEventLoop()
+        # What the monitoring thread posts after five failed iterations
+        wx.CallAfter(pl._handle_fatal_error, RuntimeError("monitoring failed"))
+        nested["loop"].Run()
+        events.append("modal loop returned")
+
+    def watchdog():
+        events.append("watchdog")
+        loop = nested.get("loop")
+        if loop is not None and loop.IsRunning():
+            loop.Exit()
+        wx.CallLater(50, wx_app.ExitMainLoop)
+
+    # wxPython's MainLoop() returns right away without a top-level window.
+    # This one (like the loader's PLFrame) is never shown.
+    frame = wx.Frame(None)
+    try:
+        wx.CallAfter(run_modal_loop)
+        timer = wx.CallLater(3000, watchdog)
+        started = time.monotonic()
+        wx_app.MainLoop()
+        elapsed = time.monotonic() - started
+        timer.Stop()
+    finally:
+        frame.Destroy()
+
+    assert events == ["handle_error", "EndModal", "modal loop returned"]
+    assert elapsed < 2
+
+
+def test_programmatic_exit_ends_exceptions_dialog(monkeypatch):
+    pl = _make_pl()
+    pl.frame = None
+    ended = []
+
+    class ExceptionsDialog(profile_loader.ProfileLoaderExceptionsDialog):
+        def __init__(self):  # never create the real (wx) dialog
+            pass
+
+        def EndModal(self, code):  # noqa: N802
+            ended.append(code)
+
+    monkeypatch.setattr(profile_loader, "get_dialogs", lambda: [ExceptionsDialog()])
+    exits = []
+    pl._exit_main_loop = lambda: exits.append(None)
+
+    pl.exit(None)
+
+    assert ended == [profile_loader.wx.ID_CANCEL]
+    assert exits == [None]
+
+
 # --- WCS worker process IPC failures ----------------------------------------
 
 
