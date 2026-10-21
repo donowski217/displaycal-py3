@@ -117,6 +117,34 @@ def _is_freeze_support_call(node: ast.AST) -> bool:
     return name == "freeze_support"
 
 
+def test_launcher_does_not_give_the_loader_pipes():
+    """The launcher stub exits after a few seconds.
+
+    Pipes it handed to the loader would break, and every later print() in a
+    non-frozen loader would then raise OSError.
+    """
+    tree = ast.parse(
+        (SCRIPTS_DIR / "displaycal-apply-profiles-launcher").read_text(
+            encoding="utf-8"
+        )
+    )
+    popen_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "Popen"
+    ]
+    assert len(popen_calls) == 1
+    pipe_kwargs = {
+        keyword.arg
+        for keyword in popen_calls[0].keywords
+        if isinstance(keyword.value, ast.Attribute)
+        and keyword.value.attr in ("PIPE", "STDOUT")
+    }
+    assert not pipe_kwargs
+
+
 def test_entry_scripts_were_found():
     assert "displaycal-apply-profiles" in ENTRY_SCRIPTS
     assert len(ENTRY_SCRIPTS) >= 10

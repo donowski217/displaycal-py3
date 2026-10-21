@@ -28,7 +28,11 @@ args.append("--task")
 if "--oneshot" in sys.argv[1:]:
     args.append("--oneshot")
 
-sp.Popen(args, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.STDOUT)
+# Do not hand the loader pipes to this stub: it exits after a few seconds, so
+# every later print() in a non-frozen (pythonw) loader would fail on the broken
+# pipe. Inheriting our (absent) console handles leaves the loader's sys.stdout
+# and sys.stderr as None, which DisplayCAL.log redirects to its log file.
+sp.Popen(args, stdin=sp.DEVNULL)
 
 # Sleep a few seconds so task scheduler can see an instance already running and
 # won't start another one due to multiple triggers firing at the same time
