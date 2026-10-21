@@ -634,6 +634,8 @@ def terminate_conflicting_instance(
             ) and basename_lower == pyexe_lower
             if not (is_pid_match or is_session_exe_match) or pid2 == opid:
                 continue
+            if not is_other_instance_process(pid2):
+                continue
             # Other instance running
             incoming = False
             if module != "apply-profiles":
@@ -651,6 +653,43 @@ def terminate_conflicting_instance(
             incoming = terminate_running_instance(incoming, pid2, startupinfo)
 
     return incoming
+
+
+def is_other_instance_process(pid: int) -> bool:
+    """Return whether a process with a matching executable is another instance.
+
+    A multiprocessing child (e.g. the profile loader's WCS worker, which in a
+    frozen build is another process of the same executable, started with
+    "--multiprocessing-fork") is not: it cannot be closed gracefully, and if
+    it was listed after its parent, its failed taskkill would override the
+    result, so that this instance would not start either. A process that has
+    exited in the meantime is not running either.
+
+    Args:
+        pid (int): The process ID.
+
+    Returns:
+        bool: False for a multiprocessing child or a process that no longer
+            exists, otherwise True (also if the process cannot be inspected).
+    """
+    try:
+        import psutil
+    except ImportError:
+        return True
+    try:
+        cmdline = psutil.Process(pid).cmdline()
+    except psutil.NoSuchProcess:  # Includes psutil.ZombieProcess
+        print(f"Process with PID {pid} no longer exists")
+        return False
+    except psutil.AccessDenied:
+        return True
+    except Exception as exception:
+        print(f"Warning - could not get command line of PID {pid}:", exception)
+        return True
+    if "--multiprocessing-fork" in cmdline:
+        print(f"Ignoring multiprocessing child process with PID {pid}")
+        return False
+    return True
 
 
 def create_dummy_lockfile(lockfilename: str) -> None:

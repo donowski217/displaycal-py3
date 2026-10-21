@@ -131,3 +131,128 @@ def test_entry_script_calls_freeze_support_before_importing_displaycal(script):
         )
     else:
         pytest.fail(f"{script} does not call freeze_support()")
+
+
+# The WCS worker child (same exe name) is not another instance
+
+LOADER_EXE = "DisplayCAL-apply-profiles.exe"
+LOADER_PID = 1111
+WORKER_PID = 2222
+GONE_PID = 3333
+PROTECTED_PID = 4444
+CMDLINES = {
+    LOADER_PID: [rf"C:\Program Files\DisplayCAL\{LOADER_EXE}", "--task"],
+    WORKER_PID: [
+        rf"C:\Program Files\DisplayCAL\{LOADER_EXE}",
+        "--multiprocessing-fork",
+        f"parent_pid={LOADER_PID}",
+        "pipe_handle=568",
+    ],
+}
+
+
+@pytest.fixture
+def fake_processes(monkeypatch):
+    """Fake process list and psutil; record (never run) taskkill calls."""
+    psutil = pytest.importorskip("psutil")
+
+    class FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def cmdline(self) -> list[str]:
+            if self.pid == GONE_PID:
+                raise psutil.NoSuchProcess(self.pid)
+            if self.pid == PROTECTED_PID:
+                raise psutil.AccessDenied(self.pid)
+            return CMDLINES[self.pid]
+
+    monkeypatch.setattr(psutil, "Process", FakeProcess)
+    env = types.SimpleNamespace(processes=[], terminated=[])
+    session_id = 1
+    monkeypatch.setitem(
+        sys.modules,
+        "win32ts",
+        types.SimpleNamespace(
+            ProcessIdToSessionId=lambda pid: session_id,
+            WTSEnumerateProcesses=lambda: [
+                (session_id, pid, LOADER_EXE, None) for pid in env.processes
+            ],
+        ),
+    )
+    return env
+
+
+@pytest.fixture
+def instance_env(main, fake_processes, monkeypatch, tmp_path):
+    def terminate_running_instance(incoming, pid, startupinfo):
+        fake_processes.terminated.append(pid)
+        # A graceful taskkill cannot close the windowless worker
+        return incoming if pid == WORKER_PID else "ok"
+
+    monkeypatch.setattr(main, "terminate_running_instance", terminate_running_instance)
+    monkeypatch.setattr(main, "EXE_EXT", ".exe")
+    lockfilename = tmp_path / "DisplayCAL-apply-profiles.lock"
+    lockfilename.write_text("")
+    fake_processes.lockfilename = str(lockfilename)
+    fake_processes.lock = types.SimpleNamespace(unlock=lambda: None)
+    return fake_processes
+
+
+def _terminate_conflicting_instance(main, env):
+    return main.terminate_conflicting_instance(
+        "apply-profiles", env.lockfilename, env.lock, None, None
+    )
+
+
+windows_only = pytest.mark.skipif(
+    sys.platform != "win32", reason="terminate_conflicting_instance is Windows-only"
+)
+
+
+@windows_only
+@pytest.mark.parametrize(
+    "processes", [[LOADER_PID, WORKER_PID], [WORKER_PID, LOADER_PID]]
+)
+def test_multiprocessing_child_is_not_another_instance(main, instance_env, processes):
+    """The loader's WCS worker must not make the new loader refuse to start.
+
+    With the worker listed after the loader, the worker's failed taskkill used
+    to override the loader's successful one: the new loader closed the old
+    one and then refused to start ("Not starting another instance.").
+    """
+    instance_env.processes = processes
+
+    assert _terminate_conflicting_instance(main, instance_env) == "ok"
+    assert instance_env.terminated == [LOADER_PID]
+
+
+@windows_only
+def test_orphaned_worker_alone_does_not_block_start(main, instance_env):
+    instance_env.processes = [WORKER_PID]
+
+    assert _terminate_conflicting_instance(main, instance_env) is None
+    assert instance_env.terminated == []
+
+
+@windows_only
+def test_process_that_exited_meanwhile_is_ignored(main, instance_env):
+    instance_env.processes = [GONE_PID]
+
+    assert _terminate_conflicting_instance(main, instance_env) is None
+    assert instance_env.terminated == []
+
+
+@windows_only
+def test_process_that_cannot_be_inspected_is_still_an_instance(main, instance_env):
+    instance_env.processes = [PROTECTED_PID]
+
+    assert _terminate_conflicting_instance(main, instance_env) == "ok"
+    assert instance_env.terminated == [PROTECTED_PID]
+
+
+def test_is_other_instance_process(main, fake_processes):
+    assert main.is_other_instance_process(LOADER_PID) is True
+    assert main.is_other_instance_process(WORKER_PID) is False
+    assert main.is_other_instance_process(GONE_PID) is False
+    assert main.is_other_instance_process(PROTECTED_PID) is True
