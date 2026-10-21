@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import errno
 import getpass
 import glob
@@ -12,7 +13,7 @@ import socket
 import subprocess as sp
 import sys
 import threading
-from time import sleep
+from time import monotonic, sleep
 from typing import TYPE_CHECKING, Any
 
 # Python version check
@@ -527,16 +528,23 @@ def connect_and_notify_running_instance(
         print("Getting instance name")
         if appsocket.send("getappname"):
             print("Sent scripting request, awaiting response...")
-            data_read = appsocket.read()
-            incoming = data_read.rstrip("\4")
-            print(f"Got response: {incoming!r}")
-            # translate incoming values
-            incoming = {
-                PYNAME: PYNAME,
-                False: False,
-                None: False,
-                "": False,
-            }.get(incoming)
+            data_read = appsocket.read(AppSocket.PROBE_TIMEOUT)
+            if data_read is None:
+                # No reply in time: not one of our instances (e.g. a foreign
+                # service listening on a stale port from the lock file).
+                # Treated like any other unexpected reply.
+                incoming = None
+            else:
+                incoming = data_read.rstrip("\4")
+                print(f"Got response: {incoming!r}")
+                # translate incoming values. Anything else (e.g. the reply of
+                # a foreign service) means it is not one of our instances.
+                incoming = {
+                    PYNAME: PYNAME,
+                    False: False,
+                    None: False,
+                    "": False,
+                }.get(incoming)
 
     while incoming:
         # Send args as UTF-8
@@ -1323,6 +1331,16 @@ class AppLock:
 class AppSocket:
     """Socket wrapper class."""
 
+    PROBE_TIMEOUT = 30.0
+    """Seconds to wait for the reply to "getappname" from another instance.
+
+    That reply comes straight from the other instance's scripting host
+    thread, so it is quick. Without a limit, a foreign service that accepts
+    the connection on a stale port from the lock file but never replies
+    would block startup forever. Only this probe has a time limit: e.g. the
+    reply to "exit" may legitimately take long, and a timeout there must not
+    be mistaken for success."""
+
     def __init__(self) -> None:
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1367,26 +1385,56 @@ class AppSocket:
             return False
         return True
 
-    def read(self) -> str:
+    def read(self, timeout: None | float = None) -> None | str:
         """Read data until EOT character (ASCII 4) is found.
 
+        The received bytes are collected and decoded at the end, so a UTF-8
+        sequence split across two recv() calls is decoded correctly. Bytes
+        which are not valid UTF-8 (e.g. the reply of a foreign service which
+        listens on a stale port from a lock file) are escaped instead of
+        raising UnicodeDecodeError, and with "backslashreplace" (unlike
+        "replace") the result can be printed to any stdout encoding. Such a
+        reply never matches an application name.
+
+        Args:
+            timeout (None | float, optional): Give up after this many seconds
+                without the complete data. None (default) waits indefinitely.
+
         Returns:
-            str: Incoming data.
+            None | str: Incoming data (empty if the peer closed the connection
+                without sending anything, or on a socket error), or None if the
+                timeout expired.
         """
-        incoming = ""
-        while "\4" not in incoming:
-            try:
-                data = self.socket.recv(1024).decode("utf-8")
-            except OSError as exception:
-                if exception.errno == errno.EWOULDBLOCK:
-                    sleep(0.05)
-                    continue
-                print("Warning - could not receive data:", exception)
-                break
-            if not data:
-                break
-            incoming += data
-        return incoming
+        incoming = b""
+        deadline = None if timeout is None else monotonic() + timeout
+        previous_timeout = self.socket.gettimeout()
+        try:
+            while b"\4" not in incoming:
+                if deadline is not None:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        print(f"Warning - no complete response within {timeout} s")
+                        return None
+                    self.socket.settimeout(remaining)
+                try:
+                    data = self.socket.recv(1024)
+                except socket.timeout:
+                    print(f"Warning - no complete response within {timeout} s")
+                    return None
+                except OSError as exception:
+                    if exception.errno == errno.EWOULDBLOCK:
+                        sleep(0.05)
+                        continue
+                    print("Warning - could not receive data:", exception)
+                    break
+                if not data:
+                    break
+                incoming += data
+        finally:
+            if deadline is not None:
+                with contextlib.suppress(OSError):
+                    self.socket.settimeout(previous_timeout)
+        return incoming.decode("utf-8", "backslashreplace")
 
     def send(self, data: str) -> bool:
         """Send data.
