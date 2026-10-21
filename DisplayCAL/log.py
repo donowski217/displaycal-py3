@@ -730,6 +730,36 @@ def _emit_to_app_log(level: int, msg: str) -> bool:
     return True
 
 
+def log_error(text: str) -> bool:
+    """Record an error (e.g. a traceback) in the application log file.
+
+    The text is written as one ERROR record directly to the application log
+    file handlers, bypassing LOG(), LOGBUFFER and the wx log window, so this
+    is safe to call from exception hooks and from any thread. If there is no
+    application log file handler (e.g. before setup_logging() ran), the text
+    is written to sys.stderr instead. Never raises.
+
+    Args:
+        text (str): The text to record. May span multiple lines.
+
+    Returns:
+        bool: True if the text was recorded in the application log file,
+            False if it was written to sys.stderr instead (or could not be
+            written at all).
+    """
+    try:
+        text = str(text).rstrip()
+        if _emit_to_app_log(logging.ERROR, text):
+            return True
+        stream = sys.stderr
+        if stream is not None:
+            stream.write(f"{text}\n")
+            stream.flush()
+    except Exception:
+        pass
+    return False
+
+
 class _LineBuffer:
     """Pending partial line of one thread for one StdioToLog stream."""
 
