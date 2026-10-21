@@ -21,6 +21,7 @@ import sys
 import tarfile
 import textwrap
 import threading
+import traceback
 import warnings
 import xml.parsers.expat
 import zipfile
@@ -71,6 +72,7 @@ from DisplayCAL.lib.agw.fourwaysplitter import (
     FourWaySplitterEvent,
 )
 from DisplayCAL.lib.agw.gradientbutton import CLICK, HOVER, GradientButton
+from DisplayCAL.log import safe_print
 from DisplayCAL.meta import NAME as APPNAME
 from DisplayCAL.network import ScriptingClientSocket, get_network_addr
 from DisplayCAL.options import DEBUG
@@ -1225,19 +1227,24 @@ class BaseFrame(wx.Frame):
     def message_handler(self, conn, addrport):
         """Handle messages sent via socket.
 
+        Commands are newline-terminated UTF-8 lines. The received bytes are
+        split on newlines before decoding, so a multi-byte character that
+        arrives in two ``recv()`` chunks is decoded intact, and bytes that are
+        not valid UTF-8 (e.g. from a program that is not a DisplayCAL
+        scripting client) are replaced instead of ending the connection. An
+        error while handling one line is logged and the next line is read.
+
         Args:
             conn (socket.socket): The socket connection to handle.
             addrport (tuple): A tuple containing the address and port of the
                 connected client, e.g. ('127.0.0.1', 1234).
         """
         responseformats[conn] = "plain"
-        buffer = ""
+        buffer = b""
         while self and getattr(self, "listening", False):
             # Wait for incoming message
             try:
                 incoming = conn.recv(4096)
-                if isinstance(incoming, bytes):
-                    incoming = incoming.decode("utf-8")
             except socket.timeout:
                 continue
             except OSError as exception:
@@ -1249,118 +1256,18 @@ class BaseFrame(wx.Frame):
                 if not incoming:
                     break
                 buffer += incoming
-                while "\n" in buffer and self and getattr(self, "listening", False):
-                    end = buffer.find("\n")
-                    line = buffer[:end].strip()
+                while b"\n" in buffer and self and getattr(self, "listening", False):
+                    end = buffer.find(b"\n")
+                    line = buffer[:end].decode("utf-8", "replace").strip()
                     buffer = buffer[end + 1 :]
-                    if line:
-                        command_timestamp = datetime.now().strftime(
-                            "%Y-%m-%dTH:%M:%S.%f"
-                        )
-                        line = str(line)
-                        print(lang.getstr("app.incoming_message", (*addrport, line)))
-                        data = split_command_line(line)
-                        response = None
-                        # Non-UI commands
-                        if data[0] == "getappname" and len(data) == 1:
-                            response = PYNAME
-                        elif data[0] == "getcfg" and len(data) < 3:
-                            if len(data) == 2:
-                                # Return cfg value
-                                if data[1] in DEFAULTS:
-                                    if responseformats[conn].startswith("xml"):
-                                        response = {
-                                            "name": data[1],
-                                            "value": getcfg(data[1]),
-                                        }
-                                    else:
-                                        response = {data[1]: getcfg(data[1])}
-                                else:
-                                    response = "invalid"
-                            else:
-                                # Return whole cfg
-                                if responseformats[conn] != "plain":
-                                    response = []
-                                else:
-                                    response = {}
-                                for name in sorted(DEFAULTS):
-                                    value = getcfg(name, False)
-                                    if value is not None:
-                                        if responseformats[conn] != "plain":
-                                            response.append(
-                                                {"name": name, "value": value}
-                                            )
-                                        else:
-                                            response[name] = value
-                        elif data[0] == "getcommands" and len(data) == 1:
-                            response = sorted(self.get_commands())
-                        elif data[0] == "getdefault" and len(data) == 2:
-                            if data[1] in DEFAULTS:
-                                if responseformats[conn] != "plain":
-                                    response = {
-                                        "name": data[1],
-                                        "value": DEFAULTS[data[1]],
-                                    }
-                                else:
-                                    response = {data[1]: DEFAULTS[data[1]]}
-                            else:
-                                response = "invalid"
-                        elif data[0] == "getdefaults" and len(data) == 1:
-                            response = [] if responseformats[conn] != "plain" else {}
-                            for name in sorted(DEFAULTS):
-                                if responseformats[conn] != "plain":
-                                    response.append(
-                                        {"name": name, "value": DEFAULTS[name]}
-                                    )
-                                else:
-                                    response[name] = DEFAULTS[name]
-                        elif data[0] == "getvalid" and len(data) == 1:
-                            if responseformats[conn] != "plain":
-                                response = {}
-                                for section, options in (
-                                    ("ranges", config.VALID_RANGES),
-                                    ("values", config.VALID_VALUES),
-                                ):
-                                    valid = response[section] = []
-                                    for name in options:
-                                        values = options[name]
-                                        valid.append({"name": name, "values": values})
-                            else:
-                                response = {
-                                    "ranges": config.VALID_RANGES,
-                                    "values": config.VALID_VALUES,
-                                }
-                            if responseformats[conn] == "plain":
-                                valid = []
-                                for section in response:
-                                    options = response[section]
-                                    valid.append(f"[{section}]")
-                                    for name in options:
-                                        values = options[name]
-                                        valid.append(
-                                            "{} = {}".format(
-                                                name,
-                                                " ".join(
-                                                    demjson.encode(value)
-                                                    for value in values
-                                                ),
-                                            )
-                                        )
-                                response = valid
-                        elif (
-                            data[0] == "setresponseformat"
-                            and len(data) == 2
-                            and data[1]
-                            in ("json", "json.pretty", "plain", "xml", "xml.pretty")
-                        ):
-                            responseformats[conn] = data[1]
-                            response = "ok"
-                        if response is not None:
-                            self.send_response(response, data, conn, command_timestamp)
-                            continue
-                        # UI commands
-                        wx.CallAfter(
-                            self.finish_processing, data, conn, command_timestamp
+                    if not line:
+                        continue
+                    try:
+                        self.handle_message_line(line, conn, addrport)
+                    except Exception:
+                        safe_print(
+                            "Warning - error while handling scripting command "
+                            f"{line!r} from {addrport}:\n{traceback.format_exc()}"
                         )
         try:
             conn.shutdown(socket.SHUT_RDWR)
@@ -1370,6 +1277,113 @@ class BaseFrame(wx.Frame):
         print(lang.getstr("app.client.disconnect", addrport))
         conn.close()
         responseformats.pop(conn)
+
+    def handle_message_line(self, line, conn, addrport):
+        """Handle one command line received by ``message_handler``.
+
+        Non-UI commands are answered right away on the calling thread, UI
+        commands are passed on to ``finish_processing`` on the main thread.
+
+        Args:
+            line (str): The command line (decoded, stripped and not empty).
+            conn (socket.socket): The client connection.
+            addrport (tuple): The address and port of the connected client.
+        """
+        command_timestamp = datetime.now().strftime("%Y-%m-%dTH:%M:%S.%f")
+        print_safe(lang.getstr("app.incoming_message", (*addrport, line)))
+        data = split_command_line(line)
+        response = None
+        # Non-UI commands
+        if data[0] == "getappname" and len(data) == 1:
+            response = PYNAME
+        elif data[0] == "getcfg" and len(data) < 3:
+            if len(data) == 2:
+                # Return cfg value
+                if data[1] in DEFAULTS:
+                    if responseformats[conn].startswith("xml"):
+                        response = {
+                            "name": data[1],
+                            "value": getcfg(data[1]),
+                        }
+                    else:
+                        response = {data[1]: getcfg(data[1])}
+                else:
+                    response = "invalid"
+            else:
+                # Return whole cfg
+                if responseformats[conn] != "plain":
+                    response = []
+                else:
+                    response = {}
+                for name in sorted(DEFAULTS):
+                    value = getcfg(name, False)
+                    if value is not None:
+                        if responseformats[conn] != "plain":
+                            response.append({"name": name, "value": value})
+                        else:
+                            response[name] = value
+        elif data[0] == "getcommands" and len(data) == 1:
+            response = sorted(self.get_commands())
+        elif data[0] == "getdefault" and len(data) == 2:
+            if data[1] in DEFAULTS:
+                if responseformats[conn] != "plain":
+                    response = {
+                        "name": data[1],
+                        "value": DEFAULTS[data[1]],
+                    }
+                else:
+                    response = {data[1]: DEFAULTS[data[1]]}
+            else:
+                response = "invalid"
+        elif data[0] == "getdefaults" and len(data) == 1:
+            response = [] if responseformats[conn] != "plain" else {}
+            for name in sorted(DEFAULTS):
+                if responseformats[conn] != "plain":
+                    response.append({"name": name, "value": DEFAULTS[name]})
+                else:
+                    response[name] = DEFAULTS[name]
+        elif data[0] == "getvalid" and len(data) == 1:
+            if responseformats[conn] != "plain":
+                response = {}
+                for section, options in (
+                    ("ranges", config.VALID_RANGES),
+                    ("values", config.VALID_VALUES),
+                ):
+                    valid = response[section] = []
+                    for name in options:
+                        values = options[name]
+                        valid.append({"name": name, "values": values})
+            else:
+                response = {
+                    "ranges": config.VALID_RANGES,
+                    "values": config.VALID_VALUES,
+                }
+            if responseformats[conn] == "plain":
+                valid = []
+                for section in response:
+                    options = response[section]
+                    valid.append(f"[{section}]")
+                    for name in options:
+                        values = options[name]
+                        valid.append(
+                            "{} = {}".format(
+                                name,
+                                " ".join(demjson.encode(value) for value in values),
+                            )
+                        )
+                response = valid
+        elif (
+            data[0] == "setresponseformat"
+            and len(data) == 2
+            and data[1] in ("json", "json.pretty", "plain", "xml", "xml.pretty")
+        ):
+            responseformats[conn] = data[1]
+            response = "ok"
+        if response is not None:
+            self.send_response(response, data, conn, command_timestamp)
+            return
+        # UI commands
+        wx.CallAfter(self.finish_processing, data, conn, command_timestamp)
 
     def get_app_state(self, file_format):
         """Get the current application state.
@@ -2219,7 +2233,10 @@ class BaseFrame(wx.Frame):
             command (str): The command to send.
 
         Returns:
-            str: The response from the scripting host.
+            None | str | Exception: The decoded response from the scripting
+                host, None if it is not running (or another application is
+                listening on its port), or the exception if talking to it
+                failed.
         """
         lock_name = APPBASENAME
         scripting_host = APPNAME
@@ -2237,19 +2254,21 @@ class BaseFrame(wx.Frame):
                         raise conn
                     # Check if we're actually connected to the right
                     # application (if it terminated unexpectedly, something
-                    # else may have grabbed the port)
+                    # else may have grabbed the port). Responses are bytes.
+                    # The name is lowercase when running from source.
                     conn.send_command("getappname")
-                    response = conn.get_single_response()
-                    if response == scripting_host:
-                        conn.send_command(command)
-                        response = conn.get_single_response()
-                        print(f"{scripting_host} {command} returned", response)
-                    else:
+                    response = conn.get_single_response().decode("utf-8", "replace")
+                    if response.lower() != scripting_host.lower():
                         print(
                             f"Warning - {scripting_host} not running under "
                             "expected port",
                             port,
                         )
+                        del conn
+                        continue
+                    conn.send_command(command)
+                    response = conn.get_single_response().decode("utf-8", "replace")
+                    print_safe(f"{scripting_host} {command} returned {response}")
                     del conn
                     return response
             else:

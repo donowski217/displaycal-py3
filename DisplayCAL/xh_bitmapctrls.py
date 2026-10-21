@@ -10,7 +10,6 @@ import wx
 from wx import xrc
 
 from DisplayCAL.config import get_bitmap
-from DisplayCAL.log import safe_print
 
 
 class BitmapButton(xrc.XmlResourceHandler):
@@ -54,8 +53,8 @@ class BitmapButton(xrc.XmlResourceHandler):
         )
 
         self.SetupWindow(w)
-        if self.GetBool("hidden") and w.Shown:
-            safe_print(f"{self.Name} should have been hidden")
+        # <hidden> is only applied by C++ handlers (XRC_MAKE_INSTANCE); hide manually
+        if self.GetBool("hidden"):
             w.Hide()
         return w
 
@@ -101,7 +100,7 @@ class StaticBitmap(xrc.XmlResourceHandler):
         )
 
         self.SetupWindow(w)
-        if self.GetBool("hidden") and w.Shown:
-            safe_print(f"{self.Name} should have been hidden")
+        # <hidden> is only applied by C++ handlers (XRC_MAKE_INSTANCE); hide manually
+        if self.GetBool("hidden"):
             w.Hide()
         return w
