@@ -592,6 +592,69 @@ def test_no_worker_is_started_once_shutdown_is_called(echo_manager, monkeypatch)
     assert starts == []
 
 
+def test_shutdown_leaves_no_threads_running(monkeypatch):
+    """Each manager used to leave its worker log listener thread running."""
+    monkeypatch.setattr(mscms_module, "_wcs_worker_process", _echo_worker)
+    threads_before = set(threading.enumerate())
+    manager = mscms_module.WCSManager(request_timeout=5)
+    try:
+        assert manager.get_calibration_management_state() == (
+            "GetCalibrationManagementState"
+        )
+    finally:
+        manager.shutdown()
+
+    deadline = time.monotonic() + 5
+    while True:
+        leftover = [
+            thread.name
+            for thread in threading.enumerate()
+            if thread not in threads_before and thread.is_alive()
+        ]
+        if not leftover or time.monotonic() > deadline:
+            break
+        time.sleep(0.05)
+    assert leftover == []
+
+
+class _StuckListener:
+    """A worker log listener whose thread does not end (e.g. stuck reading)."""
+
+    def __init__(self):
+        self.stop_calls = 0
+        self.release = threading.Event()
+
+    def stop(self):
+        self.stop_calls += 1
+        self.release.wait()
+
+
+def test_shutdown_does_not_wait_for_a_stuck_log_listener(monkeypatch, caplog):
+    """E.g. a worker process that was killed while writing a log record."""
+    monkeypatch.setattr(mscms_module, "_wcs_worker_process", _echo_worker)
+    monkeypatch.setattr(mscms_module, "log_listener_stop_timeout", 0.2)
+    manager = mscms_module.WCSManager(request_timeout=5)
+    real_listener = manager._log_listener
+    stuck_listener = _StuckListener()
+    manager._log_listener = stuck_listener
+    caplog.set_level(logging.WARNING, logger="DisplayCAL.mscms.manager")
+    try:
+        started = time.monotonic()
+        manager.shutdown()
+        elapsed = time.monotonic() - started
+        manager.shutdown()
+    finally:
+        stuck_listener.release.set()
+        real_listener.stop()
+        manager._log_queue.close()
+
+    assert elapsed < 3
+    # Idempotent: not stopped again
+    assert stuck_listener.stop_calls == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("log listener did not stop" in message for message in messages)
+
+
 # --- Worker process side ------------------------------------------------------
 
 

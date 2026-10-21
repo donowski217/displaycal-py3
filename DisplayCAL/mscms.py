@@ -174,6 +174,9 @@ worker_death_grace = 0.25
 worker_start_timeout = 30.0
 # Wait at most this long for a killed worker process to exit
 worker_kill_timeout = 2.0
+# Wait at most this long for the worker log listener to stop at shutdown (it
+# may never, e.g. if a worker process was killed while writing a record)
+log_listener_stop_timeout = 2.0
 
 FILE_NOT_FOUND_ERRNO = 2
 
@@ -1136,6 +1139,13 @@ class WCSManager:
             logger.debug("Stopping worker process and threads")
             self._stop_worker()
 
+        # Nothing is sent to a worker process anymore: let the request queue's
+        # feeder thread end, and don't let it block our exit on requests that
+        # a killed worker did not read
+        with contextlib.suppress(Exception):
+            self._request_queue.cancel_join_thread()
+            self._request_queue.close()
+
         listener_thread = self._response_listener_thread
         if (
             listener_thread is not None
@@ -1143,7 +1153,51 @@ class WCSManager:
             and listener_thread.is_alive()
         ):
             listener_thread.join(timeout=2.0)
+        self._stop_log_listener()
         logger.info("WCSManager shut down complete")
+
+    def _stop_log_listener(self) -> None:
+        """Stop the listener that hands the worker's log records on.
+
+        It handles the records logged before (e.g. the worker's last ones)
+        first. Call once, after the worker process stopped. Doesn't wait
+        longer than ``log_listener_stop_timeout`` seconds: a listener thread
+        that doesn't end (e.g. stuck reading a record that a killed worker
+        process did not finish writing) is left behind (it is a daemon).
+        """
+        listener = self._log_listener
+        if listener is None:
+            return
+        # Its stop sentinel is all we put into the log queue. Don't let the
+        # queue's feeder thread block our exit if nobody reads it anymore.
+        with contextlib.suppress(Exception):
+            self._log_queue.cancel_join_thread()
+        stopper = Thread(
+            target=self._stop_listener,
+            args=(listener,),
+            name="WCSManagerLogListenerStop",
+            daemon=True,
+        )
+        stopper.start()
+        stopper.join(timeout=log_listener_stop_timeout)
+        if stopper.is_alive():
+            logger.warning("WCSWorker log listener did not stop in time")
+            return
+        # Nobody reads or writes the log queue anymore: let its feeder end
+        with contextlib.suppress(Exception):
+            self._log_queue.close()
+
+    @staticmethod
+    def _stop_listener(listener: QueueListener) -> None:
+        """Stop a QueueListener, logging (instead of raising) any error.
+
+        Args:
+            listener (QueueListener): The listener.
+        """
+        try:
+            listener.stop()
+        except Exception as e:
+            logger.warning(f"Failed to stop the WCSWorker log listener: {e}")
 
     def _atexit_shutdown(self) -> None:
         """Shutdown handler for atexit to ensure cleanup on normal interpreter exit."""
