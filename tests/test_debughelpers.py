@@ -24,7 +24,12 @@ import uuid
 import pytest
 
 from DisplayCAL import debughelpers, log
-from DisplayCAL.debughelpers import Error, format_error_traceback, handle_error
+from DisplayCAL.debughelpers import (
+    Error,
+    format_error_traceback,
+    handle_error,
+    print_error_traceback,
+)
 
 
 class RecordingFileHandler(logging.FileHandler):
@@ -327,3 +332,48 @@ def test_format_error_traceback_uses_the_exceptions_own_traceback():
         text = format_error_traceback(exception)
     assert "_monitoring_thread_body" in text
     assert "unrelated exception being handled" not in text
+
+
+def _raise_and_catch(message: str) -> Exception:
+    try:
+        raise ValueError(message)
+    except ValueError as exception:
+        return exception
+
+
+def test_print_error_traceback_unraised_exception_outside_except(capsys):
+    """An exception that was never raised has no traceback to print."""
+    print_error_traceback(Error("returned, not raised"))
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err == ""
+
+
+def test_print_error_traceback_uses_the_exceptions_own_traceback(capsys):
+    """A caught-and-returned exception prints its own traceback, not None."""
+    exception = _raise_and_catch("from a returned exception")
+    print_error_traceback(exception)
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "NoneType: None" not in err
+    assert "_raise_and_catch" in err
+    assert "ValueError: from a returned exception" in err
+
+
+def test_print_error_traceback_with_stderr_none(monkeypatch):
+    """Windowed builds without a stderr must not make it raise."""
+    monkeypatch.setattr(sys, "stderr", None)
+    print_error_traceback(_raise_and_catch("no stderr"))
+
+
+def test_worker_base_log_does_not_print_nonetype_none(capsys):
+    """WorkerBase.log() with a returned exception logs no "NoneType: None"."""
+    from DisplayCAL.worker_base import WorkerBase
+
+    worker = WorkerBase()
+    worker.log(Error("argyll tool failed"))
+    worker.log(_raise_and_catch("raised elsewhere"))
+    out, err = capsys.readouterr()
+    assert "NoneType: None" not in err
+    assert "argyll tool failed" in out
+    assert "ValueError: raised elsewhere" in err

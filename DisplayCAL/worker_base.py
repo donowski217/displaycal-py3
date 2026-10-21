@@ -17,7 +17,6 @@ import subprocess as sp
 import sys
 import tempfile
 import textwrap
-import traceback
 from binascii import hexlify
 from typing import TYPE_CHECKING
 
@@ -55,6 +54,7 @@ from DisplayCAL.config import (
 from DisplayCAL.debughelpers import (
     Error,
     Info,
+    print_error_traceback,
     # UnloggedError,
     # UnloggedInfo,
     # UnloggedWarning,
@@ -385,8 +385,10 @@ class WorkerBase:
     def log(self, *args, **kwargs):
         """Log to global logfile and session logfile (if any)."""
         # if we have any exceptions print the traceback, so we bust'em.
-        if any(isinstance(arg, BaseException) for arg in args):
-            traceback.print_exc()
+        for arg in args:
+            if isinstance(arg, BaseException):
+                print_error_traceback(arg)
+                break
         msg = " ".join(safe_basestring(arg) for arg in args)
         fn = kwargs.get("fn", print)
         fn(msg)

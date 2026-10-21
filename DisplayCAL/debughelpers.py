@@ -166,6 +166,25 @@ def format_error_traceback(
             return ""
 
 
+def print_error_traceback(
+    error: tuple[type, BaseException, TracebackType] | BaseException | str,
+) -> None:
+    """Write the traceback of error to sys.stderr, if it has one.
+
+    A replacement for traceback.print_exc() at call sites that may not be
+    inside an ``except`` block (e.g. when an exception is returned instead of
+    raised), where print_exc() would only print "NoneType: None".
+
+    Args:
+        error (tuple[type, BaseException, TracebackType] | BaseException | str):
+            An exception info tuple, an exception, or an error message.
+    """
+    tbstr = format_error_traceback(error)
+    if tbstr and sys.stderr:
+        with contextlib.suppress(Exception):
+            sys.stderr.write(tbstr)
+
+
 def _is_log_stream(stream: object) -> bool:
     """Return whether stream is the app log redirector (log.StdioToLog).
 

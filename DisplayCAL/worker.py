@@ -157,6 +157,7 @@ from DisplayCAL.debughelpers import (
     UntracedError,
     Warn,
     handle_error,
+    print_error_traceback,
 )
 from DisplayCAL.edid import WMIError, get_display_name_from_system_profiler, get_edid
 from DisplayCAL.icc_profile import (
@@ -10218,7 +10219,7 @@ BEGIN_DATA
             log_output=False,
         )
         if isinstance(result, Exception):
-            traceback.print_exc()
+            print_error_traceback(result)
             print(result)
             return {}
         technology_strings = {}
@@ -14873,7 +14874,7 @@ BEGIN_DATA
                     if isinstance(rslt, ICCProfileInvalidError):
                         return Error(lang.getstr("profile.invalid") + "\n" + cal), None
                     if isinstance(rslt, Exception):
-                        traceback.print_exc()
+                        print_error_traceback(rslt)
                         return (
                             Error(
                                 lang.getstr("cal_extraction_failed")
