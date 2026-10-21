@@ -176,7 +176,7 @@ def test_is_other_running_survives_oserror_from_enumwindows(monkeypatch):
         raise ctypes.WinError(31)
 
     monkeypatch.setattr(profile_loader.win32gui, "EnumWindows", enum_windows)
-    monkeypatch.setattr(pl, "_look_for_known_processes", lambda other: None)
+    monkeypatch.setattr(pl, "_look_for_known_processes", lambda other, *args: None)
 
     assert pl._is_other_running(True) is False
     assert not pl._is_other_running_lock.locked()
@@ -187,7 +187,7 @@ def test_is_other_running_releases_lock_on_error(monkeypatch):
     pl = _make_pl()
     monkeypatch.setattr(profile_loader.win32gui, "EnumWindows", lambda cb, x: None)
 
-    def look_for_known_processes(other_component):
+    def look_for_known_processes(other_component, *args):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(pl, "_look_for_known_processes", look_for_known_processes)
@@ -212,7 +212,7 @@ def test_is_other_running_with_exiting_process_of_known_window(monkeypatch):
         raise ctypes.WinError(31)
 
     monkeypatch.setattr(profile_loader, "get_process_filename", get_process_filename)
-    monkeypatch.setattr(pl, "_look_for_known_processes", lambda other: None)
+    monkeypatch.setattr(pl, "_look_for_known_processes", lambda other, *args: None)
 
     assert pl._is_other_running(True) is False
     assert not pl._is_other_running_lock.locked()
@@ -2105,6 +2105,7 @@ def test_registry_access_denied_uses_fallback_without_warning(
 
 TOOLWINDOW = 0x00000080  # win32con.WS_EX_TOOLWINDOW
 APPWINDOW = 0x00040000  # win32con.WS_EX_APPWINDOW
+NOACTIVATE = 0x08000000  # win32con.WS_EX_NOACTIVATE
 
 
 class _FakeWindows:
@@ -2162,6 +2163,9 @@ def _set_processes(monkeypatch, processes):
         # Main window owned by a hidden window but marked as an app window
         (True, 4711, APPWINDOW, True),
         (False, 4711, APPWINDOW, False),
+        # Non-activating window, e.g. an on-screen display overlay
+        (True, 0, NOACTIVATE, False),
+        (True, 0, NOACTIVATE | APPWINDOW, True),
     ],
 )
 def test_is_program_window(monkeypatch, visible, owner, exstyle, expected):
@@ -2230,7 +2234,7 @@ def test_only_programs_are_tracked(monkeypatch):
 
 
 def test_windowless_known_app_is_still_detected(monkeypatch):
-    """Only change tracking is limited to programs, not app detection."""
+    """Detection of known apps still looks at all processes."""
     pl = _make_pl()
     pl._program_pids = set()
     pl._known_apps = {"dispcal.exe"}
@@ -2241,7 +2245,8 @@ def test_windowless_known_app_is_still_detected(monkeypatch):
 
     pl._look_for_known_processes((None, None, 0))
 
-    assert pl._hwnds_pids == set()
+    # Tracked although it has no window, so that its exit forces a re-apply
+    assert pl._hwnds_pids == {("dispcal.exe", 500)}
     assert pl._ProfileLoader__other_component == (r"C:\Argyll\dispcal.exe", None, 0)
 
 
@@ -2301,3 +2306,89 @@ def test_new_window_of_running_program_does_not_trigger_reapply(monkeypatch):
     _tracked_after_scan(pl, monkeypatch, windows, base)
 
     assert pl._track_process_changes(previous) is False
+
+
+def test_enumerate_windows_callback_ignores_window_destroyed_meanwhile(monkeypatch):
+    """pywin32 returns thread ID 0 and a meaningless pid for a gone window."""
+    pl = _make_pl()
+    windows = _FakeWindows()
+    windows.add(100, 42)
+    windows.install(monkeypatch)
+    monkeypatch.setattr(
+        profile_loader.win32process, "GetWindowThreadProcessId", lambda hwnd: (0, 77)
+    )
+
+    pl._enumerate_windows_callback(100, None)
+
+    assert pl._program_pids == set()
+
+
+def test_hidden_window_keeps_program_tracked_until_its_process_exits(monkeypatch):
+    """Hiding a window (e.g. minimizing to the tray) is not an exit.
+
+    The actual exit is, even if the window went away earlier.
+    """
+    monkeypatch.setattr(profile_loader, "getcfg", lambda name: 1)
+    pl = _make_pl()
+    windows = _FakeWindows()
+    windows.add(200, 600)
+    processes = [(600, "Game.exe")]
+
+    running = _tracked_after_scan(pl, monkeypatch, windows, processes)
+    windows.windows[200] = (600, False, 0, 0, "AppWindow")  # window hidden
+    hidden = _tracked_after_scan(pl, monkeypatch, windows, processes)
+    assert pl._track_process_changes(running) is False
+    assert 600 not in pl._program_pids  # reset before each enumeration
+    assert hidden == {("Game.exe", 600)}
+
+    del windows.windows[200]
+    _tracked_after_scan(pl, monkeypatch, windows, [])  # the process exits
+    assert pl._track_process_changes(hidden) is True
+
+
+def test_windowless_known_app_exit_triggers_reapply(monkeypatch):
+    """E.g. f.lux in the tray, or an Argyll tool run from a script."""
+    monkeypatch.setattr(profile_loader, "getcfg", lambda name: 1)
+    monkeypatch.setattr(profile_loader, "lang", _FakeLang(), raising=False)
+    pl = _make_pl()
+    # Detecting the app and losing it again shows a tray notification
+    pl.notify = lambda *args, **kwargs: None
+    pl._known_apps = {"flux.exe"}
+    monkeypatch.setattr(
+        profile_loader, "get_process_filename", lambda pid: r"C:\f.lux\flux.exe"
+    )
+    windows = _FakeWindows()
+
+    running = _tracked_after_scan(pl, monkeypatch, windows, [(700, "flux.exe")])
+    _tracked_after_scan(pl, monkeypatch, windows, [])
+
+    assert pl._track_process_changes(running) is True
+
+
+@pytest.mark.parametrize("name", ["LogonUI.exe", "consent.exe"])
+def test_secure_desktop_transition_triggers_reapply(monkeypatch, name):
+    """The lock screen and the UAC prompt.
+
+    Their windows are on the secure desktop, which EnumWindows does not list,
+    and some video drivers reset the gamma table around these transitions.
+    They are system processes without a user SID.
+    """
+    monkeypatch.setattr(profile_loader, "getcfg", lambda name: 1)
+    pl = _make_pl()
+    windows = _FakeWindows()
+    windows.install(monkeypatch)
+
+    def scan(processes):
+        monkeypatch.setattr(
+            profile_loader.win32ts,
+            "WTSEnumerateProcesses",
+            lambda: [(1, pid, basename, None) for pid, basename in processes],
+        )
+        pl._is_other_running(True)
+        return pl._hwnds_pids
+
+    before = scan([(400, "svchost.exe")])
+    during = scan([(400, "svchost.exe"), (800, name)])
+    assert pl._track_process_changes(before) is True
+    scan([(400, "svchost.exe")])
+    assert pl._track_process_changes(during) is True

@@ -93,6 +93,12 @@ from DisplayCAL.wx_windows import (
     wx,
 )
 
+SECURE_DESKTOP_PROCESSES = frozenset({"consent.exe", "logonui.exe"})
+"""Processes showing their UI on the secure (Winlogon) desktop, which window
+enumeration does not see: the UAC prompt and the lock screen/Ctrl+Alt+Del.
+Their launch and exit mark a secure desktop transition, at which some video
+drivers reset the video card gamma table."""
+
 if sys.platform == "win32":
     import errno
     import winreg
@@ -2139,9 +2145,9 @@ class ProfileLoader:
         self._component_name = None
         self._app_detection_msg = None
         self._hwnds_pids = set()
-        # PIDs of programs, i.e. processes with a visible, unowned top-level
-        # window, at the last window enumeration (see
-        # _enumerate_windows_callback)
+        # PIDs of programs, i.e. processes with a top-level window that would
+        # get a taskbar button, at the last window enumeration (see
+        # _is_program_window and _enumerate_windows_callback)
         self._program_pids = set()
         # (pid, error code) pairs of known processes whose filename could not
         # be read at the last check (see _look_for_known_processes)
@@ -4936,8 +4942,10 @@ class ProfileLoader:
         """
         try:
             if self._is_program_window(hwnd):
-                pid = win32process.GetWindowThreadProcessId(hwnd)[1]
-                if pid != self._pid:
+                thread_id, pid = win32process.GetWindowThreadProcessId(hwnd)
+                # Thread ID 0: the window was destroyed meanwhile, and pid is
+                # not meaningful then (pywin32 does not raise)
+                if thread_id and pid != self._pid:
                     self._program_pids.add(pid)
             cls = win32gui.GetClassName(hwnd)
             if not (cls == "madHcNetQueueWindow" or self._is_known_window_class(cls)):
@@ -4960,10 +4968,11 @@ class ProfileLoader:
         """Check if a top-level window is the window of a program.
 
         Uses the rule of the Windows taskbar: a visible window that either has
-        the WS_EX_APPWINDOW style, or has no owner and is not a tool window.
-        This is what an application or game that may change the video card
-        gamma table shows, while background processes (console hosts, shells,
-        services, helpers) have none.
+        the WS_EX_APPWINDOW style, or has no owner and is neither a tool window
+        nor a non-activating one (e.g. an on-screen display overlay). This is
+        what an application or game that may change the video card gamma table
+        shows, while background processes (console hosts, shells, services,
+        helpers) have none.
 
         Args:
             hwnd (int): Handle to the top-level window.
@@ -4976,7 +4985,7 @@ class ProfileLoader:
         exstyle = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
         if exstyle & win32con.WS_EX_APPWINDOW:
             return True
-        if exstyle & win32con.WS_EX_TOOLWINDOW:
+        if exstyle & (win32con.WS_EX_TOOLWINDOW | win32con.WS_EX_NOACTIVATE):
             return False
         return not win32gui.GetWindow(hwnd, win32con.GW_OWNER)
 
@@ -5050,6 +5059,8 @@ class ProfileLoader:
                 # processes anyway.
                 other_component = self.__other_component
                 self.__other_component = None, None, 0
+                # Programs stay tracked until their process exits
+                previously_tracked = self._hwnds_pids
                 # Look for known window classes
                 # Performance on C2D 3.16 GHz (Win7 x64, ~ 90 processes): ~ 1ms
                 self._hwnds_pids = set()
@@ -5064,7 +5075,7 @@ class ProfileLoader:
                     not self.__other_component[1]
                     or self.__other_component[1] == "madHcNetQueueWindow"
                 ):
-                    self._look_for_known_processes(other_component)
+                    self._look_for_known_processes(other_component, previously_tracked)
                 if other_component != self.__other_component:
                     self._handle_component_detection(other_component)
             result = (
@@ -5082,13 +5093,20 @@ class ProfileLoader:
         return result
 
     def _look_for_known_processes(
-        self, other_component: tuple[None | str, None | str, int]
+        self,
+        other_component: tuple[None | str, None | str, int],
+        previously_tracked: set | frozenset = frozenset(),
     ) -> None:
         """Look for known processes that may be using the videoLUT.
+
+        Also records the processes whose launch or exit forces calibration to
+        be re-applied (see _track_process_changes) in self._hwnds_pids.
 
         Args:
             other_component (tuple): A tuple containing the filename,
                 window class, and reset flag of the other component.
+            previously_tracked (set | frozenset): The processes recorded at the
+                last check. Programs stay recorded until their process exits.
         """
         # Look for known processes
         # Performance on C2D 3.16 GHz (Win7 x64, ~ 90 processes):
@@ -5107,13 +5125,23 @@ class ProfileLoader:
         program_pids = self._program_pids
         for _session_id, pid, basename, user_security_id in processes:
             name_lower = basename.lower()
-            if name_lower != "madhcctrl.exe" and pid in program_pids:
-                # Track programs (processes with a visible top-level window,
-                # except madVR Home Cinema Control) launching or exiting, as
-                # these may change the video card gamma table without the
-                # change being visible through GetDeviceGammaRamp. Background
-                # processes (console hosts, shells, services) come and go every
-                # few seconds; tracking them made the loader re-apply the
+            known_app = name_lower in self._known_apps
+            has_exception = name_lower in self._exception_names
+            if name_lower != "madhcctrl.exe" and (
+                pid in program_pids
+                or (basename, pid) in previously_tracked
+                or known_app
+                or has_exception
+                or name_lower in SECURE_DESKTOP_PROCESSES
+            ):
+                # Track the processes whose launch or exit may change the
+                # video card gamma table without the change being visible
+                # through GetDeviceGammaRamp: programs (processes that showed
+                # a window that gets a taskbar button, until they exit), known
+                # apps and exceptions (even without a window, e.g. in the
+                # tray), and secure desktop transitions. Background processes
+                # (console hosts, shells, services) come and go every few
+                # seconds; tracking them made the loader re-apply the
                 # calibration of every display that often.
                 self._hwnds_pids.add((basename, pid))
             if skip or not user_security_id:
@@ -5122,8 +5150,6 @@ class ProfileLoader:
                 # system process and we cannot get process filename
                 # due to access restrictions)
                 continue
-            known_app = name_lower in self._known_apps
-            has_exception = name_lower in self._exception_names
             if not (known_app or has_exception):
                 continue
             try:
