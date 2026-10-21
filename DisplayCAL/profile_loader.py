@@ -1373,15 +1373,7 @@ class ProfileAssociationsDialog(InfoDialog):
             wx.CallAfter(self._next)
 
     def _next(self) -> None:
-        locked = self.pl.lock.locked()
-        if locked:
-            print("ProfileAssociationsDialog: Waiting to acquire lock...")
-        with self.pl.lock:
-            if locked:
-                print("ProfileAssociationsDialog: Acquired lock")
-            self.pl._next = True
-            if locked:
-                print("ProfileAssociationsDialog: Releasing lock")
+        self.pl._call_with_lock(self.pl._request_next_iteration)
 
     def use_my_settings(self, event: wx.Event) -> None:
         """Enable or disable per-user profiles.
@@ -1442,16 +1434,9 @@ class PLFrame(BaseFrame):
             ) or self.pl._is_other_running(False):
                 return "forbidden"
             if data[-1] == "display-changed":
-                if self.pl.lock.locked():
-                    print("PLFrame.process_data: Waiting to acquire lock...")
-                with self.pl.lock:
-                    print("PLFrame.process_data: Acquired lock")
-                    if self.pl._has_display_changed:
-                        # Normally calibration loading is disabled while
-                        # DisplayCAL is running. Override this when the
-                        # display has changed
-                        self.pl._manual_restore = getcfg("profile.load_on_login") and 2
-                    print("PLFrame.process_data: Releasing lock")
+                # Without blocking the GUI thread (and the reply) behind a
+                # monitoring iteration (see ProfileLoader._call_with_lock)
+                self.pl._call_with_lock(self.pl._override_on_display_change)
             elif data[0] == "reset-vcgt":
                 self.pl._set_reset_gamma_ramps(None, len(data))
             else:
@@ -1786,25 +1771,19 @@ class TaskBarIcon(SysTrayIcon):
             self._dclick = False
             return
         if not getattr(self, "_notification", None):
-            # Make sure the displayed info is up-to-date
-            locked = self.pl.lock.locked()
-            if locked:
-                print("TaskBarIcon.on_left_down: Waiting to acquire lock...")
-            with self.pl.lock:
-                if locked:
-                    print("TaskBarIcon.on_left_down: Acquired lock")
-                self.pl._next = True
-                if locked:
-                    print("TaskBarIcon.on_left_down: Releasing lock")
-            time.sleep(0.11)
-            locked = self.pl.lock.locked()
-            if locked:
-                print("TaskBarIcon.on_left_down: Waiting to acquire lock...")
-            with self.pl.lock:
-                if locked:
-                    print("TaskBarIcon.on_left_down: Acquired lock")
-                if locked:
-                    print("TaskBarIcon.on_left_down: Releasing lock")
+            # Make sure the displayed info is up-to-date: have the next
+            # monitoring iteration run right away and wait for it. But never
+            # for long: an iteration stuck in a WCS worker call must not
+            # freeze the tray icon. Then show what is known.
+            lock = self.pl.lock
+            if lock.acquire(timeout=self.pl.GUI_LOCK_TIMEOUT):
+                try:
+                    self.pl._next = True
+                finally:
+                    lock.release()
+                time.sleep(0.11)
+                if lock.acquire(timeout=self.pl.GUI_LOCK_TIMEOUT):
+                    lock.release()
             self._show_notification_later = wx.CallLater(40, self.show_notification)
         else:
             self.show_notification(toggle=True)
@@ -1820,16 +1799,7 @@ class TaskBarIcon(SysTrayIcon):
             return
         if self._show_notification_later and self._show_notification_later.IsRunning():
             self._show_notification_later.Stop()
-        locked = self.pl.lock.locked()
-        if locked:
-            print("TaskBarIcon.on_left_dclick: Waiting to acquire lock...")
-        with self.pl.lock:
-            if locked:
-                print("TaskBarIcon.on_left_dclick: Acquired lock")
-            self.pl._manual_restore = True
-            self.pl._next = True
-            if locked:
-                print("TaskBarIcon.on_left_dclick: Releasing lock")
+        self.pl._call_with_lock(self.pl._request_manual_restore)
 
     def check_user_attention(self) -> None | wx.Dialog:
         """Check if any dialog needs user attention.
@@ -1895,13 +1865,7 @@ class TaskBarIcon(SysTrayIcon):
         config.setcfg("profile.load_on_login", int(event.IsChecked()))
         self.pl.writecfg()
         if event.IsChecked():
-            if self.pl.lock.locked():
-                print("TaskBarIcon: Waiting to acquire lock...")
-            with self.pl.lock:
-                print("TaskBarIcon: Acquired lock")
-                self.pl._manual_restore = True
-                self.pl._next = True
-                print("TaskBarIcon: Releasing lock")
+            self.pl._call_with_lock(self.pl._request_manual_restore)
         else:
             self.set_visual_state()
 
@@ -1920,10 +1884,7 @@ class TaskBarIcon(SysTrayIcon):
         """
         print("Menu command: Set quantization bitdepth", bits)
         setcfg("profile_loader.quantize_bits", bits)
-        with self.pl.lock:
-            self.pl._quantize = 2**bits - 1.0
-            self.pl.ramps = {}
-            self.pl._manual_restore = True
+        self.pl._call_with_lock(lambda: self.pl._set_quantization(bits))
 
     def set_exceptions(self, event: wx.Event) -> None:
         """Set application exceptions for profile loading.
@@ -2087,6 +2048,12 @@ class ProfileLoader:
     #: How often exit() retries leaving the main loop while a modal dialog's
     #: nested event loop is still active (milliseconds).
     EXIT_RETRY_MS = 50
+    #: How long a GUI-thread handler waits for self.lock before deferring its
+    #: change until the monitoring iteration holding the lock is done
+    #: (seconds), and how often deferred changes retry (milliseconds). See
+    #: _call_with_lock.
+    GUI_LOCK_TIMEOUT = 0.2
+    GUI_LOCK_RETRY_MS = 250
 
     def __init__(self) -> None:
         self._bootstrap_app()
@@ -2098,6 +2065,8 @@ class ProfileLoader:
         self._shutdown_done = threading.Event()
         self._shutdown_thread = None
         self._ui_torn_down = False
+        # GUI-thread changes waiting for self.lock (see _call_with_lock)
+        self._deferred_locked_calls = []
         self.monitoring = True
         # Whether a persistent tray icon is active on this platform/toolkit.
         # Set True by setup_taskbar_icon() (wx, win32-only) or overridden by
@@ -2170,7 +2139,9 @@ class ProfileLoader:
             sys.platform == "win32"
             and "--force" not in sys.argv[1:]
             and sys.getwindowsversion() >= (6, 1)
-            and self._calibration_management_isenabled()
+            # Query it (no tray yet that could freeze; the GUI thread's
+            # _calibration_management_isenabled() only reads this result)
+            and self._query_calibration_management_state()
         ):
             # Incase calibration loading is handled by Windows 7 and
             # isn't forced
@@ -5262,8 +5233,8 @@ class ProfileLoader:
             return
         # Check if madVR did reset the video card gamma tables.
         # If it didn't, assume we can keep preserving calibration state
-        with self.lock:
-            self._next = True
+        # (runs on the GUI thread, from a timer)
+        self._call_with_lock(self._request_next_iteration)
 
     def _reset_display_profile_associations(self, force: bool = False) -> None:
         """Reset display profile associations for all monitors.
@@ -5491,16 +5462,13 @@ class ProfileLoader:
         if event:
             print("Menu command:", end=" ")
         print("Set calibration state to load profile vcgt")
-        if self.lock.locked():
-            print("Waiting to acquire lock...")
-        with self.lock:
-            print("Acquired lock")
-            setcfg("profile_loader.reset_gamma_ramps", 0)
+        setcfg("profile_loader.reset_gamma_ramps", 0)
+
+        def apply() -> None:
             self._manual_restore = manual_restore
             self._reset_gamma_ramps = False
-            print("Releasing lock")
-        self._refresh_visual_state()
-        self.writecfg()
+
+        self._call_with_lock(apply, self._after_calibration_state_change)
 
     def _set_reset_gamma_ramps(
         self, event: wx.Event, manual_restore: bool = True
@@ -5514,16 +5482,138 @@ class ProfileLoader:
         if event:
             print("Menu command:", end=" ")
         print("Set calibration state to reset vcgt")
-        if self.lock.locked():
-            print("Waiting to acquire lock...")
-        with self.lock:
-            print("Acquired lock")
-            setcfg("profile_loader.reset_gamma_ramps", 1)
+        setcfg("profile_loader.reset_gamma_ramps", 1)
+
+        def apply() -> None:
             self._manual_restore = manual_restore
             self._reset_gamma_ramps = True
-            print("Releasing lock")
+
+        self._call_with_lock(apply, self._after_calibration_state_change)
+
+    def _request_manual_restore(self) -> None:
+        """Load calibration at the next iteration, right away (holding lock)."""
+        self._manual_restore = True
+        self._next = True
+
+    def _request_next_iteration(self) -> None:
+        """Run the next monitoring iteration right away (holding self.lock)."""
+        self._next = True
+
+    def _set_quantization(self, bits: int) -> None:
+        """Quantize gamma ramps to ``bits`` bits from now on (holding lock).
+
+        Args:
+            bits (int): The bit depth.
+        """
+        self._quantize = 2**bits - 1.0
+        self.ramps = {}
+        self._manual_restore = True
+
+    def _override_on_display_change(self) -> None:
+        """Load calibration despite DisplayCAL running if the display changed.
+
+        For the ``apply-profiles display-changed`` scripting command. Called
+        holding ``self.lock``.
+        """
+        if self._has_display_changed:
+            # Normally calibration loading is disabled while DisplayCAL is
+            # running. Override this when the display has changed
+            self._manual_restore = getcfg("profile.load_on_login") and 2
+
+    def _after_calibration_state_change(self) -> None:
+        """Show and save a new calibration state (load or reset vcgt)."""
         self._refresh_visual_state()
         self.writecfg()
+
+    def _call_with_lock(
+        self,
+        func: Callable[[], object],
+        after: Callable[[], object] | None = None,
+    ) -> bool:
+        """Run ``func()`` holding ``self.lock``, then ``after()`` (if given).
+
+        The display configuration monitoring thread holds ``self.lock`` for a
+        whole iteration, which includes calls to the WCS worker process. With
+        a stalled worker that can take minutes, and a GUI-thread handler
+        waiting for the lock froze the tray icon and menu (and the scripting
+        host's replies) meanwhile. So on the GUI thread, if the lock is not
+        free within ``GUI_LOCK_TIMEOUT`` seconds, the call is deferred: it
+        runs (deferred calls in order) as soon as the lock is free, retried
+        every ``GUI_LOCK_RETRY_MS`` milliseconds from the GUI thread's event
+        loop. Either way ``func`` runs between monitoring iterations, as
+        before. On other threads, this waits for the lock.
+
+        Args:
+            func (Callable[[], object]): Called with the lock held.
+            after (Callable[[], object] | None): Called after ``func``, with
+                the lock released.
+
+        Returns:
+            bool: True if ``func`` ran right away, False if it was deferred.
+        """
+        if not self._is_gui_thread():
+            with self.lock:
+                func()
+            if after:
+                after()
+            return True
+        pending = getattr(self, "_deferred_locked_calls", None)
+        if pending is None:
+            pending = self._deferred_locked_calls = []
+        if not pending and self.lock.acquire(timeout=self.GUI_LOCK_TIMEOUT):
+            try:
+                func()
+            finally:
+                self.lock.release()
+            if after:
+                after()
+            return True
+        if not pending:
+            print(
+                "Display configuration monitoring is busy, the change is applied "
+                "when it is done"
+            )
+            self._post_to_gui_thread_delayed(
+                self.GUI_LOCK_RETRY_MS, self._run_deferred_locked_calls
+            )
+        pending.append((func, after))
+        return False
+
+    def _run_deferred_locked_calls(self) -> None:
+        """Run the calls :meth:`_call_with_lock` deferred, if the lock is free.
+
+        Runs on the GUI thread. Never waits for the lock: retries later.
+        """
+        pending = getattr(self, "_deferred_locked_calls", None)
+        if not pending:
+            return
+        if self._shutdown:
+            print(f"Shutting down, dropping {len(pending)} deferred change(s)")
+            pending.clear()
+            return
+        if not self.lock.acquire(blocking=False):
+            self._post_to_gui_thread_delayed(
+                self.GUI_LOCK_RETRY_MS, self._run_deferred_locked_calls
+            )
+            return
+        afters = []
+        try:
+            while pending:
+                func, after = pending.pop(0)
+                try:
+                    func()
+                except Exception:
+                    log_error_traceback()
+                else:
+                    if after:
+                        afters.append(after)
+        finally:
+            self.lock.release()
+        for after in afters:
+            try:
+                after()
+            except Exception:
+                log_error_traceback()
 
     def _refresh_visual_state(self) -> None:
         """Refresh the persistent UI's visual state (icon/tooltip), if any.
@@ -5639,21 +5729,22 @@ class ProfileLoader:
     def _calibration_management_isenabled(self) -> bool:
         """Return whether Windows manages display calibration. Never raises.
 
-        The state is queried from the WCS worker process. If that fails (e.g.
-        the worker process is stalled, dead or being restarted), the error is
-        printed and the last known state is returned, so a WCS problem can
-        neither kill the display configuration monitoring thread nor raise
-        into the GUI. On the GUI thread, the last known state (refreshed by
-        the monitoring thread every few seconds) is returned right away
-        instead of waiting for the worker process, so a stalled worker cannot
-        freeze the tray icon or menu either.
+        On other threads, the state is queried from the WCS worker process.
+        If that fails (e.g. the worker process is stalled, dead or being
+        restarted), the error is printed and the last known state is
+        returned, so a WCS problem cannot kill the display configuration
+        monitoring thread. On the GUI thread, only the last known state
+        (refreshed by the monitoring thread every iteration) is returned,
+        False while it is still unknown (e.g. the startup query failed): the
+        GUI thread never waits for the worker process here, so this cannot
+        freeze the tray icon or menu. (Handlers that take ``self.lock`` are
+        kept from blocking by :meth:`_call_with_lock`.)
 
         Returns:
             bool: True if Windows calibration management is enabled.
         """
-        state = getattr(self, "_calibration_management_state", None)
-        if state is not None and self._is_gui_thread():
-            return state
+        if self._is_gui_thread():
+            return bool(getattr(self, "_calibration_management_state", None))
         return self._query_calibration_management_state()
 
     def _query_calibration_management_state(self) -> bool:
@@ -5695,8 +5786,10 @@ class ProfileLoader:
         """
         if event:
             print("Menu command:", end=" ")
-        print("Toggle fix profile associations", event.IsChecked())
-        if event.IsChecked():
+        # The event may be gone by the time a deferred change runs
+        checked = event.IsChecked()
+        print("Toggle fix profile associations", checked)
+        if checked:
             dlg = FixProfileAssociationsDialog(self, parent)
             self.fix_profile_associations_dlg = dlg
             result = dlg.ShowModal()
@@ -5704,19 +5797,22 @@ class ProfileLoader:
             if result == wx.ID_CANCEL:
                 print("Cancelled toggling fix profile associations")
                 return False
-        if self.lock.locked():
-            print("Waiting to acquire lock...")
-        with self.lock:
-            print("Acquired lock")
-            setcfg("profile_loader.fix_profile_associations", int(event.IsChecked()))
-            if event.IsChecked():
-                self._set_display_profiles()
-            else:
-                self._reset_display_profile_associations()
-            self._manual_restore = True
-            self.writecfg()
-            print("Releasing lock")
-        return event.IsChecked()
+        self._call_with_lock(lambda: self._apply_fix_profile_associations(checked))
+        return checked
+
+    def _apply_fix_profile_associations(self, enable: bool) -> None:
+        """Enable or disable fixing profile associations (holding self.lock).
+
+        Args:
+            enable (bool): Whether to fix profile associations.
+        """
+        setcfg("profile_loader.fix_profile_associations", int(enable))
+        if enable:
+            self._set_display_profiles()
+        else:
+            self._reset_display_profile_associations()
+        self._manual_restore = True
+        self.writecfg()
 
     def _set_exceptions(self) -> None:
         """Set exceptions for profile loading."""

@@ -1348,6 +1348,248 @@ def test_programmatic_exit_ends_exceptions_dialog(monkeypatch):
     assert exits == [None]
 
 
+# --- The GUI thread never waits long for self.lock ---------------------------
+
+
+class _StuckIteration:
+    """Hold pl.lock on another thread, like an iteration stuck in WCS calls.
+
+    Releases the lock by itself after ``timeout`` seconds (so code that does
+    wait for the lock cannot hang the test run), or on ``release()``.
+    """
+
+    def __init__(self, pl, timeout=3.0):
+        self._release = threading.Event()
+        holding = threading.Event()
+
+        def hold():
+            with pl.lock:
+                holding.set()
+                self._release.wait(timeout)
+
+        self.thread = threading.Thread(
+            target=hold, name="DisplayConfigurationMonitoring"
+        )
+        self.thread.start()
+        assert holding.wait(5)
+
+    def release(self):
+        self._release.set()
+        self.thread.join(5)
+
+
+def _make_gui_pl(monkeypatch):
+    pl = _make_pl()
+    pl._manual_restore = False
+    pl._reset_gamma_ramps = False
+    pl._next = False
+    pl._has_display_changed = True
+    pl._deferred_locked_calls = []
+    pl.GUI_LOCK_TIMEOUT = 0.05
+    pl.events = []
+    pl.delayed = []
+    pl._refresh_visual_state = lambda: pl.events.append("refresh")
+    pl.writecfg = lambda: pl.events.append("writecfg")
+    pl._post_to_gui_thread_delayed = lambda ms, func, *args: pl.delayed.append(func)
+    monkeypatch.setattr(
+        profile_loader, "setcfg", lambda name, value: pl.events.append((name, value))
+    )
+    monkeypatch.setattr(profile_loader, "getcfg", lambda name, *args, **kwargs: 1)
+    return pl
+
+
+def _run_delayed(pl):
+    """Run what was posted to the GUI thread's timer (like its event loop)."""
+    delayed, pl.delayed = pl.delayed, []
+    for func in delayed:
+        func()
+
+
+class _CheckedEvent:
+    def __init__(self, checked):
+        self.checked = checked
+
+    def IsChecked(self):  # noqa: N802
+        return self.checked
+
+
+def _process_display_changed_command(pl):
+    frame = profile_loader.PLFrame.__new__(profile_loader.PLFrame)
+    frame.pl = pl
+    pl._calibration_management_isenabled = lambda: False
+    pl._is_displaycal_running = lambda: False
+    pl._is_other_running = lambda enumerate_windows_and_processes=True: False
+    assert frame.process_data(["apply-profiles", "display-changed"]) == "ok"
+
+
+GUI_HANDLERS = {
+    "load calibration (menu)": (
+        lambda pl: pl._set_manual_restore(None),
+        {"_manual_restore": True, "_reset_gamma_ramps": False},
+    ),
+    "reset calibration (menu)": (
+        lambda pl: pl._set_reset_gamma_ramps(None),
+        {"_manual_restore": True, "_reset_gamma_ramps": True},
+    ),
+    "apply-profiles display-changed (scripting)": (
+        _process_display_changed_command,
+        {"_manual_restore": 2},
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(GUI_HANDLERS))
+def test_gui_handler_does_not_wait_for_a_stuck_iteration(monkeypatch, name):
+    handler, expected = GUI_HANDLERS[name]
+    pl = _make_gui_pl(monkeypatch)
+    pl._set_display_profiles = lambda dry_run=False: None
+    monkeypatch.setattr(profile_loader, "lang", _FakeLang(), raising=False)
+    stuck = _StuckIteration(pl)
+    try:
+        started = time.monotonic()
+        handler(pl)
+        elapsed = time.monotonic() - started
+        # Deferred: nothing changed while the iteration holds the lock
+        assert pl._manual_restore is False
+        assert "writecfg" not in pl.events
+        assert len(pl.delayed) == 1
+        _run_delayed(pl)  # still busy: retried later
+        assert pl._manual_restore is False
+        assert len(pl.delayed) == 1
+    finally:
+        stuck.release()
+    assert elapsed < 1
+
+    _run_delayed(pl)  # the iteration is done
+
+    for attr, value in expected.items():
+        assert getattr(pl, attr) == value
+    assert pl.delayed == []
+    assert not pl.lock.locked()
+
+
+def test_toggle_fix_profile_associations_does_not_wait(monkeypatch):
+    pl = _make_gui_pl(monkeypatch)
+    resets = []
+    pl._reset_display_profile_associations = lambda force=False: resets.append(
+        pl.lock.locked()
+    )
+    stuck = _StuckIteration(pl)
+    try:
+        started = time.monotonic()
+        result = pl._toggle_fix_profile_associations(_CheckedEvent(False))
+        elapsed = time.monotonic() - started
+        assert resets == []
+    finally:
+        stuck.release()
+
+    assert result is False
+    assert elapsed < 1
+    _run_delayed(pl)
+    # Applied holding the lock, between iterations, as before
+    assert resets == [True]
+    assert ("profile_loader.fix_profile_associations", 0) in pl.events
+    assert pl._manual_restore is True
+
+
+def test_deferred_gui_changes_run_in_order(monkeypatch):
+    pl = _make_gui_pl(monkeypatch)
+    stuck = _StuckIteration(pl)
+    try:
+        pl._set_reset_gamma_ramps(None)
+        pl._set_manual_restore(None)
+    finally:
+        stuck.release()
+    # One retry timer for both
+    assert len(pl.delayed) == 1
+
+    _run_delayed(pl)
+
+    # The last choice wins, as it would have without deferring
+    assert pl._reset_gamma_ramps is False
+    assert pl.events.count("writecfg") == 2
+
+
+def test_gui_handler_runs_right_away_when_the_lock_is_free(monkeypatch):
+    pl = _make_gui_pl(monkeypatch)
+
+    pl._set_reset_gamma_ramps(None)
+
+    assert pl._reset_gamma_ramps is True
+    assert pl.events == [
+        ("profile_loader.reset_gamma_ramps", 1),
+        "refresh",
+        "writecfg",
+    ]
+    assert pl.delayed == []
+
+
+def test_deferred_gui_changes_are_dropped_on_shutdown(monkeypatch):
+    pl = _make_gui_pl(monkeypatch)
+    stuck = _StuckIteration(pl)
+    try:
+        pl._set_reset_gamma_ramps(None)
+    finally:
+        stuck.release()
+    pl._shutdown = True
+
+    _run_delayed(pl)
+
+    assert pl._reset_gamma_ramps is False
+    assert pl._deferred_locked_calls == []
+    assert pl.delayed == []
+
+
+def test_tray_clicks_do_not_wait_for_a_stuck_iteration(monkeypatch):
+    pl = _make_gui_pl(monkeypatch)
+    pl._is_other_running = lambda enumerate_windows_and_processes=True: False
+    icon = profile_loader.TaskBarIcon.__new__(profile_loader.TaskBarIcon)
+    icon.pl = pl
+    icon._dclick = False
+    icon._notification = None
+    icon._show_notification_later = None
+    later = []
+    monkeypatch.setattr(
+        profile_loader.wx, "CallLater", lambda ms, func, *args: later.append(func)
+    )
+    monkeypatch.setattr(profile_loader.time, "sleep", lambda seconds: None)
+    stuck = _StuckIteration(pl)
+    try:
+        started = time.monotonic()
+        icon.on_left_up(None)  # single click: status notification
+        icon._dclick = False
+        icon.on_left_dclick(None)  # double click: load calibration now
+        elapsed = time.monotonic() - started
+    finally:
+        stuck.release()
+
+    assert elapsed < 1
+    # The notification shows what is known
+    assert later == [icon.show_notification]
+    _run_delayed(pl)
+    assert pl._manual_restore is True
+    assert pl._next is True
+
+
+def test_gui_thread_never_queries_unknown_calibration_management_state(monkeypatch):
+    """Not even when the startup query failed and the state is still unknown."""
+    pl = _make_pl()
+    pl._calibration_management_state = None
+    queries = []
+    monkeypatch.setattr(
+        profile_loader,
+        "calibration_management_isenabled",
+        lambda: queries.append(None) or True,
+    )
+
+    assert pl._calibration_management_isenabled() is False
+    assert queries == []
+    # The monitoring thread does query it
+    assert _in_thread(pl._calibration_management_isenabled) is True
+    assert pl._calibration_management_isenabled() is True
+    assert queries == [None]
+
+
 # --- WCS worker process IPC failures ----------------------------------------
 
 
