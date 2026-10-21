@@ -173,6 +173,47 @@ def test_is_other_running_with_exiting_process_of_known_window(monkeypatch):
     assert pl._hwnds_pids == set()
 
 
+def _scan_known_processes(monkeypatch, pl, error, times=3):
+    """Run _look_for_known_processes with one known app failing with error."""
+    monkeypatch.setattr(
+        profile_loader.win32ts,
+        "WTSEnumerateProcesses",
+        lambda: [(1, 4242, "explorer.exe", "S-1-5-21-1")],
+    )
+
+    def get_process_filename(pid):
+        raise error
+
+    monkeypatch.setattr(profile_loader, "get_process_filename", get_process_filename)
+    pl._known_apps = {"explorer.exe"}
+    for _ in range(times):
+        pl._look_for_known_processes((None, None, 0))
+
+
+@pytest.mark.parametrize(
+    "winerror_code",
+    [5, 299, 87, 31],  # access denied, partial copy, invalid param, gen failure
+)
+def test_expected_process_filename_errors_are_not_logged(
+    monkeypatch, capsys, winerror_code
+):
+    """ctypes.WinError's args[0] is the errno, not the Windows error code."""
+    pl = _make_pl()
+
+    _scan_known_processes(monkeypatch, pl, ctypes.WinError(winerror_code))
+
+    assert "Couldn't get filename" not in capsys.readouterr().out
+
+
+def test_unexpected_process_filename_error_is_logged_once(monkeypatch, capsys):
+    """Not every three seconds for as long as the process exists."""
+    pl = _make_pl()
+
+    _scan_known_processes(monkeypatch, pl, ctypes.WinError(6))  # invalid handle
+
+    assert capsys.readouterr().out.count("Couldn't get filename of process 4242") == 1
+
+
 def test_enumerate_windows_callback_skips_vanished_window(monkeypatch):
     pl = _make_pl()
 

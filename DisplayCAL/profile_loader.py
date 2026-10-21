@@ -2132,6 +2132,9 @@ class ProfileLoader:
         self._component_name = None
         self._app_detection_msg = None
         self._hwnds_pids = set()
+        # (pid, error code) pairs of known processes whose filename could not
+        # be read at the last check (see _look_for_known_processes)
+        self._process_filename_errors = set()
         self._fixed_profile_associations = set()
         self.__other_component = None, None, 0
         self.__apply_profiles = None
@@ -5057,6 +5060,10 @@ class ProfileLoader:
             return
 
         skip = False
+        # (pid, error code) pairs that failed this time; each is logged once
+        # while it keeps failing (this runs every three seconds)
+        filename_errors = set()
+        logged_filename_errors = getattr(self, "_process_filename_errors", set())
         for _session_id, pid, basename, user_security_id in processes:
             name_lower = basename.lower()
             if name_lower != "madhcctrl.exe":
@@ -5075,16 +5082,9 @@ class ProfileLoader:
             try:
                 filename = get_process_filename(pid)
             except (OSError, pywintypes.error) as exception:
-                if exception.args[0] not in (
-                    winerror.ERROR_ACCESS_DENIED,
-                    winerror.ERROR_PARTIAL_COPY,
-                    winerror.ERROR_INVALID_PARAMETER,
-                    winerror.ERROR_GEN_FAILURE,
-                ):
-                    print(
-                        f"Couldn't get filename of process {pid}:",
-                        exception,
-                    )
+                self._note_process_filename_error(
+                    pid, exception, logged_filename_errors, filename_errors
+                )
                 continue
             enabled, reset, path = self._exceptions.get(filename.lower(), (0, 0, ""))
             if known_app or enabled:
@@ -5094,6 +5094,43 @@ class ProfileLoader:
                 elif other_component != (filename, None, reset):
                     self._reset_gamma_ramps = True
                 self.__other_component = filename, None, reset
+        self._process_filename_errors = filename_errors
+
+    @staticmethod
+    def _note_process_filename_error(
+        pid: int,
+        exception: Exception,
+        logged: set[tuple[int, object]],
+        failed: set[tuple[int, object]],
+    ) -> None:
+        """Log an unexpected failure to read a process's filename, once.
+
+        Expected errors (access denied, partial copy, invalid parameter, gen
+        failure, e.g. for a process that is exiting) are not logged.
+
+        Args:
+            pid (int): The process ID.
+            exception (Exception): The error (OSError or pywintypes.error).
+            logged (set[tuple[int, object]]): (pid, error code) pairs that
+                failed at the last check, i.e. that were already logged.
+            failed (set[tuple[int, object]]): (pid, error code) pairs that
+                failed at this check, to which this one is added.
+        """
+        # The Windows error code: args[0] of an OSError from ctypes.WinError
+        # is the errno it maps to (e.g. EACCES for ERROR_ACCESS_DENIED)
+        code = getattr(exception, "winerror", None)
+        if code is None and exception.args:
+            code = exception.args[0]
+        if code in (
+            winerror.ERROR_ACCESS_DENIED,
+            winerror.ERROR_PARTIAL_COPY,
+            winerror.ERROR_INVALID_PARAMETER,
+            winerror.ERROR_GEN_FAILURE,
+        ):
+            return
+        failed.add((pid, code))
+        if (pid, code) not in logged:
+            print(f"Couldn't get filename of process {pid}:", exception)
 
     def _handle_component_detection(
         self,
