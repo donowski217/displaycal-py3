@@ -2042,6 +2042,13 @@ class TaskBarIcon(SysTrayIcon):
 class ProfileLoader:
     """Profile loader class for Windows."""
 
+    #: Consecutive failed monitoring iterations after which the error is fatal.
+    MONITOR_MAX_CONSECUTIVE_FAILURES = 5
+    #: Back-off after a failed monitoring iteration (seconds), doubled after
+    #: each further consecutive failure up to the maximum.
+    MONITOR_BACKOFF_INITIAL = 3.0
+    MONITOR_BACKOFF_MAX = 30.0
+
     def __init__(self) -> None:
         self._bootstrap_app()
         self.reload_count = 0
@@ -2242,194 +2249,197 @@ class ProfileLoader:
 
         if self._tray_active:
             self.lock.acquire()
+        try:
+            worker = Worker()
 
-        worker = Worker()
+            errors = []
 
-        errors = []
+            if sys.platform == "win32":
+                separator = "-"
+            else:
+                separator = "="
+            print(separator * 80)
+            print(lang.getstr("calibration.loading_from_display_profile"))
 
-        if sys.platform == "win32":
-            separator = "-"
-        else:
-            separator = "="
-        print(separator * 80)
-        print(lang.getstr("calibration.loading_from_display_profile"))
-
-        # dispwin sets the _ICC_PROFILE(_n) root window atom, per-output xrandr
-        # _ICC_PROFILE property (if xrandr is working) and loads the vcgt for the
-        # requested screen (ucmm backend using color.jcnf), and has to be called
-        # multiple times to setup multiple screens.
-        #
-        # If there is no profile configured in ucmm for the requested screen (or
-        # ucmm support has been removed, like in the Argyll CMS versions shipped by
-        # recent Fedora releases), it falls back to a possibly existing per-output
-        # xrandr _ICC_PROFILE property (if xrandr is working) or _ICC_PROFILE(_n)
-        # root window atom.
-        dispwin = get_argyll_util("dispwin")
-        if dispwin:
-            # Always enumerate so that worker.displays is populated, even when
-            # applying to a single display by index (e.g. from the macOS
-            # VideoLUT watch). Without this the per-display loop below would
-            # have nothing to iterate over for an indexed call.
-            worker.enumerate_displays_and_ports(
-                silent=True,
-                check_lut_access=False,
-                enumerate_ports=False,
-                include_network_devices=False,
-            )
-            if index is None:
-                self.monitors = []
-                if sys.platform == "win32" and worker.displays:
-                    self._enumerate_monitors()
-        elif index is None:
-            errors.append(lang.getstr("argyll.util.not_found", "dispwin"))
-
-        if sys.platform != "win32":
-            # gcm-apply sets the _ICC_PROFILE root window atom for the first screen,
-            # per-output xrandr _ICC_PROFILE properties (if xrandr is working) and
-            # loads the vcgt for all configured screens (device-profiles.conf)
-            # NOTE: gcm-apply is no longer part of GNOME Color Manager since the
-            # introduction of colord as it's no longer needed
-            gcm_apply = which("gcm-apply")
-            if gcm_apply:
-                worker.exec_cmd(
-                    gcm_apply, capture_output=True, skip_scripts=True, silent=False
-                )
-
-            # oyranos-monitor sets _ICC_PROFILE(_n) root window atoms (oyranos
-            # db backend) and loads the vcgt for all configured screens when
-            # xcalib is installed
-            oyranos_monitor = which("oyranos-monitor")
-            xcalib = which("xcalib")
-
-        argyll_use_colord = os.getenv("ARGYLL_USE_COLORD") and dlopen(
-            "libcolordcompat.so"
-        )
-
-        results = []
-        for i, display in enumerate(
-            [
-                display.replace("[PRIMARY]", lang.getstr("display.primary"))
-                for display in worker.displays
-            ]
-        ):
-            if config.is_virtual_display(i) or (index is not None and i != index):
-                continue
-            # Load profile and set vcgt
-            if sys.platform != "win32" and oyranos_monitor:
-                display_conf_oy_compat = worker.check_display_conf_oy_compat(i + 1)
-                if display_conf_oy_compat:
-                    worker.exec_cmd(
-                        oyranos_monitor,
-                        [
-                            "-x",
-                            str(worker.display_rects[i][0]),
-                            "-y",
-                            str(worker.display_rects[i][1]),
-                        ],
-                        capture_output=True,
-                        skip_scripts=True,
-                        silent=False,
-                    )
+            # dispwin sets the _ICC_PROFILE(_n) root window atom, per-output xrandr
+            # _ICC_PROFILE property (if xrandr is working) and loads the vcgt for the
+            # requested screen (ucmm backend using color.jcnf), and has to be called
+            # multiple times to setup multiple screens.
+            #
+            # If there is no profile configured in ucmm for the requested screen (or
+            # ucmm support has been removed, like in the Argyll CMS versions shipped by
+            # recent Fedora releases), it falls back to a possibly existing per-output
+            # xrandr _ICC_PROFILE property (if xrandr is working) or _ICC_PROFILE(_n)
+            # root window atom.
+            dispwin = get_argyll_util("dispwin")
             if dispwin:
-                if not argyll_use_colord:
-                    # Deal with colord ourself
-                    profile_arg = worker.get_dispwin_display_profile_argument(i)
-                else:
-                    # Argyll deals with colord directly
-                    profile_arg = "-L"
-                if (
-                    sys.platform == "win32"
-                    or not oyranos_monitor
-                    or not display_conf_oy_compat
-                    or not xcalib
-                    or profile_arg == "-L"
-                ):
-                    # Only need to run dispwin if under Windows, or if nothing else
-                    # has already taken care of display profile and vcgt loading
-                    # (e.g. oyranos-monitor with xcalib, or colord)
-                    #
-                    # On macOS the OS (WindowServer) may intermittently clobber
-                    # the VideoLUT to all-black right after loading it, turning
-                    # the display black (issue #694). We therefore verify that
-                    # the calibration was actually loaded and re-try the load a
-                    # few times if it wasn't. Verification is also done on other
-                    # platforms when explicitly enabled.
-                    verify_load = (
-                        sys.platform == "darwin"
-                        or config.getcfg("profile_loader.verify_calibration")
-                        or "--verify" in sys.argv[1:]
-                    ) and profile_arg != "-L"
-                    max_attempts = max(
-                        1, int(config.getcfg("profile_loader.load_retries"))
+                # Always enumerate so that worker.displays is populated, even when
+                # applying to a single display by index (e.g. from the macOS
+                # VideoLUT watch). Without this the per-display loop below would
+                # have nothing to iterate over for an indexed call.
+                worker.enumerate_displays_and_ports(
+                    silent=True,
+                    check_lut_access=False,
+                    enumerate_ports=False,
+                    include_network_devices=False,
+                )
+                if index is None:
+                    self.monitors = []
+                    if sys.platform == "win32" and worker.displays:
+                        self._enumerate_monitors()
+            elif index is None:
+                errors.append(lang.getstr("argyll.util.not_found", "dispwin"))
+
+            if sys.platform != "win32":
+                # gcm-apply sets the _ICC_PROFILE root window atom for the first screen,
+                # per-output xrandr _ICC_PROFILE properties (if xrandr is working) and
+                # loads the vcgt for all configured screens (device-profiles.conf)
+                # NOTE: gcm-apply is no longer part of GNOME Color Manager since the
+                # introduction of colord as it's no longer needed
+                gcm_apply = which("gcm-apply")
+                if gcm_apply:
+                    worker.exec_cmd(
+                        gcm_apply, capture_output=True, skip_scripts=True, silent=False
                     )
-                    load_error = None
-                    for attempt in range(max_attempts):
-                        if worker.exec_cmd(
-                            dispwin,
-                            ["-v", f"-d{i + 1:d}", profile_arg],
+
+                # oyranos-monitor sets _ICC_PROFILE(_n) root window atoms (oyranos
+                # db backend) and loads the vcgt for all configured screens when
+                # xcalib is installed
+                oyranos_monitor = which("oyranos-monitor")
+                xcalib = which("xcalib")
+
+            argyll_use_colord = os.getenv("ARGYLL_USE_COLORD") and dlopen(
+                "libcolordcompat.so"
+            )
+
+            results = []
+            for i, display in enumerate(
+                [
+                    display.replace("[PRIMARY]", lang.getstr("display.primary"))
+                    for display in worker.displays
+                ]
+            ):
+                if config.is_virtual_display(i) or (index is not None and i != index):
+                    continue
+                # Load profile and set vcgt
+                if sys.platform != "win32" and oyranos_monitor:
+                    display_conf_oy_compat = worker.check_display_conf_oy_compat(i + 1)
+                    if display_conf_oy_compat:
+                        worker.exec_cmd(
+                            oyranos_monitor,
+                            [
+                                "-x",
+                                str(worker.display_rects[i][0]),
+                                "-y",
+                                str(worker.display_rects[i][1]),
+                            ],
                             capture_output=True,
                             skip_scripts=True,
                             silent=False,
-                        ):
-                            errortxt = ""
-                        else:
-                            errortxt = "\n".join(worker.errors).strip()
-                        if errortxt and (
-                            (
-                                "using linear" not in errortxt
-                                and "assuming linear" not in errortxt
-                            )
-                            or len(errortxt.split("\n")) > 1
-                        ):
-                            if (
-                                "Failed to get the displays current ICC profile"
-                                in errortxt
-                            ):
-                                # Maybe just not configured
-                                load_error = "skip"
-                                break
-                            if (
-                                sys.platform == "win32"
-                                or "Failed to set VideoLUT" in errortxt
-                                or "We don't have access to the VideoLUT" in errortxt
-                            ):
-                                errstr = lang.getstr("calibration.load_error")
-                            else:
-                                errstr = lang.getstr("profile.load_error")
-                            load_error = f"{display}: {errstr}"
-                            break
-                        # The load command itself succeeded. Verify the
-                        # calibration is actually loaded in the VideoLUT and
-                        # re-try the load if it was clobbered (macOS black
-                        # screen), see issue #694.
-                        if not verify_load:
-                            break
-                        if not worker.calibration_is_clobbered(dispwin, i, profile_arg):
-                            # Loaded OK (or could not be determined)
-                            break
-                        if attempt + 1 < max_attempts:
-                            # Give the OS a moment to settle, then re-load
-                            print(
-                                f"VideoLUT for {display} not loaded "
-                                f"(attempt {attempt + 1:d}/{max_attempts:d}), "
-                                "re-loading calibration"
-                            )
-                            time.sleep(0.5)
-                            continue
-                        load_error = ": ".join(
-                            [display, lang.getstr("calibration.load_error")]
                         )
-                    if load_error == "skip":
-                        continue
-                    if load_error:
-                        errors.append(load_error)
-                        continue
-                    results.append(display)
+                if dispwin:
+                    if not argyll_use_colord:
+                        # Deal with colord ourself
+                        profile_arg = worker.get_dispwin_display_profile_argument(i)
+                    else:
+                        # Argyll deals with colord directly
+                        profile_arg = "-L"
+                    if (
+                        sys.platform == "win32"
+                        or not oyranos_monitor
+                        or not display_conf_oy_compat
+                        or not xcalib
+                        or profile_arg == "-L"
+                    ):
+                        # Only need to run dispwin if under Windows, or if nothing else
+                        # has already taken care of display profile and vcgt loading
+                        # (e.g. oyranos-monitor with xcalib, or colord)
+                        #
+                        # On macOS the OS (WindowServer) may intermittently clobber
+                        # the VideoLUT to all-black right after loading it, turning
+                        # the display black (issue #694). We therefore verify that
+                        # the calibration was actually loaded and re-try the load a
+                        # few times if it wasn't. Verification is also done on other
+                        # platforms when explicitly enabled.
+                        verify_load = (
+                            sys.platform == "darwin"
+                            or config.getcfg("profile_loader.verify_calibration")
+                            or "--verify" in sys.argv[1:]
+                        ) and profile_arg != "-L"
+                        max_attempts = max(
+                            1, int(config.getcfg("profile_loader.load_retries"))
+                        )
+                        load_error = None
+                        for attempt in range(max_attempts):
+                            if worker.exec_cmd(
+                                dispwin,
+                                ["-v", f"-d{i + 1:d}", profile_arg],
+                                capture_output=True,
+                                skip_scripts=True,
+                                silent=False,
+                            ):
+                                errortxt = ""
+                            else:
+                                errortxt = "\n".join(worker.errors).strip()
+                            if errortxt and (
+                                (
+                                    "using linear" not in errortxt
+                                    and "assuming linear" not in errortxt
+                                )
+                                or len(errortxt.split("\n")) > 1
+                            ):
+                                if (
+                                    "Failed to get the displays current ICC profile"
+                                    in errortxt
+                                ):
+                                    # Maybe just not configured
+                                    load_error = "skip"
+                                    break
+                                if (
+                                    sys.platform == "win32"
+                                    or "Failed to set VideoLUT" in errortxt
+                                    or "We don't have access to the VideoLUT" in errortxt
+                                ):
+                                    errstr = lang.getstr("calibration.load_error")
+                                else:
+                                    errstr = lang.getstr("profile.load_error")
+                                load_error = f"{display}: {errstr}"
+                                break
+                            # The load command itself succeeded. Verify the
+                            # calibration is actually loaded in the VideoLUT and
+                            # re-try the load if it was clobbered (macOS black
+                            # screen), see issue #694.
+                            if not verify_load:
+                                break
+                            if not worker.calibration_is_clobbered(dispwin, i, profile_arg):
+                                # Loaded OK (or could not be determined)
+                                break
+                            if attempt + 1 < max_attempts:
+                                # Give the OS a moment to settle, then re-load
+                                print(
+                                    f"VideoLUT for {display} not loaded "
+                                    f"(attempt {attempt + 1:d}/{max_attempts:d}), "
+                                    "re-loading calibration"
+                                )
+                                time.sleep(0.5)
+                                continue
+                            load_error = ": ".join(
+                                [display, lang.getstr("calibration.load_error")]
+                            )
+                        if load_error == "skip":
+                            continue
+                        if load_error:
+                            errors.append(load_error)
+                            continue
+                        results.append(display)
+        finally:
+            # Always release the lock, otherwise the display configuration
+            # monitoring thread would block on it forever
+            if self._tray_active:
+                self.lock.release()
 
-        if self._tray_active:
-            self.lock.release()
-            if event:
-                self.notify(results, errors)
+        if self._tray_active and event:
+            self.notify(results, errors)
 
         return errors
 
@@ -3157,39 +3167,104 @@ class ProfileLoader:
         return has_display_changed
 
     def _check_display_conf_wrapper(self) -> None:
+        """Run the display configuration monitoring loop (thread target).
+
+        Errors in individual iterations are handled (logged and retried) by
+        :meth:`_check_display_conf` itself. Anything that still escapes it is
+        logged here and handed to the GUI thread as a fatal error.
+        """
         try:
             self._check_display_conf()
         except Exception as exception:
-            if self.lock.locked():
-                self.lock.release()
-            self._post_to_gui_thread(self._handle_fatal_error, exception)
+            # Log the real traceback while it is still available
+            traceback.print_exc()
+            # Note that self.lock is NOT released here: the monitoring loop
+            # only ever holds it inside a "with" block, so it has already been
+            # released. Releasing it here could only free a lock held by
+            # another thread (the GUI thread or ProcessDisplayChangedEvent).
+            if not self._shutdown:
+                self._post_to_gui_thread(self._handle_fatal_error, exception)
 
     def _handle_fatal_error(self, exception: Exception) -> None:
         handle_error(exception)
         self._post_to_gui_thread(self.exit)
 
     def _check_display_conf(self) -> None:
-        """Thread to monitor display configuration changes."""
+        """Thread to monitor display configuration changes.
+
+        Each iteration (including the wait for the next one) is guarded: an
+        exception is logged, the loop backs off and retries. Only after
+        ``MONITOR_MAX_CONSECUTIVE_FAILURES`` consecutive failed iterations is
+        the exception re-raised (and thus treated as fatal by
+        :meth:`_check_display_conf_wrapper`).
+        """
         self._current_display = None
         self._current_timestamp = 0
         self._next = False
         first_run = True
-        apply_profiles = self._should_apply_profiles()
         displaycal_running = False
+        failures = 0
+        try:
+            # Called for its side effect of enumerating windows and processes
+            # (fills self._hwnds_pids), so the first iteration can tell
+            # whether the list of running processes changed
+            self._should_apply_profiles()
+        except Exception:
+            failures = self._handle_monitor_error(failures, first_run)
         previous_hwnds_pids = self._hwnds_pids
         while self and self.monitoring:
-            result = None
-            results = []
-            errors = []
-            idle = True
-            locked = self.lock.locked()
-            if locked:
-                print(
-                    "DisplayConfigurationMonitoringThread: Waiting to acquire lock..."
-                )
-            lock_acquired = self.lock.acquire()
-            if lock_acquired:
-                print("DisplayConfigurationMonitoringThread: Acquired lock")
+            try:
+                if not self._run_monitor_iteration(
+                    first_run, displaycal_running, previous_hwnds_pids
+                ):
+                    # A change in profile associations was detected and we
+                    # exited the iteration early: check again right away
+                    failures = 0
+                    continue
+                previous_hwnds_pids = self._hwnds_pids
+                first_run = False
+                if "--oneshot" in sys.argv[1:]:
+                    self._post_to_gui_thread(self.exit)
+                    break
+                if "--profile-associations" in sys.argv[1:]:
+                    sys.argv.remove("--profile-associations")
+                    self._post_to_gui_thread(self._set_profile_associations, None)
+                self._wait_for_next_iteration()
+            except Exception:
+                failures = self._handle_monitor_error(failures, first_run)
+            else:
+                failures = 0
+        print("Display configuration monitoring thread finished")
+        self.shutdown()
+
+    def _run_monitor_iteration(
+        self,
+        first_run: bool,
+        displaycal_running: bool,
+        previous_hwnds_pids: set,
+    ) -> bool:
+        """Run one display configuration/profile/calibration check.
+
+        Args:
+            first_run (bool): Whether this is the first (successful) iteration.
+            displaycal_running (bool): Whether DisplayCAL was running.
+            previous_hwnds_pids (set): Windows/processes seen last iteration.
+
+        Returns:
+            bool: False if the iteration was cut short because ``self._next``
+                was set (the caller should run the next iteration right away),
+                True otherwise.
+        """
+        result = None
+        results = []
+        errors = []
+        idle = True
+        if self.lock.locked():
+            debug_print(
+                "DisplayConfigurationMonitoringThread: Waiting to acquire lock..."
+            )
+        with self.lock:
+            debug_print("DisplayConfigurationMonitoringThread: Acquired lock")
             # Check if display configuration changed
             self._check_display_changed(first_run)
             profile_associations_changed, apply_profiles, idle, result = (
@@ -3200,13 +3275,8 @@ class ProfileLoader:
             if self._next:
                 # We only arrive here if a change in profile associations was
                 # detected and we exited the loop early
-                if locked:
-                    print("DisplayConfigurationMonitoringThread: Releasing lock")
-                self.lock.release()
-                if locked:
-                    print("DisplayConfigurationMonitoringThread: Released lock")
-                continue
-            previous_hwnds_pids = self._hwnds_pids
+                debug_print("DisplayConfigurationMonitoringThread: Releasing lock")
+                return False
             timestamp = time.time()
             localtime = list(time.localtime(self._timestamp))
             localtime[3:6] = 23, 59, 59
@@ -3226,7 +3296,6 @@ class ProfileLoader:
             if apply_profiles and not idle:
                 self._post_to_gui_thread(self._animate_busy_icon)
             self.__apply_profiles = apply_profiles
-            first_run = False
             if profile_associations_changed and not self._has_display_changed:
                 if getattr(self, "profile_associations_dlg", None):
                     self._post_to_gui_thread(
@@ -3246,34 +3315,97 @@ class ProfileLoader:
                 self._has_display_changed = False
             self._manual_restore = False
             self._skip = False
-            if locked:
-                print("DisplayConfigurationMonitoringThread: Releasing lock")
-            self.lock.release()
-            if locked:
-                print("DisplayConfigurationMonitoringThread: Released lock")
-            if "--oneshot" in sys.argv[1:]:
-                self._post_to_gui_thread(self.exit)
+            debug_print("DisplayConfigurationMonitoringThread: Releasing lock")
+        return True
+
+    def _wait_for_next_iteration(self) -> None:
+        """Wait (up to three seconds) before the next monitoring iteration.
+
+        Returns early if monitoring stops, a manual restore is requested or the
+        next iteration should run right away. Every 0.5 s, checks whether
+        something external asked us to exit.
+        """
+        timeout = 0
+        while (
+            self
+            and self.monitoring
+            and timeout < 3
+            and not self._manual_restore
+            and not self._next
+        ):
+            if round(timeout * 100) % 25 == 0 and not self._check_keep_running():
+                self.monitoring = False
+                self._post_to_gui_thread(self._request_forced_shutdown)
                 break
-            if "--profile-associations" in sys.argv[1:]:
-                sys.argv.remove("--profile-associations")
-                self._post_to_gui_thread(self._set_profile_associations, None)
-            # Wait three seconds
-            timeout = 0
-            while (
-                self
-                and self.monitoring
-                and timeout < 3
-                and not self._manual_restore
-                and not self._next
-            ):
-                if round(timeout * 100) % 25 == 0 and not self._check_keep_running():
-                    self.monitoring = False
-                    self._post_to_gui_thread(self._request_forced_shutdown)
-                    break
-                time.sleep(0.1)
-                timeout += 0.1
-        print("Display configuration monitoring thread finished")
-        self.shutdown()
+            time.sleep(0.1)
+            timeout += 0.1
+
+    def _handle_monitor_error(self, failures: int, first_run: bool) -> int:
+        """Handle an exception from a monitoring iteration.
+
+        Must be called from the ``except`` block. Logs the traceback (each
+        distinct one in full, repeats in one line), makes the next iteration
+        redo display change handling if one was in progress, and backs off.
+        Re-raises the exception once ``MONITOR_MAX_CONSECUTIVE_FAILURES``
+        consecutive iterations have failed.
+
+        Args:
+            failures (int): Consecutive failed iterations before this one.
+            first_run (bool): Whether the failed iteration was the first run.
+
+        Returns:
+            int: The updated number of consecutive failures.
+        """
+        failures += 1
+        if failures >= self.MONITOR_MAX_CONSECUTIVE_FAILURES and self.monitoring:
+            print(
+                "Display configuration monitoring failed",
+                failures,
+                "times in a row, giving up",
+            )
+            # Re-raise the exception being handled by our caller
+            raise
+        tb = traceback.format_exc()
+        if tb != getattr(self, "_last_monitor_traceback", None):
+            self._last_monitor_traceback = tb
+            traceback.print_exc()
+        else:
+            print(
+                "Display configuration monitoring error (same as before):",
+                repr(sys.exc_info()[1]),
+            )
+        if not self.monitoring:
+            return failures
+        if first_run or self._display_changed_event:
+            self._rearm_display_change_detection()
+        delay = min(
+            self.MONITOR_BACKOFF_INITIAL * 2 ** (failures - 1),
+            self.MONITOR_BACKOFF_MAX,
+        )
+        print(
+            f"Display configuration monitoring: iteration failed ({failures} in a "
+            f"row), retrying in {delay:.0f} s"
+        )
+        waited = 0.0
+        while self and self.monitoring and waited < delay:
+            time.sleep(0.1)
+            waited += 0.1
+        return failures
+
+    def _rearm_display_change_detection(self) -> None:
+        """Make the next monitoring iteration redo display change handling.
+
+        An iteration that failed while handling a display configuration change
+        (or on the first run) may already have recorded the new configuration
+        (e.g. ``_enumerate_monitors`` rebuilds ``_active_displays``) before the
+        error. Without this, the retry would see "no change" and could leave
+        profile associations half-fixed until the next display change.
+        """
+        with self.lock:
+            self._display_changed_event = True
+            self._active_displays = []
+            self._current_display = None
+            self._current_timestamp = 0
 
     def _check_profile_associations(
         self,
