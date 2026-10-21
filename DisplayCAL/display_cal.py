@@ -4186,14 +4186,16 @@ class MainFrame(ReportFrame, BaseFrame, LUT3DMixin):
                 if isinstance(conn, Exception):
                     print("Warning - couldn't connect to", ip_port, f"({name}):", conn)
                     continue
+                # Responses are bytes. The application name is lowercase when
+                # running from source.
                 conn.send_command("getappname")
-                remote_appname = conn.get_single_response()
-                if remote_appname == APPNAME:
+                remote_appname = conn.get_single_response().decode("utf-8", "replace")
+                if remote_appname.lower() == APPNAME.lower():
                     print("Warning - connected to self, skipping")
                     del conn
                     continue
                 conn.send_command(f"setlanguage {lang.getcode()}")
-                response = conn.get_single_response()
+                response = conn.get_single_response().decode("utf-8", "replace")
                 if response not in ("ok", "invalid"):
                     print(
                         "Warning - couldn't set language for",
@@ -4201,7 +4203,7 @@ class MainFrame(ReportFrame, BaseFrame, LUT3DMixin):
                         f"({ip_port}):",
                         response,
                     )
-                if remote_appname == f"{APPNAME}-apply-profiles":
+                if remote_appname.lower() == f"{APPNAME}-apply-profiles".lower():
                     # Update notification text of profile loader
                     conn.send_command(
                         "notify '{}' silent sticky".format(
@@ -4210,7 +4212,7 @@ class MainFrame(ReportFrame, BaseFrame, LUT3DMixin):
                             )
                         )
                     )
-                    response = conn.get_single_response()
+                    response = conn.get_single_response().decode("utf-8", "replace")
                     if response != "ok":
                         print(
                             "Warning - couldn't update profile loader "
@@ -9005,7 +9007,8 @@ class MainFrame(ReportFrame, BaseFrame, LUT3DMixin):
         # Update profile loader config
         if sys.platform == "win32" and event:
             prev = self.send_command("apply-profiles", "getcfg profile.load_on_login")
-            if prev:
+            # None: not running, exception: unreachable (e.g. stale lock file)
+            if prev and not isinstance(prev, Exception):
                 with contextlib.suppress(Exception):
                     prev = int(prev.split()[-1])
                 result = self.send_command(
@@ -12369,7 +12372,8 @@ class MainFrame(ReportFrame, BaseFrame, LUT3DMixin):
                 cur = self.send_command(
                     "apply-profiles", "getcfg profile.load_on_login"
                 )
-                if cur:
+                # None: not running, exception: unreachable (e.g. stale lock)
+                if cur and not isinstance(cur, Exception):
                     try:
                         cur = int(cur.split()[-1])
                     except Exception:

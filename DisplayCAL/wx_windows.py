@@ -2233,7 +2233,10 @@ class BaseFrame(wx.Frame):
             command (str): The command to send.
 
         Returns:
-            str: The response from the scripting host.
+            None | str | Exception: The decoded response from the scripting
+                host, None if it is not running (or another application is
+                listening on its port), or the exception if talking to it
+                failed.
         """
         lock_name = APPBASENAME
         scripting_host = APPNAME
@@ -2251,19 +2254,21 @@ class BaseFrame(wx.Frame):
                         raise conn
                     # Check if we're actually connected to the right
                     # application (if it terminated unexpectedly, something
-                    # else may have grabbed the port)
+                    # else may have grabbed the port). Responses are bytes.
+                    # The name is lowercase when running from source.
                     conn.send_command("getappname")
-                    response = conn.get_single_response()
-                    if response == scripting_host:
-                        conn.send_command(command)
-                        response = conn.get_single_response()
-                        print(f"{scripting_host} {command} returned", response)
-                    else:
+                    response = conn.get_single_response().decode("utf-8", "replace")
+                    if response.lower() != scripting_host.lower():
                         print(
                             f"Warning - {scripting_host} not running under "
                             "expected port",
                             port,
                         )
+                        del conn
+                        continue
+                    conn.send_command(command)
+                    response = conn.get_single_response().decode("utf-8", "replace")
+                    print_safe(f"{scripting_host} {command} returned {response}")
                     del conn
                     return response
             else:
