@@ -2048,6 +2048,9 @@ class ProfileLoader:
     #: each further consecutive failure up to the maximum.
     MONITOR_BACKOFF_INITIAL = 3.0
     MONITOR_BACKOFF_MAX = 30.0
+    #: How long the monitoring thread waits for the GUI thread to count our
+    #: own top-level windows before it assumes "keep running" (seconds).
+    GUI_REQUEST_TIMEOUT = 1.0
 
     def __init__(self) -> None:
         self._bootstrap_app()
@@ -2952,18 +2955,109 @@ class ProfileLoader:
             and max(self.child_devices_count.values()) == 1
         )
 
+    @staticmethod
+    def _is_gui_thread() -> bool:
+        """Return whether the calling thread is the GUI (main) thread.
+
+        Returns:
+            bool: True if called from the GUI thread.
+        """
+        return threading.current_thread() is threading.main_thread()
+
     def _check_keep_running(self) -> bool:
-        """Check if the application should keep running."""
-        numwindows = len(self._enumerate_own_top_level_windows())
+        """Check if the application should keep running.
+
+        One of our windows having been closed by an external event (i.e.
+        ``WM_CLOSE``, e.g. at logoff) is a hint that something external is
+        trying to get us to exit.
+
+        Counting our windows touches the GUI toolkit, which must only happen
+        on the GUI thread, so when called from another thread (the display
+        configuration monitoring thread) the count is requested from the GUI
+        thread. A count that could not be determined (enumeration error, GUI
+        thread busy) means "keep running", and a lower count has to be seen on
+        two consecutive checks before we conclude that we should exit, so a
+        single transient enumeration glitch cannot shut the loader down.
+
+        Returns:
+            bool: False if the application should exit, True otherwise.
+        """
+        if self._is_gui_thread():
+            numwindows = self._count_own_top_level_windows()
+        else:
+            numwindows = self._count_own_top_level_windows_on_gui_thread()
+        if numwindows is None:
+            return True
         if numwindows < self.numwindows:
-            # One of our windows has been closed by an external event
-            # (i.e. WM_CLOSE). This is a hint that something external is trying
-            # to get us to exit. Comply by closing our main top-level window to
-            # initiate clean shutdown.
+            if not getattr(self, "_window_count_drop_seen", False):
+                # Confirm on the next check before acting on it
+                self._window_count_drop_seen = True
+                debug_print(
+                    "Window count", self.numwindows, "->", numwindows, "(unconfirmed)"
+                )
+                return True
+            # Comply by closing our main top-level window to initiate clean
+            # shutdown.
             print("Window count", self.numwindows, "->", numwindows)
             return False
+        self._window_count_drop_seen = False
         self.numwindows = numwindows
         return True
+
+    def _count_own_top_level_windows(self) -> None | int:
+        """Count our own top-level windows. Must be called on the GUI thread.
+
+        Returns:
+            None | int: The number of windows, or None if it could not be
+                determined.
+        """
+        try:
+            return len(self._enumerate_own_top_level_windows())
+        except Exception as exception:
+            if exception.args != getattr(self, "_last_window_count_error", None):
+                self._last_window_count_error = exception.args
+                print("Could not enumerate own top-level windows:", exception)
+            return None
+
+    def _count_own_top_level_windows_on_gui_thread(self) -> None | int:
+        """Have the GUI thread count our own top-level windows.
+
+        At most one request is outstanding at any time. If the GUI thread does
+        not answer within ``GUI_REQUEST_TIMEOUT`` seconds (e.g. it is busy),
+        None is returned and the outstanding request is waited for again on
+        the next call.
+
+        Returns:
+            None | int: The number of windows, or None if it could not be
+                determined in time.
+        """
+        request = getattr(self, "_window_count_request", None)
+        if request is None or request[0].is_set():
+            if not self.monitoring or self._shutdown:
+                # Do not leave requests queued for a GUI thread that is about
+                # to stop processing them
+                return None
+            done = threading.Event()
+            result: list[None | int] = [None]
+
+            def count() -> None:
+                try:
+                    result[0] = self._count_own_top_level_windows()
+                finally:
+                    done.set()
+
+            request = done, result
+            self._window_count_request = request
+            try:
+                self._post_to_gui_thread(count)
+            except Exception as exception:
+                self._window_count_request = None
+                print("Could not request own top-level window count:", exception)
+                return None
+        done, result = request
+        if not done.wait(self.GUI_REQUEST_TIMEOUT):
+            return None
+        return result[0]
 
     def _enumerate_own_top_level_windows(self) -> list:
         """Toolkit-specific hook: list this process's own top-level UI windows.
@@ -2971,9 +3065,9 @@ class ProfileLoader:
         Used by :meth:`_check_keep_running` to notice when something external
         (e.g. a Windows session shutdown/logoff sending ``WM_CLOSE``) has
         closed one of our windows, as a hint that we should comply and exit.
-        This default (wx) implementation enumerates the current thread's
+        This default (wx) implementation enumerates the GUI thread's
         native windows plus wx's own top-level window list. Overridden by
-        toolkit subclasses (e.g. the Qt port).
+        toolkit subclasses (e.g. the Qt port). Only called on the GUI thread.
 
         Returns:
             list: The window handles/objects currently considered "ours".
@@ -2984,15 +3078,20 @@ class ProfileLoader:
             win32gui.EnumThreadWindows(
                 self._tid, self._enumerate_own_windows_callback, windows
             )
-        windows.extend(
-            [
-                window
-                for window in list(wx.GetTopLevelWindows())
-                if not isinstance(window, wx.Dialog)
-                and window.Name
-                not in {"TaskBarNotification", "DisplayIdentification", "profile_info"}
-            ]
-        )
+        for window in list(wx.GetTopLevelWindows()):
+            try:
+                if (
+                    not window
+                    or window.IsBeingDeleted()
+                    or isinstance(window, wx.Dialog)
+                    or window.Name
+                    in {"TaskBarNotification", "DisplayIdentification", "profile_info"}
+                ):
+                    continue
+            except RuntimeError:
+                # wrapped C/C++ object has been deleted
+                continue
+            windows.append(window)
         return windows
 
     def _enumerate_own_windows_callback(self, hwnd: int, windowlist: list) -> None:

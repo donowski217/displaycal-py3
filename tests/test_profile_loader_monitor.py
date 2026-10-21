@@ -11,6 +11,7 @@ window is ever shown.
 
 import ctypes
 import os
+import queue
 import sys
 import threading
 import time
@@ -385,3 +386,145 @@ def test_apply_profiles_releases_lock_on_error(monkeypatch):
     with pytest.raises(RuntimeError):
         pl.apply_profiles()
     assert not pl.lock.locked()
+
+
+# --- Keep-running check: no wx calls off the GUI thread --------------------
+
+
+def _run_in_monitor_thread(func):
+    """Run ``func`` in a thread named like the real monitoring thread."""
+    outcome = {}
+
+    def target():
+        try:
+            outcome["result"] = func()
+        except BaseException as exception:  # pragma: no cover - reported below
+            outcome["error"] = exception
+
+    thread = threading.Thread(target=target, name="DisplayConfigurationMonitoring")
+    thread.start()
+    return thread, outcome
+
+
+def test_keep_running_counts_windows_on_gui_thread(monkeypatch):
+    pl = _make_pl()
+    pl.numwindows = 2
+    gui_queue = queue.Queue()
+    enumerated_on = []
+
+    def enumerate_own_top_level_windows():
+        enumerated_on.append(threading.current_thread())
+        return ["SysTrayIcon", "frame"]
+
+    pl._enumerate_own_top_level_windows = enumerate_own_top_level_windows
+    pl._post_to_gui_thread = lambda func, *args: gui_queue.put((func, args))
+
+    thread, outcome = _run_in_monitor_thread(pl._check_keep_running)
+    # Act as the GUI thread's event loop
+    func, args = gui_queue.get(timeout=5)
+    func(*args)
+    thread.join(5)
+
+    assert outcome == {"result": True}
+    assert enumerated_on == [threading.main_thread()]
+    assert pl.numwindows == 2
+
+
+def test_keep_running_assumes_true_while_gui_thread_is_busy(monkeypatch):
+    pl = _make_pl()
+    pl.numwindows = 2
+    pl.GUI_REQUEST_TIMEOUT = 0.05
+    posted = []
+    pl._post_to_gui_thread = lambda func, *args: posted.append(func)
+
+    def enumerate_own_top_level_windows():
+        raise AssertionError("must not enumerate on the monitoring thread")
+
+    pl._enumerate_own_top_level_windows = enumerate_own_top_level_windows
+
+    for _ in range(3):
+        thread, outcome = _run_in_monitor_thread(pl._check_keep_running)
+        thread.join(5)
+        assert outcome == {"result": True}
+    # Only one request is ever outstanding
+    assert len(posted) == 1
+
+
+def test_keep_running_does_not_post_while_shutting_down():
+    pl = _make_pl()
+    pl.numwindows = 2
+    pl.monitoring = False
+    posted = []
+    pl._post_to_gui_thread = lambda func, *args: posted.append(func)
+
+    thread, outcome = _run_in_monitor_thread(pl._check_keep_running)
+    thread.join(5)
+
+    assert outcome == {"result": True}
+    assert posted == []
+
+
+def test_keep_running_needs_two_consecutive_lower_counts():
+    pl = _make_pl()
+    pl.numwindows = 0
+    counts = iter([3, 2, 3, 2, 2])
+    pl._enumerate_own_top_level_windows = lambda: [None] * next(counts)
+
+    results = [pl._check_keep_running() for _ in range(5)]
+
+    assert results == [True, True, True, True, False]
+
+
+def test_keep_running_when_enumeration_fails():
+    pl = _make_pl()
+    pl.numwindows = 2
+
+    def enumerate_own_top_level_windows():
+        raise RuntimeError("wrapped C/C++ object of type Frame has been deleted")
+
+    pl._enumerate_own_top_level_windows = enumerate_own_top_level_windows
+
+    assert pl._check_keep_running() is True
+    assert pl.numwindows == 2
+
+
+class _FakeWindow:
+    def __init__(self, name, being_deleted=False):
+        self.name = name
+        self.being_deleted = being_deleted
+
+    def IsBeingDeleted(self):  # noqa: N802
+        return self.being_deleted
+
+    @property
+    def Name(self):  # noqa: N802
+        return self.name
+
+
+class _DeletedWindow:
+    def IsBeingDeleted(self):  # noqa: N802
+        raise RuntimeError("wrapped C/C++ object of type Frame has been deleted")
+
+    @property
+    def Name(self):  # noqa: N802
+        raise RuntimeError("wrapped C/C++ object of type Frame has been deleted")
+
+
+def test_enumerate_own_top_level_windows_skips_dead_windows(monkeypatch):
+    pl = _make_pl()
+    frame = _FakeWindow("frame")
+    monkeypatch.setattr(
+        profile_loader.win32gui, "EnumThreadWindows", lambda tid, cb, extra: None
+    )
+    monkeypatch.setattr(
+        profile_loader.wx,
+        "GetTopLevelWindows",
+        lambda: [
+            _DeletedWindow(),
+            _FakeWindow("other", being_deleted=True),
+            frame,
+            _FakeWindow("TaskBarNotification"),
+        ],
+    )
+
+    assert pl._enumerate_own_top_level_windows() == [frame]
