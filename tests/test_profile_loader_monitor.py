@@ -789,6 +789,35 @@ def test_reset_display_profile_associations_survives_wcs_errors(monkeypatch):
     assert unset_calls == []
 
 
+def test_display_change_invalidates_per_user_profiles_cache(monkeypatch):
+    from DisplayCAL import util_win
+
+    queries = []
+
+    class FakeWCSManager:
+        @staticmethod
+        def get_use_per_user_profiles(devicekey):
+            queries.append(devicekey)
+            return True
+
+    # Never start a real WCS worker process from this test
+    monkeypatch.setattr(util_win, "mscms", FakeWCSManager())
+    util_win.invalidate_per_user_profiles_cache()
+    pl = _make_pl()
+    pl._display_changed_event = False
+    pl._next = False
+    try:
+        util_win.per_user_profiles_isenabled(devicekey="key0")
+        util_win.per_user_profiles_isenabled(devicekey="key0")
+        pl._process_display_changed()
+        util_win.per_user_profiles_isenabled(devicekey="key0")
+    finally:
+        util_win.invalidate_per_user_profiles_cache()
+
+    assert queries == ["key0", "key0"]
+    assert pl._display_changed_event is True
+
+
 # --- GraphicsDrivers\Configuration registry key not accessible --------------
 
 

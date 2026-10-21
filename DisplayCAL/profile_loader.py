@@ -114,6 +114,7 @@ if sys.platform == "win32":
         get_first_display_device,
         get_process_filename,
         get_real_display_devices_info,
+        invalidate_per_user_profiles_cache,
         per_user_profiles_isenabled,
         run_as_admin,
         win_ver,
@@ -132,6 +133,9 @@ else:
     def calibration_management_isenabled() -> bool:
         """Stub for non-Windows platforms."""
         return False
+
+    def invalidate_per_user_profiles_cache(devicekey: None | str = None) -> None:
+        """Stub for non-Windows platforms."""
 
 
 if TYPE_CHECKING:
@@ -3154,6 +3158,8 @@ class ProfileLoader:
             print("ProcessDisplayChangedEvent: Acquired lock")
             self._display_changed_event = True
             self._next = True
+            # Re-query the (cached) per-user profile association flags
+            invalidate_per_user_profiles_cache()
             if getattr(self, "profile_associations_dlg", None):
                 self._post_to_gui_thread_delayed(
                     1000,
@@ -3973,6 +3979,8 @@ class ProfileLoader:
         if not first_run:
             print("A profile change has been detected")
             print(display, "->", desc)
+            # Associations changed: re-query the cached per-user profiles flags
+            invalidate_per_user_profiles_cache()
             device = get_active_display_device(moninfo["Device"])
             if device:
                 display_edid = get_display_name_edid(device, moninfo, i)
@@ -5034,6 +5042,8 @@ class ProfileLoader:
                 profile,
             )
             try:
+                # Decide with a fresh (not cached) per-user profiles flag
+                invalidate_per_user_profiles_cache(devicekey)
                 if not is_superuser() and not per_user_profiles_isenabled(
                     devicekey=devicekey
                 ):
@@ -5184,6 +5194,8 @@ class ProfileLoader:
                 correct_profile,
             )
             try:
+                # Decide with a fresh (not cached) per-user profiles flag
+                invalidate_per_user_profiles_cache(device.DeviceKey)
                 if not is_superuser() and not per_user_profiles_isenabled(
                     devicekey=device.DeviceKey
                 ):
@@ -5459,6 +5471,8 @@ class ProfileLoader:
         if event:
             print("Menu command:", end=" ")
         print("Set profile associations")
+        # Show the current per-user profiles flags, not cached ones
+        invalidate_per_user_profiles_cache()
         dlg = ProfileAssociationsDialog(self)
         self.profile_associations_dlg = dlg
         dlg.Center()

@@ -7,6 +7,8 @@ import ctypes
 import platform
 import struct
 import sys
+import threading
+import time
 import winreg
 from ctypes import POINTER, byref, sizeof, windll, wintypes
 from ctypes.wintypes import DWORD, HANDLE, LPWSTR
@@ -27,6 +29,14 @@ mscms = WCSManagerProxy()
 
 if TYPE_CHECKING:
     from _win32typing import PyDISPLAY_DEVICE
+
+#: How long (seconds) a per-user profiles flag queried from WCS is reused.
+#: WcsGetUsePerUserProfiles leaks one handle per call in the WCS worker
+#: process, and the profile loader needs the flag for every display every three
+#: seconds, which forced a worker restart every ~37 minutes with 4 displays.
+PER_USER_PROFILES_CACHE_TTL = 60.0
+_per_user_profiles_cache: dict[str, tuple[float, bool]] = {}
+_per_user_profiles_cache_lock = threading.Lock()
 
 
 if sys.getwindowsversion() >= (6,):
@@ -220,7 +230,11 @@ def enable_per_user_profiles(
         if device:
             devicekey = device.DeviceKey
     if devicekey:
+        # Unknown state if the call fails
+        invalidate_per_user_profiles_cache(devicekey)
         mscms.set_use_per_user_profiles(devicekey, enable)
+        with _per_user_profiles_cache_lock:
+            _per_user_profiles_cache[devicekey] = (time.monotonic(), bool(enable))
         return True
     return False
 
@@ -499,10 +513,31 @@ def get_windows_error(errorcode: int) -> ctypes.WinError:
     return ctypes.WinError(errorcode)
 
 
+def invalidate_per_user_profiles_cache(devicekey: None | str = None) -> None:
+    """Forget cached per-user profiles flags (see per_user_profiles_isenabled).
+
+    Args:
+        devicekey (None | str): Only forget the flag of this device key.
+            Defaults to None (forget all).
+    """
+    with _per_user_profiles_cache_lock:
+        if devicekey is None:
+            _per_user_profiles_cache.clear()
+        else:
+            _per_user_profiles_cache.pop(devicekey, None)
+
+
 def per_user_profiles_isenabled(
     display_no: int = 0, devicekey: None | str = None
 ) -> bool:
     """Check if per user profiles is enabled under Vista/Windows 7.
+
+    The flag is cached per device key for ``PER_USER_PROFILES_CACHE_TTL``
+    seconds, because the underlying WcsGetUsePerUserProfiles call leaks a
+    handle in the WCS worker process. Changes made with
+    :func:`enable_per_user_profiles` update the cache; use
+    :func:`invalidate_per_user_profiles_cache` when the flag may have been
+    changed elsewhere.
 
     Args:
         display_no (int): The display number.
@@ -523,7 +558,15 @@ def per_user_profiles_isenabled(
             devicekey = device.DeviceKey
     if not devicekey:
         return None
-    return mscms.get_use_per_user_profiles(devicekey)
+    now = time.monotonic()
+    with _per_user_profiles_cache_lock:
+        cached = _per_user_profiles_cache.get(devicekey)
+    if cached is not None and 0 <= now - cached[0] < PER_USER_PROFILES_CACHE_TTL:
+        return cached[1]
+    enabled = mscms.get_use_per_user_profiles(devicekey)
+    with _per_user_profiles_cache_lock:
+        _per_user_profiles_cache[devicekey] = (now, enabled)
+    return enabled
 
 
 def run_as_admin(

@@ -239,6 +239,92 @@ def test_worker_exits_when_parent_process_is_gone(monkeypatch):
     assert "WCSWorker process shutting down" not in messages
 
 
+# --- Per-user profiles flag cache (util_win) ----------------------------------
+
+
+class _FakeWCSManager:
+    """Stands in for util_win's WCSManagerProxy (no worker process)."""
+
+    def __init__(self):
+        self.answer = True
+        self.get_calls = []
+        self.set_calls = []
+
+    def get_use_per_user_profiles(self, devicekey):
+        self.get_calls.append(devicekey)
+        if isinstance(self.answer, BaseException):
+            raise self.answer
+        return self.answer
+
+    def set_use_per_user_profiles(self, devicekey, enable):
+        self.set_calls.append((devicekey, enable))
+
+
+@pytest.fixture
+def util_win_cache(monkeypatch):
+    util_win = pytest.importorskip("DisplayCAL.util_win")
+    fake = _FakeWCSManager()
+    monkeypatch.setattr(util_win, "mscms", fake)
+    util_win.invalidate_per_user_profiles_cache()
+    yield util_win, fake
+    util_win.invalidate_per_user_profiles_cache()
+
+
+def test_per_user_profiles_flag_is_cached_per_device(util_win_cache):
+    util_win, fake = util_win_cache
+
+    for _ in range(20):
+        for devicekey in ("key0", "key1"):
+            assert util_win.per_user_profiles_isenabled(devicekey=devicekey) is True
+
+    assert sorted(fake.get_calls) == ["key0", "key1"]
+
+
+def test_per_user_profiles_cache_expires(util_win_cache, monkeypatch):
+    util_win, fake = util_win_cache
+    monkeypatch.setattr(util_win, "PER_USER_PROFILES_CACHE_TTL", 0)
+
+    for _ in range(3):
+        util_win.per_user_profiles_isenabled(devicekey="key0")
+
+    assert fake.get_calls == ["key0"] * 3
+
+
+def test_per_user_profiles_cache_invalidation(util_win_cache):
+    util_win, fake = util_win_cache
+    util_win.per_user_profiles_isenabled(devicekey="key0")
+    util_win.per_user_profiles_isenabled(devicekey="key1")
+    util_win.invalidate_per_user_profiles_cache("key0")
+    util_win.per_user_profiles_isenabled(devicekey="key0")
+    util_win.per_user_profiles_isenabled(devicekey="key1")
+    util_win.invalidate_per_user_profiles_cache()
+    util_win.per_user_profiles_isenabled(devicekey="key1")
+
+    assert fake.get_calls == ["key0", "key1", "key0", "key1"]
+
+
+def test_enable_per_user_profiles_updates_cache(util_win_cache):
+    util_win, fake = util_win_cache
+    assert util_win.per_user_profiles_isenabled(devicekey="key0") is True
+
+    util_win.enable_per_user_profiles(False, devicekey="key0")
+
+    assert fake.set_calls == [("key0", False)]
+    assert util_win.per_user_profiles_isenabled(devicekey="key0") is False
+    assert fake.get_calls == ["key0"]
+
+
+def test_per_user_profiles_errors_are_not_cached(util_win_cache):
+    util_win, fake = util_win_cache
+    fake.answer = TimeoutError("timed out")
+
+    for _ in range(2):
+        with pytest.raises(TimeoutError):
+            util_win.per_user_profiles_isenabled(devicekey="key0")
+
+    assert fake.get_calls == ["key0", "key0"]
+
+
 # --- Test doubles of the worker process (must be importable by the child) ----
 
 
