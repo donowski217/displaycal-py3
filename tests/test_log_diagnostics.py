@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import threading
+import traceback
 import types
 import uuid
 import weakref
@@ -225,6 +226,8 @@ def stdio_env(app_log, monkeypatch):
     """Isolate the stdio redirection state of the log module."""
     registered = []
     monkeypatch.setattr(log, "_STDIO_LOG_STREAMS", [])
+    # Streams left over by other tests must not show up in this test's log
+    monkeypatch.setattr(log, "_ALL_STDIO_LOG_STREAMS", weakref.WeakSet())
     monkeypatch.setattr(
         log,
         "atexit",
@@ -404,6 +407,11 @@ def test_stdio_to_log_two_threads_do_not_deadlock(stdio_env, stderr_writing_hand
     assert {f"stderr {i}" for i in range(count)} <= messages
 
 
+def _summary(line: str, count: int) -> str:
+    """Return the repeat summary StdioToLog writes for line."""
+    return f'(previous line repeated {count} time{"" if count == 1 else "s"}: "{line}")'
+
+
 def test_stdio_to_log_collapses_repeated_lines(stdio_env):
     with _stdio(stdio_env.blackhole, stdio_env.shim):
         log.redirect_stdio_to_log()
@@ -413,7 +421,10 @@ def test_stdio_to_log_collapses_repeated_lines(stdio_env):
 
     assert _messages(stdio_env.logger) == [
         (logging.INFO, "DisplayConfigurationMonitoringThread: Acquired lock"),
-        (logging.INFO, "(last message repeated 4 times)"),
+        (
+            logging.INFO,
+            _summary("DisplayConfigurationMonitoringThread: Acquired lock", 4),
+        ),
         (logging.INFO, "Display configuration changed"),
     ]
 
@@ -434,8 +445,164 @@ def test_stdio_to_log_keeps_a_heartbeat_while_collapsing(stdio_env, monkeypatch)
 
     assert [m for _, m in _messages(stdio_env.logger)] == [
         "Acquired lock",
-        "(last message repeated 2 times)",
-        "(last message repeated 1 time)",
+        _summary("Acquired lock", 2),
+        _summary("Acquired lock", 1),
+    ]
+
+
+def test_stdio_to_log_logs_repeats_separated_by_other_records(
+    stdio_env: types.SimpleNamespace,
+) -> None:
+    """Only a copy of the previous record in the log file is collapsed.
+
+    The log file is shared by both streams, LOG()/safe_print() and
+    log_error(): a line repeated after other records is a new event (e.g. a
+    retry after a traceback, or the same error again minutes later) and must
+    stay in place in the timeline.
+    """
+    applying = "Applying calibration to display 1"
+    wcs_error = "WCS call failed: timeout"
+    with _stdio(stdio_env.blackhole, stdio_env.shim):
+        log.redirect_stdio_to_log()
+        print(applying)
+        try:
+            raise OSError(31, "SetDeviceGammaRamp failed")
+        except OSError:
+            traceback.print_exc()
+        print(applying)
+        log.LOG("Calibration applied")
+        print(applying)
+        print("Display 1 done")
+        sys.stderr.write(f"{wcs_error}\n")
+        print("Next iteration")
+        sys.stderr.write(f"{wcs_error}\n")
+        log.log_error("Something else failed")
+        sys.stderr.write(f"{wcs_error}\n")
+        print("Exiting")
+    log._flush_stdio_log_streams()
+
+    messages = _messages(stdio_env.logger)
+    assert not [m for _, m in messages if "repeated" in m]
+    traceback_end = messages.index(
+        (logging.ERROR, "OSError: [Errno 31] SetDeviceGammaRamp failed")
+    )
+    assert messages[0] == (logging.INFO, applying)
+    assert messages[1] == (logging.ERROR, "Traceback (most recent call last):")
+    assert messages[traceback_end + 1 :] == [
+        (logging.INFO, applying),
+        (logging.INFO, "Calibration applied"),
+        (logging.INFO, applying),
+        (logging.INFO, "Display 1 done"),
+        (logging.ERROR, wcs_error),
+        (logging.INFO, "Next iteration"),
+        (logging.ERROR, wcs_error),
+        (logging.ERROR, "Something else failed"),
+        (logging.ERROR, wcs_error),
+        (logging.INFO, "Exiting"),
+    ]
+
+
+@pytest.mark.parametrize("source", ["LOG", "stderr", "log_error", "child logger"])
+def test_stdio_to_log_writes_repeat_summary_before_next_record(
+    stdio_env: types.SimpleNamespace, source: str
+) -> None:
+    """The summary follows the line it counts, before any other record."""
+    with _stdio(stdio_env.blackhole, stdio_env.shim):
+        log.redirect_stdio_to_log()
+        for _ in range(3):
+            print("Acquired lock")
+        if source == "LOG":
+            log.LOG("Other record")
+        elif source == "stderr":
+            sys.stderr.write("Other record\n")
+        elif source == "log_error":
+            log.log_error("Other record")
+        else:
+            logging.getLogger(f"{stdio_env.logger.name}.child").warning("Other record")
+        print("Acquired lock")
+
+    expected = [
+        "Acquired lock",
+        _summary("Acquired lock", 2),
+        "Other record",
+        "Acquired lock",
+    ]
+    assert [m for _, m in _messages(stdio_env.logger)] == expected
+    file_lines = stdio_env.path.read_text(encoding="utf-8").splitlines()
+    # "<date> <time> <message>"
+    assert [line.split(" ", 2)[2] for line in file_lines] == expected
+
+
+def test_stdio_to_log_repeat_summary_quotes_long_lines_shortened(
+    stdio_env: types.SimpleNamespace,
+) -> None:
+    """A summary quotes at most max_summary_quote_length characters."""
+    long_line = "x" * 300
+    with _stdio(stdio_env.blackhole, stdio_env.shim):
+        log.redirect_stdio_to_log()
+        print(long_line)
+        print(long_line)
+        print("end")
+
+    assert [m for _, m in _messages(stdio_env.logger)] == [
+        long_line,
+        _summary("x" * 200 + "...", 1),
+        "end",
+    ]
+
+
+class _LocalLogsWhileLocked(threading.local):
+    """Thread-local storage of a StdioToLog stream, used under its lock.
+
+    Logs a record directly to the app logger the first time the line buffer
+    is looked up while armed, like a finalizer calling LOG() when a garbage
+    collection interrupts the stream's bookkeeping.
+    """
+
+    def __init__(self, logger: logging.Logger, text: str) -> None:
+        self.logger = logger
+        self.text = text
+        self.armed = False
+        self._buffer = None
+
+    @property
+    def buffer(self) -> object:
+        if self.armed:
+            self.armed = False
+            self.logger.info(self.text)
+        return self._buffer
+
+    @buffer.setter
+    def buffer(self, value: object) -> None:
+        self._buffer = value
+
+
+def test_stdio_to_log_record_interrupting_bookkeeping_with_pending_summary(
+    stdio_env: types.SimpleNamespace,
+) -> None:
+    """A record logged while the stream holds its lock does not take its lock.
+
+    The pending summary then follows that record, still naming its line.
+    """
+    stream = log.StdioToLog(logging.INFO, stdio_env.blackhole)
+    stream._local = _LocalLogsWhileLocked(stdio_env.logger, "record from finalizer")
+
+    def scenario() -> None:
+        stream.write("Acquired lock\n")
+        stream.write("Acquired lock\n")
+        stream._local.armed = True
+        stream.write("Acquired lock\n")
+        stream.write("Display configuration changed\n")
+
+    thread = _run_with_time_limit(scenario)
+
+    assert not thread.is_alive(), "the thread deadlocked on the stream's own lock"
+    assert [m for _, m in _messages(stdio_env.logger)] == [
+        "Acquired lock",
+        "record from finalizer",
+        _summary("Acquired lock", 1),
+        "Acquired lock",
+        "Display configuration changed",
     ]
 
 
