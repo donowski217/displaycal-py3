@@ -124,10 +124,64 @@ def test_profile_lookup_error_is_handled_per_display(monkeypatch, error, first_r
     # Error icon for this display, the iteration itself carries on
     assert pl.setgammaramp_success == {0: None}
     profile_key, mtime, desc = pl.profile_associations["key0"]
-    assert profile_key == str(error)
+    # A stable, non-empty key (empty would mean "no profile assigned")
+    assert profile_key.startswith(f"<{type(error).__name__}")
     assert mtime == 0
-    assert desc == str(error)
+    assert desc == (str(error) or repr(error))
     assert pl._next is False
+
+
+def _timeouts():
+    """A get_display_profile that fails with a new request ID every call."""
+    calls = []
+
+    def get_display_profile(display_no=0, path_only=False, devicekey=None):
+        calls.append(devicekey)
+        raise TimeoutError(f"Timeout waiting for response to request {len(calls)}")
+
+    return get_display_profile
+
+
+@pytest.mark.parametrize("fix_profile_associations", [0, 1])
+def test_repeated_lookup_error_is_not_a_new_association(
+    monkeypatch, capsys, fix_profile_associations
+):
+    """Only the first of a run of identical failures counts as a change."""
+    pl = _make_pl(monkeypatch, fix_profile_associations)
+    monkeypatch.setattr(profile_loader, "get_display_profile", _timeouts())
+
+    changed = [
+        pl._check_profile_associations(first_run, True, set(), None, [], [])[0]
+        for first_run in (True, False, False, False)
+    ]
+
+    assert changed == [1, 0, 0, 0]
+    assert "A profile change has been detected" not in capsys.readouterr().out
+    # No settle delay and immediate re-poll for a supposed association change
+    assert pl.dry_run_checks == []
+    assert pl._next is False
+
+
+def test_lookup_error_after_a_profile_is_one_change(monkeypatch, capsys):
+    pl = _make_pl(monkeypatch)
+    monkeypatch.setattr(
+        profile_loader,
+        "get_display_profile",
+        lambda display_no=0, path_only=False, devicekey=None: r"C:\x\good.icc",
+    )
+    monkeypatch.setattr(profile_loader, "get_profile_desc", lambda name: name)
+    pl._check_profile_associations(True, True, set(), None, [], [])
+    assert pl.profile_associations["key0"][0] == "good.icc"
+    monkeypatch.setattr(profile_loader, "get_display_profile", _timeouts())
+
+    changed = [
+        pl._check_profile_associations(False, True, set(), None, [], [])[0]
+        for _ in range(3)
+    ]
+
+    assert changed == [1, 0, 0]
+    assert capsys.readouterr().out.count("A profile change has been detected") == 1
+    assert pl.profile_associations["key0"][0] == "<TimeoutError>"
 
 
 @pytest.mark.parametrize("first_run", [True, False])

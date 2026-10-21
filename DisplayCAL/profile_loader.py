@@ -3670,7 +3670,10 @@ class ProfileLoader:
             else:
                 if profile_path:
                     profile_name = os.path.basename(profile_path)
-            profile_key = str(profile_name or exception or "")
+            if exception is not None:
+                profile_key = self._error_association_key(exception)
+            else:
+                profile_key = str(profile_name or "")
             association = self.profile_associations.get(key, (False, 0, ""))
             if (
                 getcfg("profile_loader.fix_profile_associations")
@@ -3817,6 +3820,31 @@ class ProfileLoader:
             # We only arrive here if the loop was completed
             self._next = False
         return profile_associations_changed, apply_profiles, idle, result
+
+    @staticmethod
+    def _error_association_key(exception: BaseException) -> str:
+        """Return the association key recorded for a failed profile lookup.
+
+        The key is the same for every repeat of the same failure. The message
+        is not: e.g. a WCS worker TimeoutError names the request ID, which
+        changes with every call. Keyed on the message, every poll during a
+        WCS outage looked like a new profile association (logged as a
+        profile change, per-user profiles flag cache invalidated, gamma ramps
+        reloaded and, with "fix profile associations" enabled, a one-second
+        delay and an immediate re-poll).
+
+        Args:
+            exception (BaseException): The error of the profile lookup.
+
+        Returns:
+            str: E.g. "<TimeoutError>" or "<PermissionError 13>". Never empty
+                (an empty key means "no profile assigned").
+        """
+        key = type(exception).__name__
+        args = exception.args
+        if args and isinstance(args[0], int):
+            key += f" {args[0]}"
+        return f"<{key}>"
 
     def _generate_and_apply_profiles(
         self,
@@ -4032,7 +4060,8 @@ class ProfileLoader:
             return profile_associations_changed, profile_association_changed, desc
 
         if profile_name is None:
-            desc = str(exception or "?")
+            # repr() for an error without a message, e.g. TimeoutError()
+            desc = (str(exception) or repr(exception)) if exception else "?"
         else:
             desc = get_profile_desc(profile_name)
         if not first_run:
