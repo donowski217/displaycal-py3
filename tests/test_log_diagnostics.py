@@ -566,3 +566,127 @@ def test_write_fault_log_footer_never_raises(tmp_path):
     fault_log = log.open_fault_log(str(tmp_path / "fault.log"), "DisplayCAL")
     fault_log.close()
     log.write_fault_log_footer(fault_log, "DisplayCAL")
+
+
+# Multiprocessing children must not pose as another application instance
+
+LOADER = "DisplayCAL-apply-profiles"
+FROZEN_CHILD_ARGV = [
+    r"C:\Program Files\DisplayCAL\DisplayCAL-apply-profiles.exe",
+    "--multiprocessing-fork",
+    "parent_pid=1234",
+    "pipe_handle=568",
+]
+
+
+@pytest.fixture
+def loader_dirs(tmp_path, monkeypatch):
+    """Config and log dirs of a running profile loader (as seen by its child)."""
+    confighome = tmp_path / "config"
+    logdir = tmp_path / "logs"
+    confighome.mkdir()
+    logdir.mkdir()
+    # The running parent's lock file: one line with its port
+    (confighome / f"{LOADER}.lock").write_text("15411\n")
+    (logdir / f"{LOADER}.log").write_text("parent log\n")
+    (logdir / f"{LOADER}.1.log").write_text("")
+    registered = []
+    monkeypatch.setattr(
+        log,
+        "atexit",
+        types.SimpleNamespace(register=lambda fn, *a: registered.append((fn, a))),
+    )
+    return types.SimpleNamespace(confighome=confighome, logdir=logdir)
+
+
+def _set_mtimes(logdir, main_is_older: bool) -> None:
+    older, newer = 1_000_000_000, 1_000_100_000
+    os.utime(
+        logdir / f"{LOADER}.log", (older, older) if main_is_older else (newer, newer)
+    )
+    os.utime(
+        logdir / f"{LOADER}.1.log", (newer, newer) if main_is_older else (older, older)
+    )
+
+
+def test_main_process_is_not_a_multiprocessing_child(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [r"C:\DisplayCAL\DisplayCAL-apply-profiles.exe"])
+    assert log.is_multiprocessing_child() is False
+
+
+def test_named_child_process_is_a_multiprocessing_child(monkeypatch):
+    monkeypatch.setattr(
+        log.mp, "current_process", lambda: types.SimpleNamespace(name="Process-1")
+    )
+    assert log.is_multiprocessing_child() is True
+
+
+@pytest.mark.parametrize("main_is_older", [True, False])
+def test_frozen_multiprocessing_child_is_detected_before_freeze_support(
+    loader_dirs, monkeypatch, main_is_older
+):
+    """A frozen child imports DisplayCAL before freeze_support() names it.
+
+    At that point its process name is still "MainProcess", so it used to
+    count the parent's lock file line as another instance and pick (and
+    rotate) the parent's log or the ".1" log: the 0-byte
+    DisplayCAL-apply-profiles.1.log files.
+    """
+    monkeypatch.setattr(sys, "argv", FROZEN_CHILD_ARGV)
+    _set_mtimes(loader_dirs.logdir, main_is_older)
+    assert log.is_multiprocessing_child() is True
+
+    result = log.update_filename_for_confighome(
+        "midnight",
+        str(loader_dirs.logdir),
+        LOADER,
+        str(loader_dirs.confighome),
+        "a",
+    )
+
+    assert result == ("never", f"{LOADER}.mp-worker-1", "w")
+
+
+def test_frozen_multiprocessing_child_leaves_parent_logs_alone(
+    loader_dirs, monkeypatch, file_loggers
+):
+    monkeypatch.setattr(sys, "argv", FROZEN_CHILD_ARGV)
+    _set_mtimes(loader_dirs.logdir, main_is_older=False)
+    # Lock file of another live worker of the same parent
+    sibling_lock = loader_dirs.confighome / f"{LOADER}.mp-worker-1.lock"
+    sibling_lock.write_text("")
+    before = {p.name: p.stat().st_mtime for p in loader_dirs.logdir.iterdir()}
+
+    logger = log.get_file_logger(
+        _unique_name("child"),
+        logdir=str(loader_dirs.logdir),
+        filename=LOADER,
+        confighome=str(loader_dirs.confighome),
+    )
+    file_loggers.append(logger)
+
+    assert [os.path.basename(h.baseFilename) for h in logger.handlers] == [
+        f"{LOADER}.mp-worker-2.log"
+    ]
+    after = {p.name: p.stat().st_mtime for p in loader_dirs.logdir.iterdir()}
+    assert after.pop(f"{LOADER}.mp-worker-2.log", None) is not None
+    assert after == before
+    assert sibling_lock.exists()
+
+
+@pytest.mark.parametrize("main_is_older", [True, False])
+def test_second_main_process_still_gets_instance_log(
+    loader_dirs, monkeypatch, main_is_older
+):
+    """A genuine second instance keeps using the '.1' logic."""
+    monkeypatch.setattr(sys, "argv", [FROZEN_CHILD_ARGV[0], "--task"])
+    _set_mtimes(loader_dirs.logdir, main_is_older)
+    when, filename, mode = log.update_filename_for_confighome(
+        "midnight",
+        str(loader_dirs.logdir),
+        LOADER,
+        str(loader_dirs.confighome),
+        "a",
+    )
+    assert (when, mode) == ("midnight", "a")
+    assert filename == (LOADER if main_is_older else f"{LOADER}.1")

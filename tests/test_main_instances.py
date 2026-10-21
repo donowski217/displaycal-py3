@@ -5,8 +5,10 @@ Nothing here starts, signals or kills a process.
 
 from __future__ import annotations
 
+import ast
 import faulthandler
 import os
+import pathlib
 import sys
 import types
 
@@ -76,3 +78,56 @@ def test_initialize_fault_handler_appends(main, monkeypatch, tmp_path):
         f"{pid} exited ===",
     ]
     assert all("DisplayCAL-apply-profiles" in line for line in lines[1:])
+
+
+# Frozen multiprocessing children must not import DisplayCAL before
+# freeze_support() takes over
+
+SCRIPTS_DIR = pathlib.Path(__file__).resolve().parent.parent / "scripts"
+ENTRY_SCRIPTS = sorted(
+    path.name
+    for path in SCRIPTS_DIR.glob("displaycal*")
+    # The launcher never imports DisplayCAL; it only starts the loader
+    if path.name != "displaycal-apply-profiles-launcher"
+)
+
+
+def _imports_displaycal(node: ast.AST) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Import) and any(
+            alias.name.split(".")[0] == "DisplayCAL" for alias in child.names
+        ):
+            return True
+        if (
+            isinstance(child, ast.ImportFrom)
+            and child.module
+            and child.module.split(".")[0] == "DisplayCAL"
+        ):
+            return True
+    return False
+
+
+def _is_freeze_support_call(node: ast.AST) -> bool:
+    if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)):
+        return False
+    func = node.value.func
+    name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+    return name == "freeze_support"
+
+
+def test_entry_scripts_were_found():
+    assert "displaycal-apply-profiles" in ENTRY_SCRIPTS
+    assert len(ENTRY_SCRIPTS) >= 10
+
+
+@pytest.mark.parametrize("script", ENTRY_SCRIPTS)
+def test_entry_script_calls_freeze_support_before_importing_displaycal(script):
+    tree = ast.parse((SCRIPTS_DIR / script).read_text(encoding="utf-8"))
+    for node in tree.body:
+        if _is_freeze_support_call(node):
+            break
+        assert not _imports_displaycal(node), (
+            f"{script} imports DisplayCAL before calling freeze_support()"
+        )
+    else:
+        pytest.fail(f"{script} does not call freeze_support()")

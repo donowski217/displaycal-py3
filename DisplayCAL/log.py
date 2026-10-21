@@ -405,6 +405,25 @@ def get_file_logger(
     return logger
 
 
+def is_multiprocessing_child() -> bool:
+    """Return whether this process is a multiprocessing child process.
+
+    The process name alone is not enough: in a frozen Windows build, a
+    spawned child runs the entry script, which may import DisplayCAL and set
+    up logging, before multiprocessing.freeze_support() names the process.
+    The "--multiprocessing-fork" argument which the spawn start method passes
+    to the child is there from the start. (It is replaced by the parent's
+    arguments once the child is prepared, so check this early, e.g. while
+    setting up logging, and do not cache the result.)
+
+    Returns:
+        bool: True if this is a multiprocessing child process.
+    """
+    return mp.current_process().name != "MainProcess" or (
+        "--multiprocessing-fork" in (getattr(sys, "argv", None) or [])
+    )
+
+
 def update_filename_for_confighome(
     when: str,
     logdir: str,
@@ -427,7 +446,7 @@ def update_filename_for_confighome(
             'filename', and 'mode'.
     """
     # Use different logfile name (append number) for each additional instance
-    is_main_process = mp.current_process().name == "MainProcess"
+    is_main_process = not is_multiprocessing_child()
     if os.path.basename(confighome).lower() == "dispcalgui":
         lockbasename = filename.replace(APPNAME, "dispcalGUI")
     else:
@@ -476,7 +495,7 @@ def update_filename_with_lockfile(
         filename (str): Name of the log file.
         lockfilepath (str): Path to the lock file.
     """
-    is_main_process = mp.current_process().name == "MainProcess"
+    is_main_process = not is_multiprocessing_child()
     try:
         with open(lockfilepath) as lockfile:
             instances = len(lockfile.read().splitlines())
