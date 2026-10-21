@@ -103,9 +103,9 @@ def test_session_logfile_does_not_hijack_app_log(app_log, tmp_path, file_loggers
     assert "line during session" in app_text
     assert "line after session" in app_text
     assert "session only line" not in app_text
-    session_text = (
-        tmp_path / "session" / f"{session.filename}.log"
-    ).read_text(encoding="utf-8")
+    session_text = (tmp_path / "session" / f"{session.filename}.log").read_text(
+        encoding="utf-8"
+    )
     assert "session only line" in session_text
     assert "line during session" not in session_text
 
@@ -202,8 +202,6 @@ class Stderr:
 
     def flush(self) -> None:
         pass
-
-
 
 
 @contextlib.contextmanager
