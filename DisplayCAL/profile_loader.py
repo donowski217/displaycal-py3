@@ -2080,6 +2080,12 @@ class ProfileLoader:
         self.child_devices_count = {}
         self._current_display_key = -1
         self.numwindows = 0
+        # Keep-running check state (see _check_keep_running)
+        self._window_count_drop_seen = False
+        self._window_count_request = None
+        self._last_window_count_error = None
+        # Last logged monitoring iteration traceback (_handle_monitor_error)
+        self._last_monitor_traceback = None
         self.profile_associations = {}
         self.profiles = {}
         self.devices2profiles = {}
@@ -3040,7 +3046,7 @@ class ProfileLoader:
         if numwindows is None:
             return True
         if numwindows < self.numwindows:
-            if not getattr(self, "_window_count_drop_seen", False):
+            if not self._window_count_drop_seen:
                 # Confirm on the next check before acting on it
                 self._window_count_drop_seen = True
                 debug_print(
@@ -3065,7 +3071,7 @@ class ProfileLoader:
         try:
             return len(self._enumerate_own_top_level_windows())
         except Exception as exception:
-            if exception.args != getattr(self, "_last_window_count_error", None):
+            if exception.args != self._last_window_count_error:
                 self._last_window_count_error = exception.args
                 print("Could not enumerate own top-level windows:", exception)
             return None
@@ -3082,7 +3088,7 @@ class ProfileLoader:
             None | int: The number of windows, or None if it could not be
                 determined in time.
         """
-        request = getattr(self, "_window_count_request", None)
+        request = self._window_count_request
         if request is None or request[0].is_set():
             if not self.monitoring or self._shutdown:
                 # Do not leave requests queued for a GUI thread that is about
@@ -3233,7 +3239,7 @@ class ProfileLoader:
         key_name = r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Configuration"
         key = None
         numsubkeys = 0
-        if not getattr(self, "_display_conf_key_unavailable", False):
+        if not self._display_conf_key_unavailable:
             try:
                 key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_name)
                 numsubkeys, numvalues, mtime = winreg.QueryInfoKey(key)
@@ -3511,7 +3517,7 @@ class ProfileLoader:
         Args:
             since (float): ``time.perf_counter()`` when the iteration started.
         """
-        checked = getattr(self, "_calibration_management_state_checked", None)
+        checked = self._calibration_management_state_checked
         if checked is None or checked < since:
             self._query_calibration_management_state()
 
@@ -3575,7 +3581,7 @@ class ProfileLoader:
             # Re-raise the exception being handled by our caller
             raise
         tb = traceback.format_exc()
-        if tb != getattr(self, "_last_monitor_traceback", None):
+        if tb != self._last_monitor_traceback:
             self._last_monitor_traceback = tb
             # Handled: into the app log as one record (not line by line
             # through stderr)
@@ -5063,7 +5069,7 @@ class ProfileLoader:
         # (pid, error code) pairs that failed this time; each is logged once
         # while it keeps failing (this runs every three seconds)
         filename_errors = set()
-        logged_filename_errors = getattr(self, "_process_filename_errors", set())
+        logged_filename_errors = self._process_filename_errors
         for _session_id, pid, basename, user_security_id in processes:
             name_lower = basename.lower()
             if name_lower != "madhcctrl.exe":
@@ -5705,8 +5711,8 @@ class ProfileLoader:
     def _request_forced_shutdown(self) -> None:
         """Toolkit-specific hook: force-close on the GUI thread, no confirmation.
 
-        Used by :meth:`_check_display_conf` when
-        :meth:`_check_keep_running` notices something external (e.g. a
+        Posted by :meth:`_stop_if_asked_to_exit` (on the monitoring thread)
+        when :meth:`_check_keep_running` notices something external (e.g. a
         Windows session shutdown/logoff) asked us to exit. This default (wx)
         implementation shuts down and force-closes the persistent frame.
         Overridden by toolkit subclasses (e.g. the Qt port).
@@ -5781,7 +5787,7 @@ class ProfileLoader:
             bool: True if Windows calibration management is enabled.
         """
         if self._is_gui_thread():
-            return bool(getattr(self, "_calibration_management_state", None))
+            return bool(self._calibration_management_state)
         return self._query_calibration_management_state()
 
     def _query_calibration_management_state(self) -> bool:
@@ -5800,10 +5806,10 @@ class ProfileLoader:
             state = bool(calibration_management_isenabled())
         except Exception as exception:
             error = f"{exception.__class__.__name__}: {exception}"
-            if error != getattr(self, "_last_wcs_error", None):
+            if error != self._last_wcs_error:
                 self._last_wcs_error = error
                 print("Could not query Windows calibration management state:", error)
-            return bool(getattr(self, "_calibration_management_state", None))
+            return bool(self._calibration_management_state)
         self._calibration_management_state = state
         self._last_wcs_error = None
         return state

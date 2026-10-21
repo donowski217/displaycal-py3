@@ -51,7 +51,52 @@ def _make_pl():
     pl._madvr_reset_cal = {}
     pl.monitors = []
     pl._current_display_key = None
+    # State that ProfileLoader.__init__ initializes
+    pl._display_conf_key_unavailable = False
+    pl._calibration_management_state = None
+    pl._calibration_management_state_checked = None
+    pl._last_wcs_error = None
+    pl._window_count_drop_seen = False
+    pl._window_count_request = None
+    pl._last_window_count_error = None
+    pl._last_monitor_traceback = None
+    pl._process_filename_errors = set()
+    pl._deferred_locked_calls = []
     return pl
+
+
+def test_init_initializes_monitoring_state(monkeypatch):
+    """The real __init__, without app, tray icon or thread (toolkit hooks)."""
+
+    class HeadlessLoader(ProfileLoader):
+        def _bootstrap_app(self):
+            self._app = None
+
+        def _setup_ui(self):
+            pass
+
+    queries = []
+    monkeypatch.setattr(
+        profile_loader,
+        "calibration_management_isenabled",
+        lambda: queries.append(None) or False,
+    )
+    monkeypatch.setattr(sys, "argv", [sys.argv[0]])
+
+    pl = HeadlessLoader()
+
+    assert pl._window_count_drop_seen is False
+    assert pl._window_count_request is None
+    assert pl._last_window_count_error is None
+    assert pl._last_monitor_traceback is None
+    assert pl._process_filename_errors == set()
+    assert pl._deferred_locked_calls == []
+    assert pl._ui_torn_down is False
+    assert not pl._shutdown_done.is_set()
+    # Windows calibration management is queried once, at startup
+    if sys.getwindowsversion() >= (6, 1):
+        assert queries == [None]
+        assert pl._calibration_management_state is False
 
 
 STOP = "stop"

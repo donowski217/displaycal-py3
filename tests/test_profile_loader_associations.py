@@ -63,6 +63,14 @@ def _make_pl(monkeypatch, fix_profile_associations=0):
     pl._next = False
     pl._current_display_key = None
     pl._reset_gamma_ramps = False
+    # State that ProfileLoader.__init__ initializes
+    pl._calibration_management_state = None
+    pl._calibration_management_state_checked = None
+    pl._last_wcs_error = None
+    pl._last_monitor_traceback = None
+    pl._window_count_drop_seen = False
+    pl._window_count_request = None
+    pl._last_window_count_error = None
     pl.gdi32 = None  # never read or write a gamma ramp
     pl._should_apply_profiles = lambda *args, **kwargs: False
     pl._is_displaycal_running = lambda: False
