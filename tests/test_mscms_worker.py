@@ -7,7 +7,9 @@ System call is made and no profile association is touched.
 
 import io
 import logging
+import os
 import queue
+import sys
 import threading
 import time
 from logging.handlers import QueueListener
@@ -170,6 +172,140 @@ def test_call_during_worker_restart_is_retried(echo_manager, monkeypatch):
     restart.join(10)
 
     assert result == "GetCalibrationManagementState"
+
+
+def _count_worker_starts(manager, monkeypatch):
+    starts = []
+    original_start_worker = manager._start_worker
+
+    def counting_start_worker():
+        starts.append(None)
+        original_start_worker()
+
+    monkeypatch.setattr(manager, "_start_worker", counting_start_worker)
+    return starts
+
+
+def test_worker_that_keeps_dying_is_not_respawned_in_a_loop(monkeypatch):
+    """E.g. a frozen child blocked by security software: it dies at once.
+
+    Each call used to respawn the worker up to six times and wait the full
+    request timeout for every attempt, forever.
+    """
+    monkeypatch.setattr(mscms_module, "_wcs_worker_process", _exiting_worker)
+    monkeypatch.setattr(mscms_module, "worker_restart_cooldown_initial", 1.0)
+    manager = mscms_module.WCSManager(request_timeout=10)
+    try:
+        starts = _count_worker_starts(manager, monkeypatch)
+        manager._worker_process.join(10)
+
+        started = time.monotonic()
+        for _ in range(5):
+            with pytest.raises(mscms_module.WCSWorkerError) as exc_info:
+                manager.get_calibration_management_state()
+        elapsed = time.monotonic() - started
+
+        # The first dead worker is replaced at once. Its replacement died
+        # right away too, so the next restart waits for the cooldown and
+        # calls fail at once meanwhile (no waiting for the request timeout).
+        assert len(starts) == 1
+        assert elapsed < 8
+        assert "restart deferred" in str(exc_info.value)
+        assert "exit code 3" in str(exc_info.value)
+        assert manager._restart_cooldown == 1.0
+
+        # After the cooldown: one more restart, then the cooldown doubles
+        time.sleep(1.1)
+        with pytest.raises(mscms_module.WCSWorkerError):
+            manager.get_calibration_management_state()
+        assert len(starts) == 2
+        assert manager._restart_cooldown == 2.0
+    finally:
+        manager.shutdown()
+
+
+def test_worker_dying_during_a_request_is_noticed_at_once(monkeypatch, caplog):
+    """E.g. a driver crash in one WCS call: don't wait for the request timeout."""
+    monkeypatch.setattr(mscms_module, "_wcs_worker_process", _crash_on_request_worker)
+    manager = mscms_module.WCSManager(request_timeout=60)
+    try:
+        starts = _count_worker_starts(manager, monkeypatch)
+        caplog.set_level(logging.ERROR, logger="DisplayCAL.mscms.manager")
+
+        started = time.monotonic()
+        with pytest.raises(mscms_module.WCSWorkerError):
+            manager.get_calibration_management_state()
+        elapsed = time.monotonic() - started
+
+        # Replaced once (and the call retried), then the restart is deferred
+        assert len(starts) == 1
+        assert elapsed < 20
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("exit code 7" in message for message in messages), messages
+    finally:
+        manager.shutdown()
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+class _DeadWorker:
+    pid = 1234
+    exitcode = 3221225477
+
+    def is_alive(self):
+        return False
+
+
+def test_restart_cooldown_doubles_is_capped_and_resets(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(mscms_module, "monotonic", clock)
+    manager = mscms_module.WCSManager.__new__(mscms_module.WCSManager)
+    manager._worker_started_at = clock.now
+    manager._worker_restarted_after_death = False
+    manager._restart_cooldown = 0.0
+    manager._restart_not_before = 0.0
+    manager._dead_worker_seen = None
+
+    def worker_dies_after(seconds):
+        """Return a dead worker that ran for ``seconds``, then 'restart' it."""
+        clock.now += seconds
+        return _DeadWorker()
+
+    def restart():
+        manager._worker_started_at = clock.now
+        manager._worker_restarted_after_death = True
+
+    # The original worker dies: restarted at once
+    manager._check_restart_cooldown(worker_dies_after(5), "dead")
+    assert manager._restart_cooldown == 0
+    restart()
+
+    cooldowns = []
+    for _ in range(8):
+        worker = worker_dies_after(2)
+        with pytest.raises(mscms_module.WCSWorkerError) as exc_info:
+            manager._check_restart_cooldown(worker, "dead")
+        cooldowns.append(manager._restart_cooldown)
+        # Still deferred just before the cooldown ends, with the same error
+        clock.now += manager._restart_cooldown - 0.5
+        with pytest.raises(mscms_module.WCSWorkerError) as exc_info2:
+            manager._check_restart_cooldown(worker, "dead")
+        assert str(exc_info2.value) == str(exc_info.value)
+        clock.now += 0.5
+        manager._check_restart_cooldown(worker, "dead")
+        restart()
+
+    assert cooldowns == [5, 10, 20, 40, 80, 160, 300, 300]
+
+    # A worker that lived longer resets the cooldown: restarted at once
+    manager._check_restart_cooldown(worker_dies_after(3600), "dead")
+    assert manager._restart_cooldown == 0
 
 
 def test_call_after_shutdown_is_not_retried(echo_manager):
@@ -340,3 +476,20 @@ def _echo_worker(request_queue, response_queue, log_queue):
         response_queue.put(
             {"type": "resp_success", "id": request["id"], "result": request["method"]}
         )
+
+
+def _exiting_worker(request_queue, response_queue, log_queue):
+    """Exit at once, like a worker process that cannot start."""
+    sys.exit(3)
+
+
+def _crash_on_request_worker(request_queue, response_queue, log_queue):
+    """Die without answering the first request, like a crash in a WCS call."""
+    while True:
+        try:
+            request = request_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        if request is None:
+            break
+        os._exit(7)
