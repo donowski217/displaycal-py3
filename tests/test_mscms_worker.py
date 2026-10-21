@@ -266,6 +266,8 @@ def test_restart_cooldown_doubles_is_capped_and_resets(monkeypatch):
     clock = _FakeClock()
     monkeypatch.setattr(mscms_module, "monotonic", clock)
     manager = mscms_module.WCSManager.__new__(mscms_module.WCSManager)
+    manager.request_timeout = 10.0
+    manager._hung_worker = None
     manager._worker_started_at = clock.now
     manager._worker_restarted_after_death = False
     manager._restart_cooldown = 0.0
@@ -308,6 +310,28 @@ def test_restart_cooldown_doubles_is_capped_and_resets(monkeypatch):
     assert manager._restart_cooldown == 0
 
 
+def test_worker_hanging_right_after_its_restart_gets_a_cooldown(monkeypatch):
+    """Even with a request timeout longer than the restart window."""
+    clock = _FakeClock()
+    monkeypatch.setattr(mscms_module, "monotonic", clock)
+    manager = mscms_module.WCSManager.__new__(mscms_module.WCSManager)
+    manager.request_timeout = 2 * mscms_module.worker_restart_window
+    manager._worker_started_at = clock.now
+    manager._worker_restarted_after_death = True
+    manager._restart_cooldown = 0.0
+    manager._restart_not_before = 0.0
+    manager._dead_worker_seen = None
+    # It hung on a request sent 1 s after its start, and was killed when the
+    # request timed out
+    clock.now += 1 + manager.request_timeout
+    manager._hung_worker = _DeadWorker()
+
+    with pytest.raises(mscms_module.WCSWorkerError):
+        manager._check_restart_cooldown(manager._hung_worker, "hung")
+
+    assert manager._restart_cooldown == mscms_module.worker_restart_cooldown_initial
+
+
 def test_call_after_shutdown_is_not_retried(echo_manager):
     manager = echo_manager
     manager.shutdown()
@@ -318,6 +342,103 @@ def test_call_after_shutdown_is_not_retried(echo_manager):
 
     assert not isinstance(exc_info.value, mscms_module.WCSManagerRestartingError)
     assert time.monotonic() - started < 1
+
+
+# --- Hung worker process -------------------------------------------------------
+
+# Request timeout for the hung worker tests. With the retries, a hung worker
+# used to cost (5 + 1) * HUNG_TIMEOUT + 3.1 s of backoff per call, forever.
+HUNG_TIMEOUT = 1.5
+
+
+def test_hung_worker_is_killed_and_replaced(monkeypatch, tmp_path, caplog):
+    """E.g. a WCS call that never returns: the worker reads no more requests."""
+    monkeypatch.setattr(mscms_module, "_wcs_worker_process", _hang_once_worker)
+    manager = mscms_module.WCSManager(request_timeout=HUNG_TIMEOUT)
+    try:
+        starts = _count_worker_starts(manager, monkeypatch)
+        # Up and running (and it told us so)
+        assert manager.get_calibration_management_state() == (
+            "GetCalibrationManagementState"
+        )
+        hung_worker = manager._worker_process
+        caplog.set_level(logging.ERROR, logger="DisplayCAL.mscms.manager")
+
+        started = time.monotonic()
+        result = manager._call_wcs_method("HangOnce", str(tmp_path / "hung"))
+        elapsed = time.monotonic() - started
+
+        # Answered by a new worker process after one request timeout
+        assert result == "HangOnce"
+        assert len(starts) == 1
+        assert not hung_worker.is_alive()
+        assert manager._worker_process is not hung_worker
+        assert manager._worker_process.is_alive()
+        assert elapsed < 2 * HUNG_TIMEOUT + 2
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            f"PID {hung_worker.pid} did not answer request" in message
+            for message in messages
+        ), messages
+    finally:
+        manager.shutdown()
+
+
+def test_worker_that_keeps_hanging_is_not_waited_for(monkeypatch):
+    """The replacement hangs too: calls fail at once during the cooldown."""
+    monkeypatch.setattr(mscms_module, "_wcs_worker_process", _hanging_worker)
+    monkeypatch.setattr(mscms_module, "worker_restart_cooldown_initial", 2.0)
+    manager = mscms_module.WCSManager(request_timeout=HUNG_TIMEOUT)
+    try:
+        starts = _count_worker_starts(manager, monkeypatch)
+        assert manager.get_calibration_management_state() == (
+            "GetCalibrationManagementState"
+        )
+
+        started = time.monotonic()
+        with pytest.raises(mscms_module.WCSWorkerError) as exc_info:
+            manager._call_wcs_method("Hang")
+        elapsed = time.monotonic() - started
+
+        # The hung worker was replaced once. Its replacement hung right away
+        # too, so it is not restarted until the cooldown ends.
+        assert "restart deferred" in str(exc_info.value)
+        assert len(starts) == 1
+        assert not manager._worker_process.is_alive()
+        assert elapsed < 4 * HUNG_TIMEOUT + 2
+
+        started = time.monotonic()
+        with pytest.raises(mscms_module.WCSWorkerError):
+            manager.get_calibration_management_state()
+        assert time.monotonic() - started < 0.5
+
+        # After the cooldown, a new worker process answers again
+        time.sleep(2.1)
+        assert manager.get_calibration_management_state() == (
+            "GetCalibrationManagementState"
+        )
+        assert len(starts) == 2
+    finally:
+        started = time.monotonic()
+        manager.shutdown()
+    assert time.monotonic() - started < 5
+
+
+def test_slow_starting_worker_is_not_mistaken_for_a_hung_one(monkeypatch):
+    """E.g. at logon: a worker process that is not up yet is not killed."""
+    monkeypatch.setattr(mscms_module, "_wcs_worker_process", _slow_starting_worker)
+    manager = mscms_module.WCSManager(request_timeout=0.5)
+    try:
+        starts = _count_worker_starts(manager, monkeypatch)
+        worker = manager._worker_process
+
+        result = manager.get_calibration_management_state()
+
+        assert result == "GetCalibrationManagementState"
+        assert starts == []
+        assert manager._worker_process is worker
+    finally:
+        manager.shutdown()
 
 
 # --- Worker process side ------------------------------------------------------
@@ -560,3 +681,57 @@ def _crash_on_request_worker(request_queue, response_queue, log_queue):
         if request is None:
             break
         os._exit(7)
+
+
+def _hang():
+    """Never return, like a WCS call that is stuck."""
+    while True:
+        time.sleep(1)
+
+
+def _serve(request_queue, response_queue, hangs):
+    """Tell the manager we are up, then answer requests with the method name.
+
+    Hang instead when ``hangs(request)`` is true.
+    """
+    response_queue.put({"type": "worker_ready", "pid": os.getpid()})
+    while True:
+        try:
+            request = request_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        if request is None:
+            break
+        if hangs(request):
+            _hang()
+        response_queue.put(
+            {"type": "resp_success", "id": request["id"], "result": request["method"]}
+        )
+
+
+def _hanging_worker(request_queue, response_queue, log_queue):
+    """Hang on every "Hang" request."""
+    _serve(request_queue, response_queue, lambda request: request["method"] == "Hang")
+
+
+def _hangs_once(request):
+    """Whether to hang: on a "HangOnce" request, if its marker file is new."""
+    if request["method"] != "HangOnce":
+        return False
+    marker = request["args"][0]
+    if os.path.exists(marker):
+        return False
+    with open(marker, "w"):
+        pass
+    return True
+
+
+def _hang_once_worker(request_queue, response_queue, log_queue):
+    """Hang on the first "HangOnce" request (in any worker process)."""
+    _serve(request_queue, response_queue, _hangs_once)
+
+
+def _slow_starting_worker(request_queue, response_queue, log_queue):
+    """Take a while to start up (much longer than the request timeout)."""
+    time.sleep(2)
+    _serve(request_queue, response_queue, lambda request: False)
