@@ -8,6 +8,9 @@ private logger with a UTF-8 file handler for the duration of each test.
 
 from __future__ import annotations
 
+import codecs
+import io
+import locale
 import logging
 import uuid
 
@@ -96,3 +99,48 @@ def test_named_file_logger_does_not_hijack_app_log(app_log, tmp_path, file_logge
     interact_text = (tmp_path / f"{name}.log").read_text(encoding="utf-8")
     assert "interact line" in interact_text
     assert "app line" not in interact_text
+
+
+# Log files are always UTF-8
+
+
+@pytest.fixture
+def cp1252_locale(monkeypatch):
+    """Make the 'locale' text encoding cp1252, as on the user's machine.
+
+    So the encoding tests do not depend on the locale (or UTF-8 mode) of the
+    machine running them.
+    """
+    if hasattr(io, "text_encoding"):
+        monkeypatch.setattr(
+            io,
+            "text_encoding",
+            lambda encoding, stacklevel=2: (
+                "cp1252" if encoding in (None, "locale") else encoding
+            ),
+        )
+    monkeypatch.setattr(locale, "getpreferredencoding", lambda *args: "cp1252")
+
+
+NON_CP1252_TEXT = "box ─┐ arrow → CJK 漢字 approx ≈ Δ"
+
+
+@pytest.mark.parametrize("when", ["never", "midnight"])
+def test_file_logger_writes_utf8(cp1252_locale, tmp_path, file_loggers, when):
+    """Records with characters outside the locale code page are not dropped."""
+    name = _unique_name("encoding")
+    logger = log.get_file_logger(name, when=when, logdir=str(tmp_path))
+    file_loggers.append(logger)
+    handlers = [h for h in logger.handlers if isinstance(h, logging.FileHandler)]
+    assert handlers
+    for handler in handlers:
+        assert codecs.lookup(handler.encoding).name == "utf-8"
+
+    logger.info(NON_CP1252_TEXT)
+    logger.info("plain ascii line")
+    for handler in handlers:
+        handler.flush()
+
+    text = (tmp_path / f"{name}.log").read_text(encoding="utf-8")
+    assert NON_CP1252_TEXT in text
+    assert "plain ascii line" in text

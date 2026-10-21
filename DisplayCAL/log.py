@@ -377,13 +377,24 @@ def get_file_logger(
     elif when != "never" and os.path.exists(logfile):
         rotate_log_files(backup_count, logdir, logfile)
     if os.path.exists(logdir):
+        # Always write UTF-8. With the default (locale) encoding, e.g. cp1252,
+        # any record containing a character outside that code page (box
+        # drawing characters, arrows, non-Latin display or profile names...)
+        # would raise in emit() and be dropped silently, because
+        # logging.raiseExceptions is off.
         try:
             if when != "never":
                 filehandler = logging.handlers.TimedRotatingFileHandler(
-                    logfile, when=when, backupCount=backup_count
+                    logfile,
+                    when=when,
+                    backupCount=backup_count,
+                    encoding="utf-8",
+                    errors="backslashreplace",
                 )
             else:
-                filehandler = logging.FileHandler(logfile, mode)
+                filehandler = logging.FileHandler(
+                    logfile, mode, encoding="utf-8", errors="backslashreplace"
+                )
             fileformatter = logging.Formatter("%(asctime)s %(message)s")
             filehandler.setFormatter(fileformatter)
             logger.addHandler(filehandler)
