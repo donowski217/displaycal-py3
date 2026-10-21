@@ -35,18 +35,6 @@ from DisplayCAL.wx_windows import BaseFrame, responseformats
 LOADER_LOCK_NAME = f"{APPBASENAME}-apply-profiles"
 LOADER_APPNAME = f"{APPNAME}-apply-profiles"
 
-# The GUI sends "notify '<text>' ...", but split_command_line() drops
-# single-quoted arguments (wexpect.py: ``state = state_basic if c == "'" else
-# arg + c`` turns ``state`` into a str), so the loader gets ["notify"] and
-# answers "invalid". The xfail lifts itself once split_command_line is fixed.
-wexpect_drops_single_quoted_args = pytest.mark.xfail(
-    split_command_line("notify 'a b' silent") != ["notify", "a b", "silent"],
-    reason="wexpect.split_command_line drops single-quoted arguments, so the "
-    "profile loader answers 'invalid' to notify '<text>'",
-    strict=True,
-)
-
-
 # -- fake scripting host (the "profile loader") ------------------------------
 
 
@@ -361,7 +349,6 @@ def test_profile_load_on_login_handler_updates_running_loader(
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only code path")
-@wexpect_drops_single_quoted_args
 def test_profile_load_on_login_handler_notify_accepted(
     display_cal, loader, monkeypatch, restore_cfg_defaults
 ):
@@ -420,7 +407,6 @@ def test_set_remote_language_updates_loader(
     assert "couldn't set language" not in capsys.readouterr().out
 
 
-@wexpect_drops_single_quoted_args
 def test_set_remote_language_loader_accepts_notify(
     display_cal, loader, monkeypatch, capsys
 ):

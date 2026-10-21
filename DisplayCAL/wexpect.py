@@ -3215,7 +3215,10 @@ def split_command_line(command_line):
             arg = arg + c
             state = state_backup if state_backup != state_whitespace else state_basic
         elif state == state_singlequote:
-            state = state_basic if c == r"'" else arg + c
+            if c == r"'":
+                state = state_basic
+            else:
+                arg = arg + c
         elif state == state_doublequote:
             if c == r'"':
                 state = state_basic
