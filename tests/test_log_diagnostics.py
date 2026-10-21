@@ -741,6 +741,19 @@ def test_stdio_to_log_writes_partial_line_of_finished_thread_at_exit(
     ]
 
 
+def test_stdio_to_log_drops_partial_line_of_a_discarded_stream(
+    stdio_env: types.SimpleNamespace,
+) -> None:
+    """A stream that goes away leaves nothing queued for logging."""
+    stream = log.StdioToLog(logging.INFO, stdio_env.blackhole)
+    stream.write("partial line of a discarded stream")
+    del stream
+    gc.collect()
+
+    assert not log._ORPHANED_LINES
+    assert _messages(stdio_env.logger) == []
+
+
 def test_stdio_to_log_logs_partial_lines_of_many_finished_threads(
     stdio_env: types.SimpleNamespace,
 ) -> None:

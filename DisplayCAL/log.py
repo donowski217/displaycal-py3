@@ -1039,7 +1039,8 @@ def _orphan_partial_line(stream_ref: weakref.ref, text: _PendingText) -> None:
         text (_PendingText): The buffer's text.
     """
     pending, text.value = text.value, ""
-    if pending.strip():
+    # A buffer also goes when its stream goes; then there is nowhere to log
+    if pending.strip() and stream_ref() is not None:
         _ORPHANED_LINES.append((stream_ref, pending))
 
 
