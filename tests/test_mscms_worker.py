@@ -8,7 +8,11 @@ System call is made and no profile association is touched.
 import io
 import logging
 import queue
+import threading
+import time
 from logging.handlers import QueueListener
+
+import pytest
 
 import DisplayCAL.mscms as mscms_module
 
@@ -90,6 +94,149 @@ def test_manager_forwards_worker_logs_to_local_loggers(monkeypatch):
 
     assert len(handlers) == 1
     assert isinstance(handlers[0], mscms_module._DispatchToLogger)
+
+
+def test_format_exitcode():
+    assert mscms_module._format_exitcode(3221225477) == "3221225477 (0xC0000005)"
+    assert mscms_module._format_exitcode(0) == "0"
+    assert mscms_module._format_exitcode(1) == "1"
+    assert mscms_module._format_exitcode(-15) == "-15"
+    assert mscms_module._format_exitcode(None) == "None"
+
+
+# --- Dead / restarting worker process ---------------------------------------
+
+
+@pytest.fixture
+def echo_manager(monkeypatch):
+    """A WCSManager whose worker answers every request with the method name."""
+    monkeypatch.setattr(mscms_module, "_wcs_worker_process", _echo_worker)
+    manager = mscms_module.WCSManager(request_timeout=0.5)
+    try:
+        yield manager
+    finally:
+        manager.shutdown()
+
+
+def test_dead_worker_is_restarted_and_logged(echo_manager, caplog):
+    manager = echo_manager
+    assert manager.get_calibration_management_state() == (
+        "GetCalibrationManagementState"
+    )
+    dead_worker = manager._worker_process
+    # Simulate a crash of our own worker process (by its handle, not by name)
+    dead_worker.terminate()
+    dead_worker.join(5)
+    assert not dead_worker.is_alive()
+
+    caplog.set_level(logging.ERROR, logger="DisplayCAL.mscms.manager")
+    started = time.monotonic()
+    result = manager.get_calibration_management_state()
+    elapsed = time.monotonic() - started
+
+    assert result == "GetCalibrationManagementState"
+    assert manager._worker_process is not dead_worker
+    assert manager._worker_process.is_alive()
+    # Restarted right away instead of timing out (about a minute by default)
+    assert elapsed < 5
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        f"PID {dead_worker.pid} is not running" in message
+        and f"exit code {mscms_module._format_exitcode(dead_worker.exitcode)}"
+        in message
+        for message in messages
+    ), messages
+
+
+def test_call_during_worker_restart_is_retried(echo_manager, monkeypatch):
+    manager = echo_manager
+    original_start_worker = manager._start_worker
+
+    def slow_start_worker():
+        # Widen the window in which the old worker is stopped and the new
+        # one not started yet
+        time.sleep(0.3)
+        original_start_worker()
+
+    monkeypatch.setattr(manager, "_start_worker", slow_start_worker)
+    restart = threading.Thread(target=manager._restart_worker, args=("test",))
+    restart.start()
+    deadline = time.monotonic() + 10
+    while not manager._shutdown_event.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert manager._restarting.is_set()
+
+    result = manager.get_calibration_management_state()
+    restart.join(10)
+
+    assert result == "GetCalibrationManagementState"
+
+
+def test_call_after_shutdown_is_not_retried(echo_manager):
+    manager = echo_manager
+    manager.shutdown()
+
+    started = time.monotonic()
+    with pytest.raises(mscms_module.WCSManagerShutdownError) as exc_info:
+        manager.get_calibration_management_state()
+
+    assert not isinstance(exc_info.value, mscms_module.WCSManagerRestartingError)
+    assert time.monotonic() - started < 1
+
+
+# --- Worker process side ------------------------------------------------------
+
+
+class _FakeQueue:
+    def __init__(self):
+        self.items = []
+        self.cancel_join_thread_called = False
+
+    def get(self, timeout=None):
+        time.sleep(0.01)
+        raise queue.Empty
+
+    def put(self, item):
+        self.items.append(item)
+
+    put_nowait = put
+
+    def cancel_join_thread(self):
+        self.cancel_join_thread_called = True
+
+
+class _DeadParent:
+    def is_alive(self):
+        return False
+
+
+class _FakeWCS:
+    pass
+
+
+def test_worker_exits_when_parent_process_is_gone(monkeypatch):
+    worker_logger = logging.getLogger("DisplayCAL.mscms.wcsworker")
+    monkeypatch.setattr(worker_logger, "propagate", worker_logger.propagate)
+    monkeypatch.setattr(mscms_module, "WCS", _FakeWCS)
+    monkeypatch.setattr(
+        mscms_module.multiprocessing, "parent_process", lambda: _DeadParent()
+    )
+    request_queue, response_queue, log_queue = _FakeQueue(), _FakeQueue(), _FakeQueue()
+
+    worker = threading.Thread(
+        target=mscms_module._wcs_worker_process,
+        args=(request_queue, response_queue, log_queue),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(5)
+
+    assert not worker.is_alive()
+    # Must not hang in Queue._finalize_join on queues nobody reads anymore
+    assert response_queue.cancel_join_thread_called
+    assert log_queue.cancel_join_thread_called
+    messages = [record.getMessage() for record in log_queue.items]
+    assert "WCSWorker process shutting down" not in messages
 
 
 # --- Test doubles of the worker process (must be importable by the child) ----
