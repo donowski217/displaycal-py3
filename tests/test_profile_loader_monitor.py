@@ -528,3 +528,143 @@ def test_enumerate_own_top_level_windows_skips_dead_windows(monkeypatch):
     )
 
     assert pl._enumerate_own_top_level_windows() == [frame]
+
+
+# --- Shutdown / UI teardown only on the GUI thread -------------------------
+
+
+def test_monitoring_thread_does_not_shut_down_itself(monkeypatch):
+    """The UI must never be torn down from the monitoring thread."""
+    harness = MonitorHarness(monkeypatch, [STOP])
+    thread = threading.Thread(
+        target=harness.pl._check_display_conf_wrapper,
+        name="DisplayConfigurationMonitoring",
+    )
+    thread.start()
+    thread.join(10)
+
+    assert not thread.is_alive()
+    assert harness.calls == 1
+    assert harness.shutdown_threads == []
+
+
+class ShutdownHarness:
+    """A ProfileLoader whose shutdown() side effects are all recorded stubs."""
+
+    def __init__(self, monkeypatch):
+        self.pl = pl = _make_pl()
+        self.events = []
+        self.posted = []
+        pl._shutdown_lock = threading.Lock()
+        pl._reset_display_profile_associations = lambda: self.events.append(
+            ("reset_associations", threading.current_thread())
+        )
+        pl.writecfg = lambda: self.events.append(
+            ("writecfg", threading.current_thread())
+        )
+        pl._teardown_ui = lambda: self.events.append(
+            ("teardown_ui", threading.current_thread())
+        )
+        pl._post_to_gui_thread = lambda func, *args: self.posted.append(func)
+        monkeypatch.setattr(
+            profile_loader,
+            "getcfg",
+            lambda name, *args, **kwargs: (
+                1 if name == "profile_loader.fix_profile_associations" else 0
+            ),
+        )
+
+    def names(self):
+        return [name for name, _thread in self.events]
+
+
+def test_shutdown_tears_down_ui_on_gui_thread(monkeypatch):
+    harness = ShutdownHarness(monkeypatch)
+    harness.pl.shutdown()
+    harness.pl.shutdown()
+
+    assert harness.names() == ["reset_associations", "writecfg", "teardown_ui"]
+    assert harness.events[-1][1] is threading.main_thread()
+    assert harness.pl.monitoring is False
+
+
+def test_shutdown_off_gui_thread_posts_ui_teardown(monkeypatch):
+    harness = ShutdownHarness(monkeypatch)
+    thread = threading.Thread(target=harness.pl.shutdown)
+    thread.start()
+    thread.join(10)
+
+    assert "teardown_ui" not in harness.names()
+    assert len(harness.posted) == 1
+    harness.posted[0]()  # what the GUI thread's event loop would do
+    assert harness.events[-1] == ("teardown_ui", threading.main_thread())
+
+
+def test_shutdown_runs_once_when_called_concurrently(monkeypatch):
+    harness = ShutdownHarness(monkeypatch)
+    barrier = threading.Barrier(5)
+
+    def call_shutdown():
+        barrier.wait()
+        harness.pl.shutdown()
+
+    threads = [threading.Thread(target=call_shutdown) for _ in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    assert harness.names().count("writecfg") == 1
+    assert harness.names().count("reset_associations") == 1
+
+
+def test_shutdown_waits_for_monitoring_thread(monkeypatch):
+    harness = ShutdownHarness(monkeypatch)
+    pl = harness.pl
+
+    def monitor():
+        while pl.monitoring:
+            time.sleep(0.2)
+        harness.events.append(("monitor_exited", threading.current_thread()))
+
+    pl._check_display_conf_thread = threading.Thread(
+        target=monitor, name="DisplayConfigurationMonitoring"
+    )
+    pl._check_display_conf_thread.start()
+    pl.shutdown()
+
+    assert not pl._check_display_conf_thread.is_alive()
+    # The monitoring thread is gone before associations are reset
+    assert harness.names()[0] == "monitor_exited"
+
+
+def test_shutdown_still_writes_config_if_reset_fails(monkeypatch, capsys):
+    harness = ShutdownHarness(monkeypatch)
+
+    def reset_display_profile_associations():
+        raise TimeoutError("WCS worker did not answer")
+
+    harness.pl._reset_display_profile_associations = reset_display_profile_associations
+    harness.pl.shutdown()
+
+    assert harness.names() == ["writecfg", "teardown_ui"]
+    assert "TimeoutError" in capsys.readouterr().err
+
+
+def test_forced_shutdown_shuts_down_before_closing_frame(monkeypatch):
+    harness = ShutdownHarness(monkeypatch)
+
+    class Frame:
+        def Close(self, force=False):  # noqa: N802
+            harness.events.append(("close_frame", force))
+
+    harness.pl.frame = Frame()
+    harness.pl._request_forced_shutdown()
+
+    assert harness.names() == [
+        "reset_associations",
+        "writecfg",
+        "teardown_ui",
+        "close_frame",
+    ]
+    assert harness.events[-1] == ("close_frame", True)

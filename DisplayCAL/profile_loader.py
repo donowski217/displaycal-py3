@@ -2051,12 +2051,15 @@ class ProfileLoader:
     #: How long the monitoring thread waits for the GUI thread to count our
     #: own top-level windows before it assumes "keep running" (seconds).
     GUI_REQUEST_TIMEOUT = 1.0
+    #: How long shutdown() waits for the monitoring thread to exit (seconds).
+    MONITOR_JOIN_TIMEOUT = 10.0
 
     def __init__(self) -> None:
         self._bootstrap_app()
         self.reload_count = 0
         self.lock = threading.Lock()
         self._is_other_running_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
         self.monitoring = True
         # Whether a persistent tray icon is active on this platform/toolkit.
         # Set True by setup_taskbar_icon() (wx, win32-only) or overridden by
@@ -3333,8 +3336,10 @@ class ProfileLoader:
                 failures = self._handle_monitor_error(failures, first_run)
             else:
                 failures = 0
+        # Note: shutdown() (and with it the UI teardown) is not called from
+        # here. It runs on the GUI thread, from the application's exit
+        # handlers (or _request_forced_shutdown), and waits for this thread.
         print("Display configuration monitoring thread finished")
-        self.shutdown()
 
     def _run_monitor_iteration(
         self,
@@ -4423,18 +4428,52 @@ class ProfileLoader:
                 self._post_to_gui_thread(self._refresh_visual_state)
 
     def shutdown(self) -> None:
-        """Shut down the profile loader."""
-        if self._shutdown:
-            return
-        self._shutdown = True
+        """Shut down the profile loader.
+
+        Runs at most once. Stops the display configuration monitoring thread
+        and waits (up to ``MONITOR_JOIN_TIMEOUT`` seconds) for it to exit, so
+        it does not keep running into interpreter finalization, then resets
+        the fixed profile associations, writes the configuration and tears
+        down the UI. Normally called on the GUI thread from the application's
+        exit handlers. The UI is only ever torn down on the GUI thread.
+        """
+        with self._shutdown_lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
         print("Shutting down profile loader")
         if self.monitoring:
             print("Shutting down display configuration monitoring thread")
             self.monitoring = False
+        self._join_monitoring_thread()
         if getcfg("profile_loader.fix_profile_associations"):
-            self._reset_display_profile_associations()
+            try:
+                self._reset_display_profile_associations()
+            except Exception:
+                # Still write the configuration and remove the tray icon
+                traceback.print_exc()
         self.writecfg()
-        self._teardown_ui()
+        if self._is_gui_thread():
+            self._teardown_ui()
+        else:
+            self._post_to_gui_thread(self._teardown_ui)
+
+    def _join_monitoring_thread(self) -> None:
+        """Wait for the display configuration monitoring thread to exit."""
+        thread = getattr(self, "_check_display_conf_thread", None)
+        if (
+            thread is None
+            or thread is threading.current_thread()
+            or not thread.is_alive()
+        ):
+            return
+        thread.join(self.MONITOR_JOIN_TIMEOUT)
+        if thread.is_alive():
+            print(
+                "Display configuration monitoring thread did not exit within",
+                self.MONITOR_JOIN_TIMEOUT,
+                "seconds",
+            )
 
     def _teardown_ui(self) -> None:
         """Tear down this platform/toolkit's persistent UI, if any.
@@ -5228,9 +5267,15 @@ class ProfileLoader:
         Used by :meth:`_check_display_conf` when
         :meth:`_check_keep_running` notices something external (e.g. a
         Windows session shutdown/logoff) asked us to exit. This default (wx)
-        implementation force-closes the persistent frame. Overridden by
-        toolkit subclasses (e.g. the Qt port).
+        implementation shuts down and force-closes the persistent frame.
+        Overridden by toolkit subclasses (e.g. the Qt port).
         """
+        # Shut down right away on the GUI thread (reset profile associations,
+        # write the configuration, remove the tray icon), even if closing the
+        # frame should not end the main loop. This used to happen on the
+        # monitoring thread. The exit handlers' own call of shutdown() is then
+        # a no-op.
+        self.shutdown()
         if self.frame:
             self.frame.Close(force=True)
 
