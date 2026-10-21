@@ -9,6 +9,7 @@ import io
 import logging
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -109,6 +110,15 @@ def test_format_exitcode():
 # --- Dead / restarting worker process ---------------------------------------
 
 
+def _crash(process):
+    """Kill our own worker process (by its PID, not by name) like a crash.
+
+    Unlike Process.terminate(), which main._exit() uses at application exit.
+    """
+    os.kill(process.pid, getattr(signal, "SIGKILL", 9))
+    process.join(5)
+
+
 @pytest.fixture
 def echo_manager(monkeypatch):
     """A WCSManager whose worker answers every request with the method name."""
@@ -126,9 +136,7 @@ def test_dead_worker_is_restarted_and_logged(echo_manager, caplog):
         "GetCalibrationManagementState"
     )
     dead_worker = manager._worker_process
-    # Simulate a crash of our own worker process (by its handle, not by name)
-    dead_worker.terminate()
-    dead_worker.join(5)
+    _crash(dead_worker)
     assert not dead_worker.is_alive()
 
     caplog.set_level(logging.ERROR, logger="DisplayCAL.mscms.manager")
@@ -439,6 +447,149 @@ def test_slow_starting_worker_is_not_mistaken_for_a_hung_one(monkeypatch):
         assert manager._worker_process is worker
     finally:
         manager.shutdown()
+
+
+# --- Shutdown --------------------------------------------------------------------
+
+
+def _start_pending_call(manager, method):
+    """Call ``method`` in a thread, and wait until the worker has read it.
+
+    Returns:
+        tuple: The thread, and a dict that receives the call's "error" and
+            the time it "finished".
+    """
+    outcome = {}
+
+    def call():
+        try:
+            outcome["result"] = manager._call_wcs_method(method)
+        except Exception as exception:
+            outcome["error"] = exception
+        outcome["finished"] = time.monotonic()
+
+    thread = threading.Thread(target=call, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not manager._pending_requests and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert manager._pending_requests
+    time.sleep(0.3)
+    return thread, outcome
+
+
+@pytest.fixture
+def hanging_manager(monkeypatch):
+    """A WCSManager whose (running) worker hangs on every "Hang" request."""
+    monkeypatch.setattr(mscms_module, "_wcs_worker_process", _hanging_worker)
+    manager = mscms_module.WCSManager(request_timeout=30)
+    try:
+        assert manager.get_calibration_management_state() == (
+            "GetCalibrationManagementState"
+        )
+        yield manager
+    finally:
+        manager.shutdown()
+
+
+def test_worker_terminated_at_exit_is_not_restarted(echo_manager, monkeypatch, caplog):
+    """main._exit() terminates all child processes at application exit.
+
+    The next call used to start a new worker process (which nothing
+    terminated anymore) and log the termination as a crash.
+    """
+    manager = echo_manager
+    assert manager.get_calibration_management_state() == (
+        "GetCalibrationManagementState"
+    )
+    starts = _count_worker_starts(manager, monkeypatch)
+    caplog.set_level(logging.INFO, logger="DisplayCAL.mscms.manager")
+    worker = manager._worker_process
+    # What main._exit() does
+    worker.terminate()
+    worker.join(5)
+
+    started = time.monotonic()
+    for _ in range(2):
+        with pytest.raises(mscms_module.WCSManagerShutdownError):
+            manager.get_calibration_management_state()
+    elapsed = time.monotonic() - started
+
+    assert starts == []
+    assert manager._worker_process is worker
+    assert elapsed < 3
+    errors = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.ERROR
+    ]
+    assert errors == []
+
+
+def test_pending_call_ends_when_worker_is_terminated_at_exit(
+    hanging_manager, monkeypatch
+):
+    """E.g. the loader's monitoring thread, still in a call at exit."""
+    manager = hanging_manager
+    starts = _count_worker_starts(manager, monkeypatch)
+    thread, outcome = _start_pending_call(manager, "Hang")
+
+    terminated = time.monotonic()
+    # What main._exit() does
+    manager._worker_process.terminate()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert isinstance(outcome.get("error"), mscms_module.WCSManagerShutdownError)
+    assert outcome["finished"] - terminated < 3
+    assert starts == []
+
+
+def test_pending_call_ends_at_shutdown(hanging_manager, monkeypatch):
+    """Not only once the hung worker was stopped (it ignores the poison pill)."""
+    manager = hanging_manager
+    starts = _count_worker_starts(manager, monkeypatch)
+    thread, outcome = _start_pending_call(manager, "Hang")
+
+    shutdown_started = time.monotonic()
+    shutdown = threading.Thread(target=manager.shutdown, daemon=True)
+    shutdown.start()
+    thread.join(5)
+    shutdown.join(15)
+
+    assert not thread.is_alive()
+    assert isinstance(outcome.get("error"), mscms_module.WCSManagerShutdownError)
+    assert outcome["finished"] - shutdown_started < 2
+    assert not shutdown.is_alive()
+    assert not manager._worker_process.is_alive()
+    assert starts == []
+
+
+def test_no_worker_is_started_once_shutdown_is_called(echo_manager, monkeypatch):
+    """Not even by a worker restart that was in progress."""
+    manager = echo_manager
+    starts = _count_worker_starts(manager, monkeypatch)
+    original_stop_worker = manager._stop_worker
+    stopping = threading.Event()
+
+    def slow_stop_worker():
+        stopping.set()
+        time.sleep(0.5)
+        original_stop_worker()
+
+    monkeypatch.setattr(manager, "_stop_worker", slow_stop_worker)
+    restart = threading.Thread(target=manager._restart_worker, args=("test",))
+    restart.start()
+    assert stopping.wait(10)
+
+    manager.shutdown()
+    restart.join(10)
+
+    assert starts == []
+    assert not manager._worker_process.is_alive()
+    with pytest.raises(mscms_module.WCSManagerShutdownError):
+        manager._ensure_worker_alive()
+    assert starts == []
 
 
 # --- Worker process side ------------------------------------------------------

@@ -37,6 +37,7 @@ import contextlib
 import logging
 import multiprocessing
 import os
+import signal
 import sys
 import threading
 import uuid
@@ -454,6 +455,9 @@ class WCSManager:
         # Set by shutdown(): distinguishes closing for good from the brief
         # stop/start of a worker restart (when _shutdown_event is also set)
         self._closing = threading.Event()
+        # Makes shutdown() run once
+        self._shutdown_lock = Lock()
+        self._shutdown_started = False
         self._restarting = threading.Event()
         # Serializes worker restarts (separate from _lock, which _stop_worker
         # and _start_worker acquire themselves). Reentrant: a hung worker is
@@ -466,9 +470,11 @@ class WCSManager:
         self._restart_not_before = 0.0
         self._dead_worker_seen: None | Process = None
         # PID of the worker process that told us it is up (see
-        # worker_start_timeout), and the last worker process killed as hung
+        # worker_start_timeout), the last worker process killed as hung, and
+        # the last one terminated by us (see _terminated_at_exit)
         self._ready_worker_pid: None | int = None
         self._hung_worker: None | Process = None
+        self._killed_worker: None | Process = None
         self._wcs_calls_made = 0
 
         self._response_listener_thread: None | Thread = None
@@ -542,6 +548,9 @@ class WCSManager:
     def _restart_worker(self, reason: str, if_dead: bool = False) -> None:
         """Restart the worker process, unless the manager is shutting down.
 
+        Nor if the worker process was terminated at application exit (see
+        :meth:`_terminated_at_exit`).
+
         Args:
             reason (str): Why the worker is restarted (for the log).
             if_dead (bool, optional): Only restart the worker if it is not
@@ -555,9 +564,11 @@ class WCSManager:
                 deferred until its cooldown ends.
         """
         with self._restart_lock:
-            if self._closing.is_set():
-                return
             worker = self._worker_process
+            if self._closing.is_set() or (
+                worker is not None and self._terminated_at_exit(worker)
+            ):
+                return
             if if_dead:
                 if worker is None or worker.is_alive():
                     return
@@ -569,6 +580,9 @@ class WCSManager:
             self._restarting.set()
             try:
                 self._stop_worker()
+                if self._closing.is_set():
+                    # shutdown() was called meanwhile
+                    return
                 # Set before starting, so that a failure to start a worker
                 # that replaces a dead one also counts as a quick death
                 self._worker_restarted_after_death = if_dead
@@ -649,40 +663,103 @@ class WCSManager:
         Raises:
             WCSWorkerError: If the worker keeps dying and its restart is
                 deferred (see :meth:`_check_restart_cooldown`).
+            WCSManagerShutdownError: If the manager is shutting down, or the
+                worker process was terminated at application exit.
         """
         worker = self._worker_process
-        if worker is not None and not worker.is_alive():
-            self._restart_worker("worker not running", if_dead=True)
+        if worker is None or worker.is_alive():
+            return
+        self._shut_down_if_terminated_at_exit(worker)
+        self._restart_worker("worker not running", if_dead=True)
+        if self._closing.is_set():
+            raise WCSManagerShutdownError("WCSManager is set to shut down")
+
+    def _terminated_at_exit(self, worker: Process) -> bool:
+        """Whether the worker process was terminated on purpose, but not by us.
+
+        At application exit, main._exit() terminates all child processes, the
+        worker included, by Process.terminate(), which leaves the exit code
+        -SIGTERM (on Windows, too). A crash, or a kill by other means, leaves
+        another exit code, and we know the worker processes we terminate
+        ourselves (see :meth:`_terminate_worker`).
+
+        Args:
+            worker (Process): The worker process.
+
+        Returns:
+            bool: Whether it was terminated at application exit.
+        """
+        return worker.exitcode == -signal.SIGTERM and worker is not self._killed_worker
+
+    def _shut_down_if_terminated_at_exit(self, worker: Process) -> None:
+        """Shut down for good if the worker process was terminated at exit.
+
+        Restarting it would start a new worker process while the application
+        exits (one that nothing terminates anymore), and log the termination
+        as if the worker had crashed.
+
+        Args:
+            worker (Process): The worker process that is not running.
+
+        Raises:
+            WCSManagerShutdownError: If it was terminated at application exit.
+        """
+        if not self._terminated_at_exit(worker):
+            return
+        logger.info(
+            f"WCSWorker process PID {worker.pid} was terminated (exit code "
+            f"{_format_exitcode(worker.exitcode)}). Not restarting it"
+        )
+        self.shutdown()
+        raise WCSManagerShutdownError(
+            "WCSWorker process was terminated, WCSManager is shut down"
+        )
+
+    def _terminate_worker(self, worker: Process) -> None:
+        """Terminate a worker process, remembering that we terminated it.
+
+        Args:
+            worker (Process): The worker process.
+        """
+        self._killed_worker = worker
+        worker.terminate()
+        worker.join(timeout=worker_kill_timeout)
 
     def _stop_worker(self) -> None:
-        """Stop the worker process with timeout and forceful termination if needed."""
+        """Stop the worker process with timeout and forceful termination if needed.
+
+        Call with ``_restart_lock`` held. ``_lock`` is not held while waiting
+        for the worker process to exit, so that callers waiting for a response
+        (and the response listener) are not blocked meanwhile.
+        """
         with self._lock:
-            if not self._worker_process or not self._worker_process.is_alive():
-                logger.debug("Worker is not running")
-                return
+            worker = self._worker_process
+            request_queue = self._request_queue
+        if not worker or not worker.is_alive():
+            logger.debug("Worker is not running")
+            return
 
-            logger.info("Sending shutdown signal to WCSWorker")
-            try:
-                # Poison Pill
-                self._request_queue.put(None)
-            except Exception as e:
-                logger.error(f"Failed to send shutdown signal: {e}")
+        logger.info("Sending shutdown signal to WCSWorker")
+        try:
+            # Poison Pill
+            request_queue.put(None)
+        except Exception as e:
+            logger.error(f"Failed to send shutdown signal: {e}")
 
-            # Waiting for process completion
-            self._worker_process.join(timeout=5.0)
-            if self._worker_process.is_alive():
-                logger.warning(
-                    "WCSWorker did not terminate gracefully, terminating forcefully."
-                )
-                self._worker_process.terminate()
-                self._worker_process.join(timeout=2.0)
+        # Waiting for process completion
+        worker.join(timeout=5.0)
+        if worker.is_alive():
+            logger.warning(
+                "WCSWorker did not terminate gracefully, terminating forcefully."
+            )
+            self._terminate_worker(worker)
 
-            if self._worker_process.is_alive():
-                logger.error("Failed to terminate WCSWorker process")
-            else:
-                logger.info("WCSWorker process terminated")
+        if worker.is_alive():
+            logger.error("Failed to terminate WCSWorker process")
+        else:
+            logger.info("WCSWorker process terminated")
 
-            self._shutdown_event.set()  # Closing down listener and call functionality
+        self._shutdown_event.set()  # Closing down listener and call functionality
 
     def _handle_check_worker(self) -> None:
         logger.debug("Performing worker process open handle check")
@@ -763,7 +840,7 @@ class WCSManager:
         event: threading.Event,
         worker: None | Process,
         request_queue: Queue[RequestType | None],
-    ) -> Literal["response", "timeout", "worker died", "request lost"]:
+    ) -> Literal["response", "timeout", "worker died", "request lost", "shutdown"]:
         """Wait for the response to a request, noticing a dead worker early.
 
         Args:
@@ -777,7 +854,8 @@ class WCSManager:
                 arrive within ``request_timeout`` seconds, "worker died" if
                 the worker process died without answering, "request lost" if
                 the request queue was replaced (along with a crashed worker)
-                before our request was read.
+                before our request was read, "shutdown" if the manager is
+                shutting down (it won't deliver the response anymore).
         """
         deadline = monotonic() + self.request_timeout
         while True:
@@ -786,6 +864,8 @@ class WCSManager:
                 return "timeout"
             if event.wait(min(remaining, worker_liveness_check_interval)):
                 return "response"
+            if self._closing.is_set():
+                return "shutdown"
             if self._restarting.is_set():
                 # Another thread is restarting the worker: see what we get
                 continue
@@ -842,8 +922,10 @@ class WCSManager:
                 restarted (retried).
             WCSManagerShutdownError: If the manager is shutting down.
         """
+        if self._closing.is_set():
+            raise WCSManagerShutdownError("WCSManager is set to shut down")
         if self._shutdown_event.is_set():
-            if self._restarting.is_set() and not self._closing.is_set():
+            if self._restarting.is_set():
                 raise WCSManagerRestartingError("WCSWorker process is restarting")
             raise WCSManagerShutdownError("WCSManager is set to shut down")
 
@@ -911,8 +993,13 @@ class WCSManager:
             WCSWorkerError: If the response did not arrive in time, the worker
                 process hung and its restart is deferred (or it could not be
                 killed).
+            WCSManagerShutdownError: If the manager is shutting down, or the
+                worker process was terminated at application exit.
         """
+        if outcome == "shutdown" or self._closing.is_set():
+            raise WCSManagerShutdownError("WCSManager is set to shut down")
         if outcome == "worker died":
+            self._shut_down_if_terminated_at_exit(worker)
             raise WCSWorkerDiedError(
                 f"WCSWorker process PID {worker.pid} exited (exit code "
                 f"{_format_exitcode(worker.exitcode)}) before answering "
@@ -954,8 +1041,7 @@ class WCSManager:
                 f"{request_id} within {self.request_timeout:g} s. Killing it"
             )
             self._hung_worker = worker
-            worker.terminate()
-            worker.join(timeout=worker_kill_timeout)
+            self._terminate_worker(worker)
             if worker.is_alive():
                 raise WCSWorkerError(
                     f"WCSWorker process PID {worker.pid} hung and could not be killed"
@@ -1028,12 +1114,20 @@ class WCSManager:
         raise exc_class(f"{error_type}: {error_message}")
 
     def shutdown(self) -> None:
-        """Shutdowns the worker process and listener thread."""
-        if self._closing.is_set():
-            logger.debug("WCSManager is already set to shut down")
-            return
-        logger.info("Shutting down WCSManager...")
+        """Shut down the worker process and the listener threads, for good.
+
+        Idempotent and final: afterwards, no worker process is started again,
+        and every call raises WCSManagerShutdownError at once (as do calls
+        that are waiting for a response when it is called).
+        """
+        # Refuse calls and worker restarts from now on
         self._closing.set()
+        with self._shutdown_lock:
+            if self._shutdown_started:
+                logger.debug("WCSManager is already shut down")
+                return
+            self._shutdown_started = True
+        logger.info("Shutting down WCSManager...")
 
         # Let a worker restart in progress finish first
         with self._restart_lock:
@@ -1042,13 +1136,18 @@ class WCSManager:
             logger.debug("Stopping worker process and threads")
             self._stop_worker()
 
-        if self._response_listener_thread and self._response_listener_thread.is_alive():
-            self._response_listener_thread.join(timeout=2.0)
+        listener_thread = self._response_listener_thread
+        if (
+            listener_thread is not None
+            and listener_thread is not threading.current_thread()
+            and listener_thread.is_alive()
+        ):
+            listener_thread.join(timeout=2.0)
         logger.info("WCSManager shut down complete")
 
     def _atexit_shutdown(self) -> None:
         """Shutdown handler for atexit to ensure cleanup on normal interpreter exit."""
-        if not self._closing.is_set():
+        if not self._shutdown_started:
             logger.info("WCSManager: atexit triggered shutdown")
             self.shutdown()
 
@@ -1347,6 +1446,16 @@ class WCSManagerProxy:
         """Ensure instance exists before getting attributes."""
         self._ensure_instance()
         return getattr(WCSManagerProxy._instance, name)
+
+    def shutdown(self) -> None:
+        """Shut down the WCSManager for good, if one was started.
+
+        Unlike any other attribute, this doesn't start a WCSManager (and its
+        worker process) that doesn't exist yet, e.g. at application exit.
+        """
+        instance = WCSManagerProxy._instance
+        if instance is not None:
+            instance.shutdown()
 
     def __setattr__(self, name: str, value: Any) -> None:  # noqa: ANN401
         """Ensure instance exists before setting attributes."""
