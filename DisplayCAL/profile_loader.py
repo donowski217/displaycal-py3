@@ -1410,7 +1410,7 @@ class PLFrame(BaseFrame):
         ):
             if (
                 not ("--force" in sys.argv[1:] or len(data) == 2)
-                and calibration_management_isenabled()
+                and self.pl._calibration_management_isenabled()
             ):
                 return lang.getstr("calibration.load.handled_by_os")
             if (
@@ -1507,12 +1507,15 @@ class TaskBarIcon(SysTrayIcon):
             restore_auto = restore_manual = reset = None
         else:
             restore_manual = self.pl._set_manual_restore
-            if "--force" in sys.argv[1:] or calibration_management_isenabled():
+            if "--force" in sys.argv[1:] or self.pl._calibration_management_isenabled():
                 restore_auto = None
             else:
                 restore_auto = self.set_auto_restore
             reset = self.pl._set_reset_gamma_ramps
-        if "--force" not in sys.argv[1:] and calibration_management_isenabled():
+        if (
+            "--force" not in sys.argv[1:]
+            and self.pl._calibration_management_isenabled()
+        ):
             restore_auto_kind = apply_kind = wx.ITEM_NORMAL
         else:
             if config.getcfg("profile.load_on_login"):
@@ -2085,6 +2088,10 @@ class ProfileLoader:
         self.use_madhcnet = bool(config.getcfg("profile_loader.use_madhcnet"))
         self._has_display_changed = False
         self._last_exception_args = ()
+        # Last known Windows calibration management state and WCS query error,
+        # see _calibration_management_isenabled()
+        self._calibration_management_state = None
+        self._last_wcs_error = None
         self._shutdown = False
         self._skip = "--skip" in sys.argv[1:]
         apply_profiles = bool(
@@ -2124,7 +2131,7 @@ class ProfileLoader:
             sys.platform == "win32"
             and "--force" not in sys.argv[1:]
             and sys.getwindowsversion() >= (6, 1)
-            and calibration_management_isenabled()
+            and self._calibration_management_isenabled()
         ):
             # Incase calibration loading is handled by Windows 7 and
             # isn't forced
@@ -2852,7 +2859,7 @@ class ProfileLoader:
             and self.frame
             and event.GetEventType() == wx.EVT_MENU.typeId
             and (
-                not calibration_management_isenabled()
+                not self._calibration_management_isenabled()
                 or config.getcfg("profile_loader.fix_profile_associations")
             )
         ):
@@ -2903,7 +2910,10 @@ class ProfileLoader:
         Returns:
             str: The notification body text.
         """
-        if "--force" not in sys.argv[1:] and calibration_management_isenabled():
+        if (
+            "--force" not in sys.argv[1:]
+            and self._calibration_management_isenabled()
+        ):
             text = lang.getstr("calibration.load.handled_by_os") + "\n"
         else:
             text = ""
@@ -5013,7 +5023,9 @@ class ProfileLoader:
                     enable_per_user_profiles(devicekey=devicekey)
                 set_display_profile(profile, devicekey=devicekey)
                 unset_display_profile(current_profile, devicekey=devicekey)
-            except OSError as exception:
+            except Exception as exception:
+                # Not only OSError: the WCS worker process IPC can also raise
+                # e.g. TimeoutError, RuntimeError, ValueError or WCSError
                 print(exception)
 
     def _set_display_profiles(self, dry_run: bool = False) -> None:
@@ -5162,7 +5174,9 @@ class ProfileLoader:
                 set_display_profile(
                     os.path.basename(correct_profile), devicekey=device.DeviceKey
                 )
-            except OSError as exception:
+            except Exception as exception:
+                # Not only OSError: the WCS worker process IPC can also raise
+                # e.g. TimeoutError, RuntimeError, ValueError or WCSError
                 print(exception)
             else:
                 self._fixed_profile_associations.add(device.DeviceKey)
@@ -5316,11 +5330,41 @@ class ProfileLoader:
                     config.getcfg("profile.load_on_login")
                     and (
                         sys.platform != "win32"
-                        or not calibration_management_isenabled()
+                        or not self._calibration_management_isenabled()
                     )
                 )
             )
         )
+
+    def _calibration_management_isenabled(self) -> bool:
+        """Return whether Windows manages display calibration. Never raises.
+
+        The state is queried from the WCS worker process. If that fails (e.g.
+        the worker process is stalled, dead or being restarted), the error is
+        printed and the last known state is returned, so a WCS problem can
+        neither kill the display configuration monitoring thread nor raise
+        into the GUI. On the GUI thread, the last known state (refreshed by
+        the monitoring thread every few seconds) is returned right away
+        instead of waiting for the worker process, so a stalled worker cannot
+        freeze the tray icon or menu either.
+
+        Returns:
+            bool: True if Windows calibration management is enabled.
+        """
+        state = getattr(self, "_calibration_management_state", None)
+        if state is not None and self._is_gui_thread():
+            return state
+        try:
+            state = bool(calibration_management_isenabled())
+        except Exception as exception:
+            error = f"{exception.__class__.__name__}: {exception}"
+            if error != getattr(self, "_last_wcs_error", None):
+                self._last_wcs_error = error
+                print("Could not query Windows calibration management state:", error)
+            return bool(getattr(self, "_calibration_management_state", None))
+        self._calibration_management_state = state
+        self._last_wcs_error = None
+        return state
 
     def _toggle_fix_profile_associations(
         self, event: wx.Event, parent: wx.Window = None

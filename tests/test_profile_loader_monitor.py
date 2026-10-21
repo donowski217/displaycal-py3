@@ -668,3 +668,122 @@ def test_forced_shutdown_shuts_down_before_closing_frame(monkeypatch):
         "close_frame",
     ]
     assert harness.events[-1] == ("close_frame", True)
+
+
+# --- WCS worker process IPC failures ----------------------------------------
+
+
+def _in_thread(func):
+    """Run ``func`` on a non-GUI thread and return its result (or raise)."""
+    thread, outcome = _run_in_monitor_thread(func)
+    thread.join(10)
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["result"]
+
+
+def test_calibration_management_state_survives_wcs_errors(monkeypatch, capsys):
+    pl = _make_pl()
+    answers = iter([True, TimeoutError("timed out"), TimeoutError("timed out")])
+
+    def calibration_management_isenabled():
+        answer = next(answers)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(
+        profile_loader,
+        "calibration_management_isenabled",
+        calibration_management_isenabled,
+    )
+
+    assert _in_thread(pl._calibration_management_isenabled) is True
+    # Worker stalled: the last known state is returned, the error logged once
+    assert _in_thread(pl._calibration_management_isenabled) is True
+    assert _in_thread(pl._calibration_management_isenabled) is True
+    assert capsys.readouterr().out.count("TimeoutError: timed out") == 1
+
+
+def test_calibration_management_state_on_gui_thread_does_not_block(monkeypatch):
+    pl = _make_pl()
+    pl._calibration_management_state = True
+
+    def calibration_management_isenabled():
+        raise AssertionError("the GUI thread must not wait for the WCS worker")
+
+    monkeypatch.setattr(
+        profile_loader,
+        "calibration_management_isenabled",
+        calibration_management_isenabled,
+    )
+
+    assert pl._calibration_management_isenabled() is True
+
+
+def test_should_apply_profiles_survives_wcs_timeout(monkeypatch):
+    pl = _make_pl()
+    pl._skip = False
+    pl._manual_restore = False
+    pl._is_other_running = lambda enumerate_windows_and_processes=True: False
+    pl._is_displaycal_running = lambda: False
+    monkeypatch.setattr(profile_loader.config, "getcfg", lambda name, *args: 1)
+
+    def calibration_management_isenabled():
+        raise TimeoutError("Timeout waiting for response to request")
+
+    monkeypatch.setattr(
+        profile_loader,
+        "calibration_management_isenabled",
+        calibration_management_isenabled,
+    )
+
+    assert _in_thread(pl._should_apply_profiles) is True
+
+
+class _FakeDevice:
+    def __init__(self, devicekey):
+        self.DeviceKey = devicekey
+        self.DeviceID = devicekey
+
+
+def _wcs_write_fails(*args, **kwargs):
+    raise ValueError("WCSWorkerError: unexpected error in worker")
+
+
+def test_set_active_profile_survives_wcs_errors(monkeypatch):
+    pl = _make_pl()
+    device = _FakeDevice("key0")
+    pl.devices2profiles = {"key0": (("Display 1",), "wrong.icc", "Wrong")}
+    pl._fixed_profile_associations = set()
+    monkeypatch.setattr(
+        profile_loader, "get_display_profile", lambda **kwargs: r"C:\x\right.icc"
+    )
+    monkeypatch.setattr(profile_loader, "is_superuser", lambda: True)
+    monkeypatch.setattr(profile_loader, "set_display_profile", _wcs_write_fails)
+
+    pl._set_active_profile(device, "Display 1", [device])
+
+    assert pl._fixed_profile_associations == set()
+
+
+def test_reset_display_profile_associations_survives_wcs_errors(monkeypatch):
+    pl = _make_pl()
+    pl._can_fix_profile_associations = lambda: True
+    pl.devices2profiles = {"key0": (("Display 1",), "right.icc", "Right")}
+    pl._fixed_profile_associations = {"key0"}
+    monkeypatch.setattr(
+        profile_loader, "get_display_profile", lambda **kwargs: r"C:\x\other.icc"
+    )
+    monkeypatch.setattr(profile_loader, "is_superuser", lambda: True)
+    monkeypatch.setattr(profile_loader, "set_display_profile", _wcs_write_fails)
+    unset_calls = []
+    monkeypatch.setattr(
+        profile_loader,
+        "unset_display_profile",
+        lambda *args, **kwargs: unset_calls.append(args),
+    )
+
+    pl._reset_display_profile_associations()
+
+    assert unset_calls == []
