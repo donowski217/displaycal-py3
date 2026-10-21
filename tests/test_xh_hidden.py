@@ -10,6 +10,8 @@ No window is ever shown: the controls are created inside a frame that is
 never ``Show()``-n and is destroyed at the end of the test.
 """
 
+from collections.abc import Iterator
+
 import pytest
 
 wx = pytest.importorskip("wx")
@@ -86,14 +88,37 @@ def _build_xrc() -> bytes:
     ).encode("utf-8")
 
 
+@pytest.fixture(scope="session")
+def _wx_app_session() -> wx.App:
+    """Keep one wx.App alive for the rest of the test session.
+
+    Never let a wx.App that has created a window go away mid-session: wx
+    then leaves its hidden display window (created when the frame queries
+    the display) behind with a dangling window procedure, and the next test
+    that pumps Win32 messages on this thread (e.g. test_systrayicon's
+    teardown) dies with an access violation, taking the whole pytest process
+    with it.
+
+    Returns:
+        wx.App: The application object (an existing one if there is one).
+    """
+    return wx.GetApp() or wx.App()
+
+
 @pytest.fixture
-def wx_app():
+def wx_app(_wx_app_session: wx.App) -> Iterator[wx.App]:
     """Provide a wx.App with wx log output routed to stderr (never a dialog).
+
+    The app itself is session-scoped (see _wx_app_session); only the log
+    target is swapped per test.
+
+    Args:
+        _wx_app_session (wx.App): The session's application object.
 
     Yields:
         wx.App: The application object.
     """
-    app = wx.GetApp() or wx.App()
+    app = _wx_app_session
     # An XRC error would otherwise pop up a modal wxLogError dialog.
     old_target = wx.Log.SetActiveTarget(wx.LogStderr())
     try:
