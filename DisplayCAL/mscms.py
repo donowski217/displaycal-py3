@@ -36,6 +36,8 @@ import builtins
 import contextlib
 import logging
 import multiprocessing
+import os
+import signal
 import sys
 import threading
 import uuid
@@ -43,12 +45,13 @@ from functools import wraps
 from logging.handlers import QueueHandler, QueueListener
 from multiprocessing import Process, Queue
 from queue import Empty
-from threading import Lock, Thread
+from threading import Lock, RLock, Thread
 from time import monotonic, sleep
 from typing import (
     Any,
     Callable,
     Literal,
+    NoReturn,
     TextIO,
     TypeVar,
     Union,
@@ -146,6 +149,7 @@ class _DispatchToLogger(logging.Handler):
         """
         logging.getLogger(record.name).handle(record)
 
+
 check_handles_call_num = 100  # check leaking handles every <num> of calls
 open_handles_threshold = 3000  # worker process open handle limit
 
@@ -162,6 +166,17 @@ worker_restart_cooldown_max = 300.0
 # sent right before dying
 worker_liveness_check_interval = 0.1
 worker_death_grace = 0.25
+# A worker process that is alive but does not answer a request within the
+# request timeout is hung (e.g. in a WCS call that never returns): it is killed
+# and then restarted like a dead one. Unless it has not told us yet that it is
+# up: then it may just be slow to start (e.g. at logon), which is allowed for
+# this many seconds.
+worker_start_timeout = 30.0
+# Wait at most this long for a killed worker process to exit
+worker_kill_timeout = 2.0
+# Wait at most this long for the worker log listener to stop at shutdown (it
+# may never, e.g. if a worker process was killed while writing a record)
+log_listener_stop_timeout = 2.0
 
 FILE_NOT_FOUND_ERRNO = 2
 
@@ -200,6 +215,16 @@ class FailureResponseType(TypedDict):
 
 
 ResponseType = Union[SuccessResponseType, FailureResponseType]
+
+
+class ReadyMessageType(TypedDict):
+    """Sent by the worker process once it is up and reads requests."""
+
+    type: Literal["worker_ready"]
+    pid: int
+
+
+WorkerMessageType = Union[ResponseType, ReadyMessageType]
 
 
 class PendingType(TypedDict):
@@ -305,7 +330,7 @@ def retry(
 
 def _wcs_worker_process(
     request_queue: Queue[RequestType | None],
-    response_queue: Queue[ResponseType],
+    response_queue: Queue[WorkerMessageType],
     log_queue: Queue[Any],
 ) -> None:
     wcs_instance = None
@@ -322,6 +347,10 @@ def _wcs_worker_process(
     try:
         wcs_instance = WCS()
         logger.debug("WCS instance initialized in worker")
+        # Tell the manager that we are up, so that it does not mistake a slow
+        # start for a hang (see worker_start_timeout)
+        ready: ReadyMessageType = {"type": "worker_ready", "pid": os.getpid()}
+        response_queue.put(ready)
 
         while True:
             try:
@@ -402,7 +431,9 @@ class WCSManager:
         handle_threshold (int, optional): Maximum open handles limit.
             Defaults to 10000.
         request_timeout (float, optional): Timeout for an individual request
-            (note the retry logic and compound requests). Defaults to 10.0.
+            (note the retry logic and compound requests). A worker process
+            that does not answer within it is killed and replaced (see
+            worker_start_timeout). Defaults to 10.0.
     """
 
     def __init__(
@@ -427,16 +458,26 @@ class WCSManager:
         # Set by shutdown(): distinguishes closing for good from the brief
         # stop/start of a worker restart (when _shutdown_event is also set)
         self._closing = threading.Event()
+        # Makes shutdown() run once
+        self._shutdown_lock = Lock()
+        self._shutdown_started = False
         self._restarting = threading.Event()
         # Serializes worker restarts (separate from _lock, which _stop_worker
-        # and _start_worker acquire themselves)
-        self._restart_lock = Lock()
+        # and _start_worker acquire themselves). Reentrant: a hung worker is
+        # killed and restarted while holding it.
+        self._restart_lock = RLock()
         # Dead worker restart circuit breaker (see worker_restart_window)
         self._worker_started_at = 0.0
         self._worker_restarted_after_death = False
         self._restart_cooldown = 0.0
         self._restart_not_before = 0.0
         self._dead_worker_seen: None | Process = None
+        # PID of the worker process that told us it is up (see
+        # worker_start_timeout), the last worker process killed as hung, and
+        # the last one terminated by us (see _terminated_at_exit)
+        self._ready_worker_pid: None | int = None
+        self._hung_worker: None | Process = None
+        self._killed_worker: None | Process = None
         self._wcs_calls_made = 0
 
         self._response_listener_thread: None | Thread = None
@@ -469,6 +510,8 @@ class WCSManager:
                 self._replace_request_queue()
 
             self._shutdown_event.clear()
+            # The new worker process has not told us yet that it is up
+            self._ready_worker_pid = None
 
             self._worker_process = multiprocessing.Process(
                 target=_wcs_worker_process,
@@ -508,6 +551,9 @@ class WCSManager:
     def _restart_worker(self, reason: str, if_dead: bool = False) -> None:
         """Restart the worker process, unless the manager is shutting down.
 
+        Nor if the worker process was terminated at application exit (see
+        :meth:`_terminated_at_exit`).
+
         Args:
             reason (str): Why the worker is restarted (for the log).
             if_dead (bool, optional): Only restart the worker if it is not
@@ -521,16 +567,15 @@ class WCSManager:
                 deferred until its cooldown ends.
         """
         with self._restart_lock:
-            if self._closing.is_set():
-                return
             worker = self._worker_process
+            if self._closing.is_set() or (
+                worker is not None and self._terminated_at_exit(worker)
+            ):
+                return
             if if_dead:
                 if worker is None or worker.is_alive():
                     return
-                reason = (
-                    f"WCSWorker process PID {worker.pid} is not running, exit "
-                    f"code {_format_exitcode(worker.exitcode)}"
-                )
+                reason = self._dead_worker_reason(worker)
                 self._check_restart_cooldown(worker, reason)
                 logger.error(f"{reason}. Restarting it")
             else:
@@ -538,6 +583,9 @@ class WCSManager:
             self._restarting.set()
             try:
                 self._stop_worker()
+                if self._closing.is_set():
+                    # shutdown() was called meanwhile
+                    return
                 # Set before starting, so that a failure to start a worker
                 # that replaces a dead one also counts as a quick death
                 self._worker_restarted_after_death = if_dead
@@ -546,14 +594,30 @@ class WCSManager:
                 self._restarting.clear()
             logger.info("WCSWorker restarted successfully")
 
+    def _dead_worker_reason(self, worker: Process) -> str:
+        """Describe what happened to a worker process that is not running.
+
+        Args:
+            worker (Process): The worker process.
+
+        Returns:
+            str: The description (for the log and errors).
+        """
+        if worker is self._hung_worker:
+            return f"WCSWorker process PID {worker.pid} hung and was killed"
+        return (
+            f"WCSWorker process PID {worker.pid} is not running, exit code "
+            f"{_format_exitcode(worker.exitcode)}"
+        )
+
     def _check_restart_cooldown(self, worker: Process, reason: str) -> None:
         """Defer restarting a dead worker process that keeps dying.
 
         Call with ``_restart_lock`` held. If the worker was itself started to
-        replace a dead one and died within ``worker_restart_window`` seconds
-        (e.g. it crashes on start, security software blocks it, or one
-        specific call crashes it), the next restart waits for a cooldown. The
-        cooldown doubles with every such failure, up to
+        replace a dead one and died (or hung) within ``worker_restart_window``
+        seconds (e.g. it crashes on start, security software blocks it, or one
+        specific call crashes it or never returns), the next restart waits for
+        a cooldown. The cooldown doubles with every such failure, up to
         ``worker_restart_cooldown_max``, and is reset when a worker lives
         longer. Without this, such a worker would be respawned every few
         seconds, forever, and every call would wait for it in vain.
@@ -571,6 +635,10 @@ class WCSManager:
             # First time we notice that this worker process died
             self._dead_worker_seen = worker
             lifetime = now - self._worker_started_at
+            if worker is self._hung_worker:
+                # It stopped answering (at least) a request timeout before it
+                # was killed
+                lifetime -= self.request_timeout
             if self._worker_restarted_after_death and lifetime < worker_restart_window:
                 self._restart_cooldown = min(
                     max(self._restart_cooldown * 2, worker_restart_cooldown_initial),
@@ -598,40 +666,103 @@ class WCSManager:
         Raises:
             WCSWorkerError: If the worker keeps dying and its restart is
                 deferred (see :meth:`_check_restart_cooldown`).
+            WCSManagerShutdownError: If the manager is shutting down, or the
+                worker process was terminated at application exit.
         """
         worker = self._worker_process
-        if worker is not None and not worker.is_alive():
-            self._restart_worker("worker not running", if_dead=True)
+        if worker is None or worker.is_alive():
+            return
+        self._shut_down_if_terminated_at_exit(worker)
+        self._restart_worker("worker not running", if_dead=True)
+        if self._closing.is_set():
+            raise WCSManagerShutdownError("WCSManager is set to shut down")
+
+    def _terminated_at_exit(self, worker: Process) -> bool:
+        """Whether the worker process was terminated on purpose, but not by us.
+
+        At application exit, main._exit() terminates all child processes, the
+        worker included, by Process.terminate(), which leaves the exit code
+        -SIGTERM (on Windows, too). A crash, or a kill by other means, leaves
+        another exit code, and we know the worker processes we terminate
+        ourselves (see :meth:`_terminate_worker`).
+
+        Args:
+            worker (Process): The worker process.
+
+        Returns:
+            bool: Whether it was terminated at application exit.
+        """
+        return worker.exitcode == -signal.SIGTERM and worker is not self._killed_worker
+
+    def _shut_down_if_terminated_at_exit(self, worker: Process) -> None:
+        """Shut down for good if the worker process was terminated at exit.
+
+        Restarting it would start a new worker process while the application
+        exits (one that nothing terminates anymore), and log the termination
+        as if the worker had crashed.
+
+        Args:
+            worker (Process): The worker process that is not running.
+
+        Raises:
+            WCSManagerShutdownError: If it was terminated at application exit.
+        """
+        if not self._terminated_at_exit(worker):
+            return
+        logger.info(
+            f"WCSWorker process PID {worker.pid} was terminated (exit code "
+            f"{_format_exitcode(worker.exitcode)}). Not restarting it"
+        )
+        self.shutdown()
+        raise WCSManagerShutdownError(
+            "WCSWorker process was terminated, WCSManager is shut down"
+        )
+
+    def _terminate_worker(self, worker: Process) -> None:
+        """Terminate a worker process, remembering that we terminated it.
+
+        Args:
+            worker (Process): The worker process.
+        """
+        self._killed_worker = worker
+        worker.terminate()
+        worker.join(timeout=worker_kill_timeout)
 
     def _stop_worker(self) -> None:
-        """Stop the worker process with timeout and forceful termination if needed."""
+        """Stop the worker process with timeout and forceful termination if needed.
+
+        Call with ``_restart_lock`` held. ``_lock`` is not held while waiting
+        for the worker process to exit, so that callers waiting for a response
+        (and the response listener) are not blocked meanwhile.
+        """
         with self._lock:
-            if not self._worker_process or not self._worker_process.is_alive():
-                logger.debug("Worker is not running")
-                return
+            worker = self._worker_process
+            request_queue = self._request_queue
+        if not worker or not worker.is_alive():
+            logger.debug("Worker is not running")
+            return
 
-            logger.info("Sending shutdown signal to WCSWorker")
-            try:
-                # Poison Pill
-                self._request_queue.put(None)
-            except Exception as e:
-                logger.error(f"Failed to send shutdown signal: {e}")
+        logger.info("Sending shutdown signal to WCSWorker")
+        try:
+            # Poison Pill
+            request_queue.put(None)
+        except Exception as e:
+            logger.error(f"Failed to send shutdown signal: {e}")
 
-            # Waiting for process completion
-            self._worker_process.join(timeout=5.0)
-            if self._worker_process.is_alive():
-                logger.warning(
-                    "WCSWorker did not terminate gracefully, terminating forcefully."
-                )
-                self._worker_process.terminate()
-                self._worker_process.join(timeout=2.0)
+        # Waiting for process completion
+        worker.join(timeout=5.0)
+        if worker.is_alive():
+            logger.warning(
+                "WCSWorker did not terminate gracefully, terminating forcefully."
+            )
+            self._terminate_worker(worker)
 
-            if self._worker_process.is_alive():
-                logger.error("Failed to terminate WCSWorker process")
-            else:
-                logger.info("WCSWorker process terminated")
+        if worker.is_alive():
+            logger.error("Failed to terminate WCSWorker process")
+        else:
+            logger.info("WCSWorker process terminated")
 
-            self._shutdown_event.set()  # Closing down listener and call functionality
+        self._shutdown_event.set()  # Closing down listener and call functionality
 
     def _handle_check_worker(self) -> None:
         logger.debug("Performing worker process open handle check")
@@ -655,8 +786,7 @@ class WCSManager:
 
         if num_handles > self.handle_threshold:
             self._restart_worker(
-                "Open handle number exceeded: "
-                f"{num_handles}>{self.handle_threshold}"
+                f"Open handle number exceeded: {num_handles}>{self.handle_threshold}"
             )
         else:
             logger.debug(f"Current child process open handles: {num_handles}")
@@ -676,33 +806,44 @@ class WCSManager:
                     logger.error(f"Error getting response from queue: {e}")
                 continue
 
-            # Regular path
-            request_id = response.get("id")
-            logger.debug(f"Received response for request ID {request_id}")
-
-            with self._lock:
-                if request_id in self._pending_requests:
-                    req_data = self._pending_requests.pop(request_id)
-                    event = req_data.get("event")
-                    if event:
-                        req_data["result"] = response.get("result")
-                        if "error" in response:
-                            req_data["error"] = response.get("error")
-                        self._pending_requests[request_id] = req_data
-                        event.set()  # signal _call_wcs_method
-                else:
-                    logger.warning(
-                        f"Received response for unknown request ID {request_id}"
-                    )
+            self._handle_response(response)
 
         logger.debug("Response listener thread loop finished")
+
+    def _handle_response(self, response: WorkerMessageType) -> None:
+        """Hand a message from the worker process to the waiting caller.
+
+        Args:
+            response (WorkerMessageType): The message.
+        """
+        if response.get("type") == "worker_ready":
+            self._ready_worker_pid = response.get("pid")
+            logger.debug(f"WCSWorker process PID {self._ready_worker_pid} is up")
+            return
+
+        # Regular path
+        request_id = response.get("id")
+        logger.debug(f"Received response for request ID {request_id}")
+
+        with self._lock:
+            if request_id in self._pending_requests:
+                req_data = self._pending_requests.pop(request_id)
+                event = req_data.get("event")
+                if event:
+                    req_data["result"] = response.get("result")
+                    if "error" in response:
+                        req_data["error"] = response.get("error")
+                    self._pending_requests[request_id] = req_data
+                    event.set()  # signal _call_wcs_method
+            else:
+                logger.warning(f"Received response for unknown request ID {request_id}")
 
     def _wait_for_response(
         self,
         event: threading.Event,
         worker: None | Process,
         request_queue: Queue[RequestType | None],
-    ) -> Literal["response", "timeout", "worker died", "request lost"]:
+    ) -> Literal["response", "timeout", "worker died", "request lost", "shutdown"]:
         """Wait for the response to a request, noticing a dead worker early.
 
         Args:
@@ -716,7 +857,8 @@ class WCSManager:
                 arrive within ``request_timeout`` seconds, "worker died" if
                 the worker process died without answering, "request lost" if
                 the request queue was replaced (along with a crashed worker)
-                before our request was read.
+                before our request was read, "shutdown" if the manager is
+                shutting down (it won't deliver the response anymore).
         """
         deadline = monotonic() + self.request_timeout
         while True:
@@ -725,6 +867,8 @@ class WCSManager:
                 return "timeout"
             if event.wait(min(remaining, worker_liveness_check_interval)):
                 return "response"
+            if self._closing.is_set():
+                return "shutdown"
             if self._restarting.is_set():
                 # Another thread is restarting the worker: see what we get
                 continue
@@ -749,11 +893,7 @@ class WCSManager:
         )
     )
     def _call_wcs_method(self, method_name: str, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
-        if self._shutdown_event.is_set():
-            if self._restarting.is_set() and not self._closing.is_set():
-                raise WCSManagerRestartingError("WCSWorker process is restarting")
-            raise WCSManagerShutdownError("WCSManager is set to shut down")
-
+        self._check_accepting_calls()
         self._ensure_worker_alive()
 
         request_id = str(uuid.uuid4())
@@ -763,7 +903,51 @@ class WCSManager:
             "args": args,
             "kwargs": kwargs,
         }
+        event, worker, request_queue = self._send_request(request)
 
+        # Waiting for an answer to be received
+        outcome = self._wait_for_response(event, worker, request_queue)
+        with self._lock:
+            req_data = self._pending_requests.pop(request_id, {})
+            logger.debug(
+                f"Request ID {request_id} removed from pending requests: "
+                + ("success" if outcome == "response" else outcome)
+            )
+        if outcome != "response":
+            self._raise_for_outcome(outcome, worker, request_id)
+        return self._response_result(req_data)
+
+    def _check_accepting_calls(self) -> None:
+        """Raise if no call can be made to the worker process now.
+
+        Raises:
+            WCSManagerRestartingError: If the worker process is being
+                restarted (retried).
+            WCSManagerShutdownError: If the manager is shutting down.
+        """
+        if self._closing.is_set():
+            raise WCSManagerShutdownError("WCSManager is set to shut down")
+        if self._shutdown_event.is_set():
+            if self._restarting.is_set():
+                raise WCSManagerRestartingError("WCSWorker process is restarting")
+            raise WCSManagerShutdownError("WCSManager is set to shut down")
+
+    def _send_request(
+        self, request: RequestType
+    ) -> tuple[threading.Event, None | Process, Queue[RequestType | None]]:
+        """Register a request as pending and send it to the worker process.
+
+        Args:
+            request (RequestType): The request.
+
+        Raises:
+            RuntimeError: If the request could not be sent.
+
+        Returns:
+            tuple: The event that is set when the response has arrived, the
+                worker process and the request queue the request was sent to.
+        """
+        request_id = request["id"]
         event = threading.Event()
         with self._lock:
             logger.debug(f"Request ID {request_id} added to the pending requests")
@@ -773,7 +957,7 @@ class WCSManager:
         request_queue = self._request_queue
         try:
             request_queue.put(request)
-            logger.debug(f"Sent request ID {request_id} for method {method_name}")
+            logger.debug(f"Sent request ID {request_id} for method {request['method']}")
         except Exception as e:
             with self._lock:
                 self._pending_requests.pop(request_id, None)
@@ -790,66 +974,163 @@ class WCSManager:
                 logger.debug("Worker process open handle check triggered")
                 # Launch in other thread to not block the listener
                 threading.Thread(target=self._handle_check_worker, daemon=True).start()
+        return event, worker, request_queue
 
-        # Waiting for an answer to be received
-        outcome = self._wait_for_response(event, worker, request_queue)
-        if outcome != "response":
-            with self._lock:
-                self._pending_requests.pop(request_id, None)
-                logger.debug(
-                    f"Request ID {request_id} removed from pending requests: "
-                    f"{outcome}"
-                )
-            if outcome == "worker died":
-                raise WCSWorkerDiedError(
-                    f"WCSWorker process PID {worker.pid} exited (exit code "
-                    f"{_format_exitcode(worker.exitcode)}) before answering "
-                    f"request {request_id}"
-                )
-            if outcome == "request lost":
-                raise WCSWorkerDiedError(
-                    f"Request {request_id} was lost in a WCSWorker process restart"
-                )
-            raise TimeoutError(f"Timeout waiting for response to request {request_id}")
+    def _raise_for_outcome(
+        self, outcome: str, worker: None | Process, request_id: str
+    ) -> NoReturn:
+        """Raise the error for a request that got no response.
 
-        # Processing the result
-        with self._lock:
-            req_data = self._pending_requests.pop(request_id, {})
-            logger.debug(
-                f"Request ID {request_id} removed from pending requests: success"
+        Args:
+            outcome (str): How waiting for the response ended (see
+                :meth:`_wait_for_response`).
+            worker (None | Process): The worker process the request was sent
+                to.
+            request_id (str): The request's ID.
+
+        Raises:
+            WCSWorkerDiedError: If the worker process died or the request was
+                lost in a worker process restart (retried).
+            TimeoutError: If the response did not arrive in time (retried,
+                after a hung worker process was replaced).
+            WCSWorkerError: If the response did not arrive in time, the worker
+                process hung and its restart is deferred (or it could not be
+                killed).
+            WCSManagerShutdownError: If the manager is shutting down, or the
+                worker process was terminated at application exit.
+        """
+        if outcome == "shutdown" or self._closing.is_set():
+            raise WCSManagerShutdownError("WCSManager is set to shut down")
+        if outcome == "worker died":
+            self._shut_down_if_terminated_at_exit(worker)
+            raise WCSWorkerDiedError(
+                f"WCSWorker process PID {worker.pid} exited (exit code "
+                f"{_format_exitcode(worker.exitcode)}) before answering "
+                f"request {request_id}"
             )
+        if outcome == "request lost":
+            raise WCSWorkerDiedError(
+                f"Request {request_id} was lost in a WCSWorker process restart"
+            )
+        self._kill_hung_worker(worker, request_id)
+        raise TimeoutError(f"Timeout waiting for response to request {request_id}")
 
-        if "error" in req_data:  # error path
-            error_response = req_data.get("error")
-            if error_response:
-                error_type = error_response.get("type")
-                error_message = error_response.get("message")
-                error_errno = error_response.get("errno")
+    def _kill_hung_worker(self, worker: None | Process, request_id: str) -> None:
+        """Kill and replace the worker process if it is hung.
 
-                # Recreating exceptions
-                try:
-                    exc_class = getattr(builtins, error_type)
-                except Exception:
-                    exc_class = WCSWorkerError
+        A worker process that is alive but did not answer a request in time
+        is stuck (e.g. in a WCS call that never returns) and would never read
+        another request: each call would wait for the request timeout, with
+        retries for about a minute, forever. Kill it and restart it like a
+        dead worker, so that the request queue is replaced and the restart
+        cooldown applies to a worker that keeps hanging (calls then fail at
+        once instead of waiting). A restart that stops the worker by a poison
+        pill would not work: a hung worker never reads it.
 
-                if issubclass(exc_class, OSError):
-                    exc = exc_class(error_message)
-                    if error_errno is not None:
-                        exc.errno = error_errno
-                    raise exc
-                # Something else might have happened
-                raise exc_class(f"{error_type}: {error_message}")
+        Args:
+            worker (None | Process): The worker process the request was sent
+                to.
+            request_id (str): The unanswered request's ID.
 
-        # normal path
-        return req_data.get("result")
+        Raises:
+            WCSWorkerError: If the worker process could not be killed, or its
+                restart is deferred (see :meth:`_check_restart_cooldown`).
+        """
+        with self._restart_lock:
+            if not self._is_hung(worker):
+                return
+            logger.error(
+                f"WCSWorker process PID {worker.pid} did not answer request "
+                f"{request_id} within {self.request_timeout:g} s. Killing it"
+            )
+            self._hung_worker = worker
+            self._terminate_worker(worker)
+            if worker.is_alive():
+                raise WCSWorkerError(
+                    f"WCSWorker process PID {worker.pid} hung and could not be killed"
+                )
+            self._restart_worker("worker hung", if_dead=True)
+
+    def _is_hung(self, worker: None | Process) -> bool:
+        """Whether a worker process that did not answer a request is hung.
+
+        Call with ``_restart_lock`` held. Only the current worker process can
+        be hung (an earlier one was replaced already), and only once it told
+        us that it is up: until then, it may just be slow to start (e.g. at
+        logon), for up to ``worker_start_timeout`` seconds.
+
+        Args:
+            worker (None | Process): The worker process the request was sent
+                to.
+
+        Returns:
+            bool: Whether it is hung.
+        """
+        if (
+            self._closing.is_set()
+            or worker is None
+            or worker is not self._worker_process
+            or not worker.is_alive()
+        ):
+            return False
+        return (
+            worker.pid == self._ready_worker_pid
+            or monotonic() - self._worker_started_at >= worker_start_timeout
+        )
+
+    @staticmethod
+    def _response_result(req_data: PendingType | dict[str, Any]) -> Any:  # noqa: ANN401
+        """Return the result of a request, or raise the error it caused.
+
+        Args:
+            req_data (PendingType | dict): The answered request.
+
+        Raises:
+            OSError: The worker's OSError (or subclass), with its errno.
+            WCSWorkerError: If the worker raised an error that is not a
+                builtin exception.
+            Exception: The worker's (builtin) exception otherwise.
+
+        Returns:
+            Any: The result.
+        """
+        error_response = req_data.get("error")
+        if not error_response:
+            return req_data.get("result")
+
+        error_type = error_response.get("type")
+        error_message = error_response.get("message")
+        error_errno = error_response.get("errno")
+
+        # Recreating exceptions
+        try:
+            exc_class = getattr(builtins, error_type)
+        except Exception:
+            exc_class = WCSWorkerError
+
+        if issubclass(exc_class, OSError):
+            exc = exc_class(error_message)
+            if error_errno is not None:
+                exc.errno = error_errno
+            raise exc
+        # Something else might have happened
+        raise exc_class(f"{error_type}: {error_message}")
 
     def shutdown(self) -> None:
-        """Shutdowns the worker process and listener thread."""
-        if self._closing.is_set():
-            logger.debug("WCSManager is already set to shut down")
-            return
-        logger.info("Shutting down WCSManager...")
+        """Shut down the worker process and the listener threads, for good.
+
+        Idempotent and final: afterwards, no worker process is started again,
+        and every call raises WCSManagerShutdownError at once (as do calls
+        that are waiting for a response when it is called).
+        """
+        # Refuse calls and worker restarts from now on
         self._closing.set()
+        with self._shutdown_lock:
+            if self._shutdown_started:
+                logger.debug("WCSManager is already shut down")
+                return
+            self._shutdown_started = True
+        logger.info("Shutting down WCSManager...")
 
         # Let a worker restart in progress finish first
         with self._restart_lock:
@@ -858,13 +1139,69 @@ class WCSManager:
             logger.debug("Stopping worker process and threads")
             self._stop_worker()
 
-        if self._response_listener_thread and self._response_listener_thread.is_alive():
-            self._response_listener_thread.join(timeout=2.0)
+        # Nothing is sent to a worker process anymore: let the request queue's
+        # feeder thread end, and don't let it block our exit on requests that
+        # a killed worker did not read
+        with contextlib.suppress(Exception):
+            self._request_queue.cancel_join_thread()
+            self._request_queue.close()
+
+        listener_thread = self._response_listener_thread
+        if (
+            listener_thread is not None
+            and listener_thread is not threading.current_thread()
+            and listener_thread.is_alive()
+        ):
+            listener_thread.join(timeout=2.0)
+        self._stop_log_listener()
         logger.info("WCSManager shut down complete")
+
+    def _stop_log_listener(self) -> None:
+        """Stop the listener that hands the worker's log records on.
+
+        It handles the records logged before (e.g. the worker's last ones)
+        first. Call once, after the worker process stopped. Doesn't wait
+        longer than ``log_listener_stop_timeout`` seconds: a listener thread
+        that doesn't end (e.g. stuck reading a record that a killed worker
+        process did not finish writing) is left behind (it is a daemon).
+        """
+        listener = self._log_listener
+        if listener is None:
+            return
+        # Its stop sentinel is all we put into the log queue. Don't let the
+        # queue's feeder thread block our exit if nobody reads it anymore.
+        with contextlib.suppress(Exception):
+            self._log_queue.cancel_join_thread()
+        stopper = Thread(
+            target=self._stop_listener,
+            args=(listener,),
+            name="WCSManagerLogListenerStop",
+            daemon=True,
+        )
+        stopper.start()
+        stopper.join(timeout=log_listener_stop_timeout)
+        if stopper.is_alive():
+            logger.warning("WCSWorker log listener did not stop in time")
+            return
+        # Nobody reads or writes the log queue anymore: let its feeder end
+        with contextlib.suppress(Exception):
+            self._log_queue.close()
+
+    @staticmethod
+    def _stop_listener(listener: QueueListener) -> None:
+        """Stop a QueueListener, logging (instead of raising) any error.
+
+        Args:
+            listener (QueueListener): The listener.
+        """
+        try:
+            listener.stop()
+        except Exception as e:
+            logger.warning(f"Failed to stop the WCSWorker log listener: {e}")
 
     def _atexit_shutdown(self) -> None:
         """Shutdown handler for atexit to ensure cleanup on normal interpreter exit."""
-        if not self._closing.is_set():
+        if not self._shutdown_started:
             logger.info("WCSManager: atexit triggered shutdown")
             self.shutdown()
 
@@ -1163,6 +1500,16 @@ class WCSManagerProxy:
         """Ensure instance exists before getting attributes."""
         self._ensure_instance()
         return getattr(WCSManagerProxy._instance, name)
+
+    def shutdown(self) -> None:
+        """Shut down the WCSManager for good, if one was started.
+
+        Unlike any other attribute, this doesn't start a WCSManager (and its
+        worker process) that doesn't exist yet, e.g. at application exit.
+        """
+        instance = WCSManagerProxy._instance
+        if instance is not None:
+            instance.shutdown()
 
     def __setattr__(self, name: str, value: Any) -> None:  # noqa: ANN401
         """Ensure instance exists before setting attributes."""

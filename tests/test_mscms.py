@@ -174,6 +174,30 @@ def test_wcs_proxy_lazy_init(clean_wcs_proxy):
         assert result is True
 
 
+def test_wcs_proxy_shutdown_does_not_start_a_manager(clean_wcs_proxy):
+    """E.g. at application exit, when WCS was never used."""
+    proxy = WCSManagerProxy()
+
+    with patch("DisplayCAL.mscms.WCSManager") as manager_class:
+        proxy.shutdown()
+
+        manager_class.assert_not_called()
+        assert WCSManagerProxy._instance is None
+
+
+def test_wcs_proxy_shutdown_shuts_the_manager_down(clean_wcs_proxy):
+    """Through the proxy, as for any other method."""
+    proxy = WCSManagerProxy()
+
+    with patch("DisplayCAL.mscms.WCSManager") as manager_class:
+        mock_instance = manager_class.return_value
+        proxy.get_calibration_management_state()
+
+        proxy.shutdown()
+
+        mock_instance.shutdown.assert_called_once()
+
+
 def test_wcs_proxy_singleton(clean_wcs_proxy):
     proxy = WCSManagerProxy()
     proxy2 = WCSManagerProxy()
