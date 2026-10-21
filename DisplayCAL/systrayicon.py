@@ -8,8 +8,12 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import functools
+import operator
 import os
 import sys
+import traceback
+from typing import Any, Callable
 
 import win32api
 import win32con
@@ -301,10 +305,13 @@ class SysTrayIcon(wx.EvtHandler):
         wx.EvtHandler.__init__(self)
         msg_taskbar_created = win32gui.RegisterWindowMessage("TaskbarCreated")
         message_map = {
-            msg_taskbar_created: self.OnTaskbarCreated,
-            win32con.WM_DESTROY: self.OnDestroy,
-            win32con.WM_COMMAND: self.OnCommand,
-            win32con.WM_USER + 20: self.OnTaskbarNotify,
+            msg: _safe_wndproc(handler)
+            for msg, handler in {
+                msg_taskbar_created: self.OnTaskbarCreated,
+                win32con.WM_DESTROY: self.OnDestroy,
+                win32con.WM_COMMAND: self.OnCommand,
+                win32con.WM_USER + 20: self.OnTaskbarNotify,
+            }.items()
         }
 
         wc = win32gui.WNDCLASS()
@@ -593,6 +600,50 @@ class SysTrayIcon(wx.EvtHandler):
         except win32gui.error:
             return False
         return True
+
+
+def _safe_wndproc(
+    handler: Callable[[int, int, int, int], Any],
+) -> Callable[[int, int, int, int], int]:
+    """Wrap a message handler of the SysTrayIcon window procedure.
+
+    pywin32 needs an int (LRESULT) from every handler of a message map. A
+    handler returning None (e.g. a missing return statement, the cause of the
+    'WNDPROC return value cannot be converted to LRESULT' errors in 3.9.17 and
+    earlier) or raising makes pywin32 print an error and call sys.excepthook,
+    which shows an error dialog from inside the window procedure. The wrapped
+    handler returns 0 instead of None and prints the traceback of an escaping
+    exception (returning 0) instead of passing it to pywin32.
+
+    Args:
+        handler (Callable[[int, int, int, int], Any]): The message handler,
+            called with (hwnd, msg, wparam, lparam).
+
+    Returns:
+        Callable[[int, int, int, int], int]: The wrapped handler.
+    """
+
+    @functools.wraps(handler)
+    def wndproc(hwnd: int, msg: int, wparam: int, lparam: int) -> int:
+        try:
+            result = handler(hwnd, msg, wparam, lparam)
+        except Exception:
+            with contextlib.suppress(Exception):
+                traceback.print_exc()
+            return 0
+        if result is None:
+            return 0
+        try:
+            return operator.index(result)
+        except TypeError:
+            with contextlib.suppress(Exception):
+                print(
+                    f"Warning: window message handler {handler!r} returned "
+                    f"{result!r} instead of an int"
+                )
+            return 0
+
+    return wndproc
 
 
 def _get_kind_str(kind: str) -> str:

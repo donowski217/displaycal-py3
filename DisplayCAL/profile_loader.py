@@ -105,6 +105,7 @@ if sys.platform == "win32":
         DISPLAY_DEVICE_ACTIVE,
         MONITORINFOF_PRIMARY,
         USE_REGISTRY,
+        cached_per_user_profiles,
         calibration_management_isenabled,
         enable_per_user_profiles,
         get_active_display_device,
@@ -114,6 +115,7 @@ if sys.platform == "win32":
         get_first_display_device,
         get_process_filename,
         get_real_display_devices_info,
+        invalidate_per_user_profiles_cache,
         per_user_profiles_isenabled,
         run_as_admin,
         win_ver,
@@ -132,6 +134,15 @@ else:
     def calibration_management_isenabled() -> bool:
         """Stub for non-Windows platforms."""
         return False
+
+    def invalidate_per_user_profiles_cache(devicekey: None | str = None) -> None:
+        """Stub for non-Windows platforms."""
+
+    def cached_per_user_profiles(
+        max_age: None | float = None,
+    ) -> contextlib.AbstractContextManager[None]:
+        """Stub for non-Windows platforms."""
+        return contextlib.nullcontext()
 
 
 if TYPE_CHECKING:
@@ -1408,9 +1419,12 @@ class PLFrame(BaseFrame):
             len(data) == 1
             or (len(data) == 2 and data[1] in ("force", "display-changed"))
         ):
+            # The sender may have changed profile associations: re-query the
+            # per-user profiles flags that association polling caches
+            invalidate_per_user_profiles_cache()
             if (
                 not ("--force" in sys.argv[1:] or len(data) == 2)
-                and calibration_management_isenabled()
+                and self.pl._calibration_management_isenabled()
             ):
                 return lang.getstr("calibration.load.handled_by_os")
             if (
@@ -1507,12 +1521,15 @@ class TaskBarIcon(SysTrayIcon):
             restore_auto = restore_manual = reset = None
         else:
             restore_manual = self.pl._set_manual_restore
-            if "--force" in sys.argv[1:] or calibration_management_isenabled():
+            if "--force" in sys.argv[1:] or self.pl._calibration_management_isenabled():
                 restore_auto = None
             else:
                 restore_auto = self.set_auto_restore
             reset = self.pl._set_reset_gamma_ramps
-        if "--force" not in sys.argv[1:] and calibration_management_isenabled():
+        if (
+            "--force" not in sys.argv[1:]
+            and self.pl._calibration_management_isenabled()
+        ):
             restore_auto_kind = apply_kind = wx.ITEM_NORMAL
         else:
             if config.getcfg("profile.load_on_login"):
@@ -2042,11 +2059,24 @@ class TaskBarIcon(SysTrayIcon):
 class ProfileLoader:
     """Profile loader class for Windows."""
 
+    #: Consecutive failed monitoring iterations after which the error is fatal.
+    MONITOR_MAX_CONSECUTIVE_FAILURES = 5
+    #: Back-off after a failed monitoring iteration (seconds), doubled after
+    #: each further consecutive failure up to the maximum.
+    MONITOR_BACKOFF_INITIAL = 3.0
+    MONITOR_BACKOFF_MAX = 30.0
+    #: How long the monitoring thread waits for the GUI thread to count our
+    #: own top-level windows before it assumes "keep running" (seconds).
+    GUI_REQUEST_TIMEOUT = 1.0
+    #: How long shutdown() waits for the monitoring thread to exit (seconds).
+    MONITOR_JOIN_TIMEOUT = 10.0
+
     def __init__(self) -> None:
         self._bootstrap_app()
         self.reload_count = 0
         self.lock = threading.Lock()
         self._is_other_running_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
         self.monitoring = True
         # Whether a persistent tray icon is active on this platform/toolkit.
         # Set True by setup_taskbar_icon() (wx, win32-only) or overridden by
@@ -2072,6 +2102,14 @@ class ProfileLoader:
         self.use_madhcnet = bool(config.getcfg("profile_loader.use_madhcnet"))
         self._has_display_changed = False
         self._last_exception_args = ()
+        # Last known Windows calibration management state and WCS query error,
+        # see _calibration_management_isenabled()
+        self._calibration_management_state = None
+        self._calibration_management_state_checked = None
+        self._last_wcs_error = None
+        # Whether the GraphicsDrivers\Configuration registry key turned out to
+        # be inaccessible (see _check_display_changed)
+        self._display_conf_key_unavailable = False
         self._shutdown = False
         self._skip = "--skip" in sys.argv[1:]
         apply_profiles = bool(
@@ -2111,7 +2149,7 @@ class ProfileLoader:
             sys.platform == "win32"
             and "--force" not in sys.argv[1:]
             and sys.getwindowsversion() >= (6, 1)
-            and calibration_management_isenabled()
+            and self._calibration_management_isenabled()
         ):
             # Incase calibration loading is handled by Windows 7 and
             # isn't forced
@@ -2242,194 +2280,200 @@ class ProfileLoader:
 
         if self._tray_active:
             self.lock.acquire()
+        try:
+            worker = Worker()
 
-        worker = Worker()
+            errors = []
 
-        errors = []
+            if sys.platform == "win32":
+                separator = "-"
+            else:
+                separator = "="
+            print(separator * 80)
+            print(lang.getstr("calibration.loading_from_display_profile"))
 
-        if sys.platform == "win32":
-            separator = "-"
-        else:
-            separator = "="
-        print(separator * 80)
-        print(lang.getstr("calibration.loading_from_display_profile"))
-
-        # dispwin sets the _ICC_PROFILE(_n) root window atom, per-output xrandr
-        # _ICC_PROFILE property (if xrandr is working) and loads the vcgt for the
-        # requested screen (ucmm backend using color.jcnf), and has to be called
-        # multiple times to setup multiple screens.
-        #
-        # If there is no profile configured in ucmm for the requested screen (or
-        # ucmm support has been removed, like in the Argyll CMS versions shipped by
-        # recent Fedora releases), it falls back to a possibly existing per-output
-        # xrandr _ICC_PROFILE property (if xrandr is working) or _ICC_PROFILE(_n)
-        # root window atom.
-        dispwin = get_argyll_util("dispwin")
-        if dispwin:
-            # Always enumerate so that worker.displays is populated, even when
-            # applying to a single display by index (e.g. from the macOS
-            # VideoLUT watch). Without this the per-display loop below would
-            # have nothing to iterate over for an indexed call.
-            worker.enumerate_displays_and_ports(
-                silent=True,
-                check_lut_access=False,
-                enumerate_ports=False,
-                include_network_devices=False,
-            )
-            if index is None:
-                self.monitors = []
-                if sys.platform == "win32" and worker.displays:
-                    self._enumerate_monitors()
-        elif index is None:
-            errors.append(lang.getstr("argyll.util.not_found", "dispwin"))
-
-        if sys.platform != "win32":
-            # gcm-apply sets the _ICC_PROFILE root window atom for the first screen,
-            # per-output xrandr _ICC_PROFILE properties (if xrandr is working) and
-            # loads the vcgt for all configured screens (device-profiles.conf)
-            # NOTE: gcm-apply is no longer part of GNOME Color Manager since the
-            # introduction of colord as it's no longer needed
-            gcm_apply = which("gcm-apply")
-            if gcm_apply:
-                worker.exec_cmd(
-                    gcm_apply, capture_output=True, skip_scripts=True, silent=False
-                )
-
-            # oyranos-monitor sets _ICC_PROFILE(_n) root window atoms (oyranos
-            # db backend) and loads the vcgt for all configured screens when
-            # xcalib is installed
-            oyranos_monitor = which("oyranos-monitor")
-            xcalib = which("xcalib")
-
-        argyll_use_colord = os.getenv("ARGYLL_USE_COLORD") and dlopen(
-            "libcolordcompat.so"
-        )
-
-        results = []
-        for i, display in enumerate(
-            [
-                display.replace("[PRIMARY]", lang.getstr("display.primary"))
-                for display in worker.displays
-            ]
-        ):
-            if config.is_virtual_display(i) or (index is not None and i != index):
-                continue
-            # Load profile and set vcgt
-            if sys.platform != "win32" and oyranos_monitor:
-                display_conf_oy_compat = worker.check_display_conf_oy_compat(i + 1)
-                if display_conf_oy_compat:
-                    worker.exec_cmd(
-                        oyranos_monitor,
-                        [
-                            "-x",
-                            str(worker.display_rects[i][0]),
-                            "-y",
-                            str(worker.display_rects[i][1]),
-                        ],
-                        capture_output=True,
-                        skip_scripts=True,
-                        silent=False,
-                    )
+            # dispwin sets the _ICC_PROFILE(_n) root window atom, per-output xrandr
+            # _ICC_PROFILE property (if xrandr is working) and loads the vcgt for the
+            # requested screen (ucmm backend using color.jcnf), and has to be called
+            # multiple times to setup multiple screens.
+            #
+            # If there is no profile configured in ucmm for the requested screen (or
+            # ucmm support has been removed, like in the Argyll CMS versions shipped by
+            # recent Fedora releases), it falls back to a possibly existing per-output
+            # xrandr _ICC_PROFILE property (if xrandr is working) or _ICC_PROFILE(_n)
+            # root window atom.
+            dispwin = get_argyll_util("dispwin")
             if dispwin:
-                if not argyll_use_colord:
-                    # Deal with colord ourself
-                    profile_arg = worker.get_dispwin_display_profile_argument(i)
-                else:
-                    # Argyll deals with colord directly
-                    profile_arg = "-L"
-                if (
-                    sys.platform == "win32"
-                    or not oyranos_monitor
-                    or not display_conf_oy_compat
-                    or not xcalib
-                    or profile_arg == "-L"
-                ):
-                    # Only need to run dispwin if under Windows, or if nothing else
-                    # has already taken care of display profile and vcgt loading
-                    # (e.g. oyranos-monitor with xcalib, or colord)
-                    #
-                    # On macOS the OS (WindowServer) may intermittently clobber
-                    # the VideoLUT to all-black right after loading it, turning
-                    # the display black (issue #694). We therefore verify that
-                    # the calibration was actually loaded and re-try the load a
-                    # few times if it wasn't. Verification is also done on other
-                    # platforms when explicitly enabled.
-                    verify_load = (
-                        sys.platform == "darwin"
-                        or config.getcfg("profile_loader.verify_calibration")
-                        or "--verify" in sys.argv[1:]
-                    ) and profile_arg != "-L"
-                    max_attempts = max(
-                        1, int(config.getcfg("profile_loader.load_retries"))
+                # Always enumerate so that worker.displays is populated, even when
+                # applying to a single display by index (e.g. from the macOS
+                # VideoLUT watch). Without this the per-display loop below would
+                # have nothing to iterate over for an indexed call.
+                worker.enumerate_displays_and_ports(
+                    silent=True,
+                    check_lut_access=False,
+                    enumerate_ports=False,
+                    include_network_devices=False,
+                )
+                if index is None:
+                    self.monitors = []
+                    if sys.platform == "win32" and worker.displays:
+                        self._enumerate_monitors()
+            elif index is None:
+                errors.append(lang.getstr("argyll.util.not_found", "dispwin"))
+
+            if sys.platform != "win32":
+                # gcm-apply sets the _ICC_PROFILE root window atom for the first screen,
+                # per-output xrandr _ICC_PROFILE properties (if xrandr is working) and
+                # loads the vcgt for all configured screens (device-profiles.conf)
+                # NOTE: gcm-apply is no longer part of GNOME Color Manager since the
+                # introduction of colord as it's no longer needed
+                gcm_apply = which("gcm-apply")
+                if gcm_apply:
+                    worker.exec_cmd(
+                        gcm_apply, capture_output=True, skip_scripts=True, silent=False
                     )
-                    load_error = None
-                    for attempt in range(max_attempts):
-                        if worker.exec_cmd(
-                            dispwin,
-                            ["-v", f"-d{i + 1:d}", profile_arg],
+
+                # oyranos-monitor sets _ICC_PROFILE(_n) root window atoms (oyranos
+                # db backend) and loads the vcgt for all configured screens when
+                # xcalib is installed
+                oyranos_monitor = which("oyranos-monitor")
+                xcalib = which("xcalib")
+
+            argyll_use_colord = os.getenv("ARGYLL_USE_COLORD") and dlopen(
+                "libcolordcompat.so"
+            )
+
+            results = []
+            for i, display in enumerate(
+                [
+                    display.replace("[PRIMARY]", lang.getstr("display.primary"))
+                    for display in worker.displays
+                ]
+            ):
+                if config.is_virtual_display(i) or (index is not None and i != index):
+                    continue
+                # Load profile and set vcgt
+                if sys.platform != "win32" and oyranos_monitor:
+                    display_conf_oy_compat = worker.check_display_conf_oy_compat(i + 1)
+                    if display_conf_oy_compat:
+                        worker.exec_cmd(
+                            oyranos_monitor,
+                            [
+                                "-x",
+                                str(worker.display_rects[i][0]),
+                                "-y",
+                                str(worker.display_rects[i][1]),
+                            ],
                             capture_output=True,
                             skip_scripts=True,
                             silent=False,
-                        ):
-                            errortxt = ""
-                        else:
-                            errortxt = "\n".join(worker.errors).strip()
-                        if errortxt and (
-                            (
-                                "using linear" not in errortxt
-                                and "assuming linear" not in errortxt
-                            )
-                            or len(errortxt.split("\n")) > 1
-                        ):
-                            if (
-                                "Failed to get the displays current ICC profile"
-                                in errortxt
-                            ):
-                                # Maybe just not configured
-                                load_error = "skip"
-                                break
-                            if (
-                                sys.platform == "win32"
-                                or "Failed to set VideoLUT" in errortxt
-                                or "We don't have access to the VideoLUT" in errortxt
-                            ):
-                                errstr = lang.getstr("calibration.load_error")
-                            else:
-                                errstr = lang.getstr("profile.load_error")
-                            load_error = f"{display}: {errstr}"
-                            break
-                        # The load command itself succeeded. Verify the
-                        # calibration is actually loaded in the VideoLUT and
-                        # re-try the load if it was clobbered (macOS black
-                        # screen), see issue #694.
-                        if not verify_load:
-                            break
-                        if not worker.calibration_is_clobbered(dispwin, i, profile_arg):
-                            # Loaded OK (or could not be determined)
-                            break
-                        if attempt + 1 < max_attempts:
-                            # Give the OS a moment to settle, then re-load
-                            print(
-                                f"VideoLUT for {display} not loaded "
-                                f"(attempt {attempt + 1:d}/{max_attempts:d}), "
-                                "re-loading calibration"
-                            )
-                            time.sleep(0.5)
-                            continue
-                        load_error = ": ".join(
-                            [display, lang.getstr("calibration.load_error")]
                         )
-                    if load_error == "skip":
-                        continue
-                    if load_error:
-                        errors.append(load_error)
-                        continue
-                    results.append(display)
+                if dispwin:
+                    if not argyll_use_colord:
+                        # Deal with colord ourself
+                        profile_arg = worker.get_dispwin_display_profile_argument(i)
+                    else:
+                        # Argyll deals with colord directly
+                        profile_arg = "-L"
+                    if (
+                        sys.platform == "win32"
+                        or not oyranos_monitor
+                        or not display_conf_oy_compat
+                        or not xcalib
+                        or profile_arg == "-L"
+                    ):
+                        # Only need to run dispwin if under Windows, or if nothing else
+                        # has already taken care of display profile and vcgt loading
+                        # (e.g. oyranos-monitor with xcalib, or colord)
+                        #
+                        # On macOS the OS (WindowServer) may intermittently clobber
+                        # the VideoLUT to all-black right after loading it, turning
+                        # the display black (issue #694). We therefore verify that
+                        # the calibration was actually loaded and re-try the load a
+                        # few times if it wasn't. Verification is also done on other
+                        # platforms when explicitly enabled.
+                        verify_load = (
+                            sys.platform == "darwin"
+                            or config.getcfg("profile_loader.verify_calibration")
+                            or "--verify" in sys.argv[1:]
+                        ) and profile_arg != "-L"
+                        max_attempts = max(
+                            1, int(config.getcfg("profile_loader.load_retries"))
+                        )
+                        load_error = None
+                        for attempt in range(max_attempts):
+                            if worker.exec_cmd(
+                                dispwin,
+                                ["-v", f"-d{i + 1:d}", profile_arg],
+                                capture_output=True,
+                                skip_scripts=True,
+                                silent=False,
+                            ):
+                                errortxt = ""
+                            else:
+                                errortxt = "\n".join(worker.errors).strip()
+                            if errortxt and (
+                                (
+                                    "using linear" not in errortxt
+                                    and "assuming linear" not in errortxt
+                                )
+                                or len(errortxt.split("\n")) > 1
+                            ):
+                                if (
+                                    "Failed to get the displays current ICC profile"
+                                    in errortxt
+                                ):
+                                    # Maybe just not configured
+                                    load_error = "skip"
+                                    break
+                                if (
+                                    sys.platform == "win32"
+                                    or "Failed to set VideoLUT" in errortxt
+                                    or "We don't have access to the VideoLUT"
+                                    in errortxt
+                                ):
+                                    errstr = lang.getstr("calibration.load_error")
+                                else:
+                                    errstr = lang.getstr("profile.load_error")
+                                load_error = f"{display}: {errstr}"
+                                break
+                            # The load command itself succeeded. Verify the
+                            # calibration is actually loaded in the VideoLUT and
+                            # re-try the load if it was clobbered (macOS black
+                            # screen), see issue #694.
+                            if not verify_load:
+                                break
+                            if not worker.calibration_is_clobbered(
+                                dispwin, i, profile_arg
+                            ):
+                                # Loaded OK (or could not be determined)
+                                break
+                            if attempt + 1 < max_attempts:
+                                # Give the OS a moment to settle, then re-load
+                                print(
+                                    f"VideoLUT for {display} not loaded "
+                                    f"(attempt {attempt + 1:d}/{max_attempts:d}), "
+                                    "re-loading calibration"
+                                )
+                                time.sleep(0.5)
+                                continue
+                            load_error = ": ".join(
+                                [display, lang.getstr("calibration.load_error")]
+                            )
+                        if load_error == "skip":
+                            continue
+                        if load_error:
+                            errors.append(load_error)
+                            continue
+                        results.append(display)
+        finally:
+            # Always release the lock, otherwise the display configuration
+            # monitoring thread would block on it forever
+            if self._tray_active:
+                self.lock.release()
 
-        if self._tray_active:
-            self.lock.release()
-            if event:
-                self.notify(results, errors)
+        if self._tray_active and event:
+            self.notify(results, errors)
 
         return errors
 
@@ -2836,7 +2880,7 @@ class ProfileLoader:
             and self.frame
             and event.GetEventType() == wx.EVT_MENU.typeId
             and (
-                not calibration_management_isenabled()
+                not self._calibration_management_isenabled()
                 or config.getcfg("profile_loader.fix_profile_associations")
             )
         ):
@@ -2887,7 +2931,10 @@ class ProfileLoader:
         Returns:
             str: The notification body text.
         """
-        if "--force" not in sys.argv[1:] and calibration_management_isenabled():
+        if (
+            "--force" not in sys.argv[1:]
+            and self._calibration_management_isenabled()
+        ):
             text = lang.getstr("calibration.load.handled_by_os") + "\n"
         else:
             text = ""
@@ -2942,18 +2989,109 @@ class ProfileLoader:
             and max(self.child_devices_count.values()) == 1
         )
 
+    @staticmethod
+    def _is_gui_thread() -> bool:
+        """Return whether the calling thread is the GUI (main) thread.
+
+        Returns:
+            bool: True if called from the GUI thread.
+        """
+        return threading.current_thread() is threading.main_thread()
+
     def _check_keep_running(self) -> bool:
-        """Check if the application should keep running."""
-        numwindows = len(self._enumerate_own_top_level_windows())
+        """Check if the application should keep running.
+
+        One of our windows having been closed by an external event (i.e.
+        ``WM_CLOSE``, e.g. at logoff) is a hint that something external is
+        trying to get us to exit.
+
+        Counting our windows touches the GUI toolkit, which must only happen
+        on the GUI thread, so when called from another thread (the display
+        configuration monitoring thread) the count is requested from the GUI
+        thread. A count that could not be determined (enumeration error, GUI
+        thread busy) means "keep running", and a lower count has to be seen on
+        two consecutive checks before we conclude that we should exit, so a
+        single transient enumeration glitch cannot shut the loader down.
+
+        Returns:
+            bool: False if the application should exit, True otherwise.
+        """
+        if self._is_gui_thread():
+            numwindows = self._count_own_top_level_windows()
+        else:
+            numwindows = self._count_own_top_level_windows_on_gui_thread()
+        if numwindows is None:
+            return True
         if numwindows < self.numwindows:
-            # One of our windows has been closed by an external event
-            # (i.e. WM_CLOSE). This is a hint that something external is trying
-            # to get us to exit. Comply by closing our main top-level window to
-            # initiate clean shutdown.
+            if not getattr(self, "_window_count_drop_seen", False):
+                # Confirm on the next check before acting on it
+                self._window_count_drop_seen = True
+                debug_print(
+                    "Window count", self.numwindows, "->", numwindows, "(unconfirmed)"
+                )
+                return True
+            # Comply by closing our main top-level window to initiate clean
+            # shutdown.
             print("Window count", self.numwindows, "->", numwindows)
             return False
+        self._window_count_drop_seen = False
         self.numwindows = numwindows
         return True
+
+    def _count_own_top_level_windows(self) -> None | int:
+        """Count our own top-level windows. Must be called on the GUI thread.
+
+        Returns:
+            None | int: The number of windows, or None if it could not be
+                determined.
+        """
+        try:
+            return len(self._enumerate_own_top_level_windows())
+        except Exception as exception:
+            if exception.args != getattr(self, "_last_window_count_error", None):
+                self._last_window_count_error = exception.args
+                print("Could not enumerate own top-level windows:", exception)
+            return None
+
+    def _count_own_top_level_windows_on_gui_thread(self) -> None | int:
+        """Have the GUI thread count our own top-level windows.
+
+        At most one request is outstanding at any time. If the GUI thread does
+        not answer within ``GUI_REQUEST_TIMEOUT`` seconds (e.g. it is busy),
+        None is returned and the outstanding request is waited for again on
+        the next call.
+
+        Returns:
+            None | int: The number of windows, or None if it could not be
+                determined in time.
+        """
+        request = getattr(self, "_window_count_request", None)
+        if request is None or request[0].is_set():
+            if not self.monitoring or self._shutdown:
+                # Do not leave requests queued for a GUI thread that is about
+                # to stop processing them
+                return None
+            done = threading.Event()
+            result: list[None | int] = [None]
+
+            def count() -> None:
+                try:
+                    result[0] = self._count_own_top_level_windows()
+                finally:
+                    done.set()
+
+            request = done, result
+            self._window_count_request = request
+            try:
+                self._post_to_gui_thread(count)
+            except Exception as exception:
+                self._window_count_request = None
+                print("Could not request own top-level window count:", exception)
+                return None
+        done, result = request
+        if not done.wait(self.GUI_REQUEST_TIMEOUT):
+            return None
+        return result[0]
 
     def _enumerate_own_top_level_windows(self) -> list:
         """Toolkit-specific hook: list this process's own top-level UI windows.
@@ -2961,9 +3099,9 @@ class ProfileLoader:
         Used by :meth:`_check_keep_running` to notice when something external
         (e.g. a Windows session shutdown/logoff sending ``WM_CLOSE``) has
         closed one of our windows, as a hint that we should comply and exit.
-        This default (wx) implementation enumerates the current thread's
+        This default (wx) implementation enumerates the GUI thread's
         native windows plus wx's own top-level window list. Overridden by
-        toolkit subclasses (e.g. the Qt port).
+        toolkit subclasses (e.g. the Qt port). Only called on the GUI thread.
 
         Returns:
             list: The window handles/objects currently considered "ours".
@@ -2974,15 +3112,20 @@ class ProfileLoader:
             win32gui.EnumThreadWindows(
                 self._tid, self._enumerate_own_windows_callback, windows
             )
-        windows.extend(
-            [
-                window
-                for window in list(wx.GetTopLevelWindows())
-                if not isinstance(window, wx.Dialog)
-                and window.Name
-                not in {"TaskBarNotification", "DisplayIdentification", "profile_info"}
-            ]
-        )
+        for window in list(wx.GetTopLevelWindows()):
+            try:
+                if (
+                    not window
+                    or window.IsBeingDeleted()
+                    or isinstance(window, wx.Dialog)
+                    or window.Name
+                    in {"TaskBarNotification", "DisplayIdentification", "profile_info"}
+                ):
+                    continue
+            except RuntimeError:
+                # wrapped C/C++ object has been deleted
+                continue
+            windows.append(window)
         return windows
 
     def _enumerate_own_windows_callback(self, hwnd: int, windowlist: list) -> None:
@@ -2992,7 +3135,13 @@ class ProfileLoader:
             hwnd (int): The handle of the window.
             windowlist (list): The list to append the window class names to.
         """
-        cls = win32gui.GetClassName(hwnd)
+        try:
+            cls = win32gui.GetClassName(hwnd)
+        except pywintypes.error:
+            # The window was destroyed after it was enumerated. Skip it
+            # instead of aborting the enumeration (which would make our window
+            # count drop and look like a request to exit).
+            return
         # print cls
         if cls in (
             "madHcNetQueueWindow",
@@ -3021,6 +3170,8 @@ class ProfileLoader:
             print("ProcessDisplayChangedEvent: Acquired lock")
             self._display_changed_event = True
             self._next = True
+            # Re-query the (cached) per-user profile association flags
+            invalidate_per_user_profiles_cache()
             if getattr(self, "profile_associations_dlg", None):
                 self._post_to_gui_thread_delayed(
                     1000,
@@ -3063,19 +3214,33 @@ class ProfileLoader:
         has_display_changed = False
         ts = time.time()
         key_name = r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Configuration"
-        try:
-            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_name)
-            numsubkeys, numvalues, mtime = winreg.QueryInfoKey(key)
-        except OSError as exception:
-            # Windows XP or Win10 >= 1903 if not running elevated
-            if exception.args[0] != errno.ENOENT or sys.getwindowsversion() >= (6,):
-                warnings.warn(
-                    rf"Registry access failed: {exception}: HKLM\{key_name}",
-                    Warning,
-                    stacklevel=2,
-                )
-            key = None
-            numsubkeys = 0
+        key = None
+        numsubkeys = 0
+        if not getattr(self, "_display_conf_key_unavailable", False):
+            try:
+                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_name)
+                numsubkeys, numvalues, mtime = winreg.QueryInfoKey(key)
+            except OSError as exception:
+                key = None
+                numsubkeys = 0
+                if exception.errno in (errno.ENOENT, errno.EACCES):
+                    # Windows XP, or Win10 >= 1903 if not running elevated
+                    # (access denied for every access mask). This is expected,
+                    # so don't warn. It won't change while we are running, so
+                    # remember it and say once which detection method is used.
+                    self._display_conf_key_unavailable = True
+                    print(
+                        rf"Registry key HKLM\{key_name} is not accessible "
+                        f"({exception}). Detecting display configuration "
+                        "changes by comparing active display device keys."
+                    )
+                else:
+                    warnings.warn(
+                        rf"Registry access failed: {exception}: HKLM\{key_name}",
+                        Warning,
+                        stacklevel=2,
+                    )
+        if key is None:
             # get_active_display_devices takes around 3-10ms in contrast to
             # querying registry which takes 1-3ms
             if (
@@ -3151,39 +3316,108 @@ class ProfileLoader:
         return has_display_changed
 
     def _check_display_conf_wrapper(self) -> None:
+        """Run the display configuration monitoring loop (thread target).
+
+        Errors in individual iterations are handled (logged and retried) by
+        :meth:`_check_display_conf` itself. Anything that still escapes it is
+        logged here and handed to the GUI thread as a fatal error.
+        """
         try:
             self._check_display_conf()
         except Exception as exception:
-            if self.lock.locked():
-                self.lock.release()
-            self._post_to_gui_thread(self._handle_fatal_error, exception)
+            # Log the real traceback while it is still available
+            traceback.print_exc()
+            # Note that self.lock is NOT released here: the monitoring loop
+            # only ever holds it inside a "with" block, so it has already been
+            # released. Releasing it here could only free a lock held by
+            # another thread (the GUI thread or ProcessDisplayChangedEvent).
+            if not self._shutdown:
+                self._post_to_gui_thread(self._handle_fatal_error, exception)
 
     def _handle_fatal_error(self, exception: Exception) -> None:
         handle_error(exception)
         self._post_to_gui_thread(self.exit)
 
     def _check_display_conf(self) -> None:
-        """Thread to monitor display configuration changes."""
+        """Thread to monitor display configuration changes.
+
+        Each iteration (including the wait for the next one) is guarded: an
+        exception is logged, the loop backs off and retries. Only after
+        ``MONITOR_MAX_CONSECUTIVE_FAILURES`` consecutive failed iterations is
+        the exception re-raised (and thus treated as fatal by
+        :meth:`_check_display_conf_wrapper`).
+        """
         self._current_display = None
         self._current_timestamp = 0
         self._next = False
+        # Whether DisplayCAL was running at the last iteration, carried over
+        # from one iteration to the next (see _handle_profile_updates)
+        self._displaycal_was_running = False
         first_run = True
-        apply_profiles = self._should_apply_profiles()
-        displaycal_running = False
+        failures = 0
+        try:
+            # Called for its side effect of enumerating windows and processes
+            # (fills self._hwnds_pids), so the first iteration can tell
+            # whether the list of running processes changed
+            self._should_apply_profiles()
+        except Exception:
+            failures = self._handle_monitor_error(failures, first_run)
         previous_hwnds_pids = self._hwnds_pids
         while self and self.monitoring:
-            result = None
-            results = []
-            errors = []
-            idle = True
-            locked = self.lock.locked()
-            if locked:
-                print(
-                    "DisplayConfigurationMonitoringThread: Waiting to acquire lock..."
-                )
-            lock_acquired = self.lock.acquire()
-            if lock_acquired:
-                print("DisplayConfigurationMonitoringThread: Acquired lock")
+            try:
+                if not self._run_monitor_iteration(first_run, previous_hwnds_pids):
+                    # A change in profile associations was detected and we
+                    # exited the iteration early: check again right away
+                    failures = 0
+                    continue
+                previous_hwnds_pids = self._hwnds_pids
+                first_run = False
+                if "--oneshot" in sys.argv[1:]:
+                    self._post_to_gui_thread(self.exit)
+                    break
+                if "--profile-associations" in sys.argv[1:]:
+                    sys.argv.remove("--profile-associations")
+                    self._post_to_gui_thread(self._set_profile_associations, None)
+                self._wait_for_next_iteration()
+            except Exception:
+                failures = self._handle_monitor_error(failures, first_run)
+            else:
+                failures = 0
+        # Note: shutdown() (and with it the UI teardown) is not called from
+        # here. It runs on the GUI thread, from the application's exit
+        # handlers (or _request_forced_shutdown), and waits for this thread.
+        print("Display configuration monitoring thread finished")
+
+    def _run_monitor_iteration(
+        self,
+        first_run: bool,
+        previous_hwnds_pids: set,
+    ) -> bool:
+        """Run one display configuration/profile/calibration check.
+
+        Whether DisplayCAL was running at the previous iteration is carried
+        over in ``self._displaycal_was_running``.
+
+        Args:
+            first_run (bool): Whether this is the first (successful) iteration.
+            previous_hwnds_pids (set): Windows/processes seen last iteration.
+
+        Returns:
+            bool: False if the iteration was cut short because ``self._next``
+                was set (the caller should run the next iteration right away),
+                True otherwise.
+        """
+        started = time.perf_counter()
+        result = None
+        results = []
+        errors = []
+        idle = True
+        if self.lock.locked():
+            debug_print(
+                "DisplayConfigurationMonitoringThread: Waiting to acquire lock..."
+            )
+        with self.lock:
+            debug_print("DisplayConfigurationMonitoringThread: Acquired lock")
             # Check if display configuration changed
             self._check_display_changed(first_run)
             profile_associations_changed, apply_profiles, idle, result = (
@@ -3194,13 +3428,8 @@ class ProfileLoader:
             if self._next:
                 # We only arrive here if a change in profile associations was
                 # detected and we exited the loop early
-                if locked:
-                    print("DisplayConfigurationMonitoringThread: Releasing lock")
-                self.lock.release()
-                if locked:
-                    print("DisplayConfigurationMonitoringThread: Released lock")
-                continue
-            previous_hwnds_pids = self._hwnds_pids
+                debug_print("DisplayConfigurationMonitoringThread: Releasing lock")
+                return False
             timestamp = time.time()
             localtime = list(time.localtime(self._timestamp))
             localtime[3:6] = 23, 59, 59
@@ -3208,10 +3437,10 @@ class ProfileLoader:
             if timestamp >= midnight:
                 self.reload_count = 0
                 self._timestamp = timestamp
-            self._handle_profile_updates(
+            self._displaycal_was_running = self._handle_profile_updates(
                 first_run,
                 apply_profiles,
-                displaycal_running,
+                self._displaycal_was_running,
                 results,
                 errors,
                 idle,
@@ -3220,7 +3449,6 @@ class ProfileLoader:
             if apply_profiles and not idle:
                 self._post_to_gui_thread(self._animate_busy_icon)
             self.__apply_profiles = apply_profiles
-            first_run = False
             if profile_associations_changed and not self._has_display_changed:
                 if getattr(self, "profile_associations_dlg", None):
                     self._post_to_gui_thread(
@@ -3240,34 +3468,136 @@ class ProfileLoader:
                 self._has_display_changed = False
             self._manual_restore = False
             self._skip = False
-            if locked:
-                print("DisplayConfigurationMonitoringThread: Releasing lock")
-            self.lock.release()
-            if locked:
-                print("DisplayConfigurationMonitoringThread: Released lock")
-            if "--oneshot" in sys.argv[1:]:
-                self._post_to_gui_thread(self.exit)
+            debug_print("DisplayConfigurationMonitoringThread: Releasing lock")
+        self._refresh_calibration_management_state(started)
+        return True
+
+    def _refresh_calibration_management_state(self, since: float) -> None:
+        """Query Windows calibration management unless done since ``since``.
+
+        The GUI thread only ever reads the last known state (see
+        :meth:`_calibration_management_isenabled`), which normally the
+        monitoring iteration's :meth:`_should_apply_profiles` refreshes. That
+        check is skipped when its result is already decided otherwise (e.g.
+        while DisplayCAL or another calibration app is running, or when
+        loading calibration on login is disabled), so query the state here
+        then, i.e. at most once per iteration.
+
+        Args:
+            since (float): ``time.perf_counter()`` when the iteration started.
+        """
+        checked = getattr(self, "_calibration_management_state_checked", None)
+        if checked is None or checked < since:
+            self._query_calibration_management_state()
+
+    def _wait_for_next_iteration(self) -> None:
+        """Wait (up to three seconds) before the next monitoring iteration.
+
+        Returns early if monitoring stops, a manual restore is requested or the
+        next iteration should run right away. Every 0.5 s, checks whether
+        something external asked us to exit.
+        """
+        timeout = 0
+        while (
+            self
+            and self.monitoring
+            and timeout < 3
+            and not self._manual_restore
+            and not self._next
+        ):
+            if round(timeout * 100) % 25 == 0 and self._stop_if_asked_to_exit():
                 break
-            if "--profile-associations" in sys.argv[1:]:
-                sys.argv.remove("--profile-associations")
-                self._post_to_gui_thread(self._set_profile_associations, None)
-            # Wait three seconds
-            timeout = 0
-            while (
-                self
-                and self.monitoring
-                and timeout < 3
-                and not self._manual_restore
-                and not self._next
-            ):
-                if round(timeout * 100) % 25 == 0 and not self._check_keep_running():
-                    self.monitoring = False
-                    self._post_to_gui_thread(self._request_forced_shutdown)
-                    break
-                time.sleep(0.1)
-                timeout += 0.1
-        print("Display configuration monitoring thread finished")
-        self.shutdown()
+            time.sleep(0.1)
+            timeout += 0.1
+
+    def _stop_if_asked_to_exit(self) -> bool:
+        """Stop monitoring if something external asked us to exit.
+
+        If so, a forced shutdown is requested on the GUI thread.
+
+        Returns:
+            bool: True if monitoring was stopped.
+        """
+        if self._check_keep_running():
+            return False
+        self.monitoring = False
+        self._post_to_gui_thread(self._request_forced_shutdown)
+        return True
+
+    def _handle_monitor_error(self, failures: int, first_run: bool) -> int:
+        """Handle an exception from a monitoring iteration.
+
+        Must be called from the ``except`` block. Logs the traceback (each
+        distinct one in full, repeats in one line), makes the next iteration
+        redo display change handling if one was in progress, and backs off.
+        Re-raises the exception once ``MONITOR_MAX_CONSECUTIVE_FAILURES``
+        consecutive iterations have failed.
+
+        Args:
+            failures (int): Consecutive failed iterations before this one.
+            first_run (bool): Whether the failed iteration was the first run.
+
+        Returns:
+            int: The updated number of consecutive failures.
+        """
+        failures += 1
+        if failures >= self.MONITOR_MAX_CONSECUTIVE_FAILURES and self.monitoring:
+            print(
+                "Display configuration monitoring failed",
+                failures,
+                "times in a row, giving up",
+            )
+            # Re-raise the exception being handled by our caller
+            raise
+        tb = traceback.format_exc()
+        if tb != getattr(self, "_last_monitor_traceback", None):
+            self._last_monitor_traceback = tb
+            traceback.print_exc()
+        else:
+            print(
+                "Display configuration monitoring error (same as before):",
+                repr(sys.exc_info()[1]),
+            )
+        if not self.monitoring:
+            return failures
+        if first_run or self._display_changed_event:
+            self._rearm_display_change_detection()
+        delay = min(
+            self.MONITOR_BACKOFF_INITIAL * 2 ** (failures - 1),
+            self.MONITOR_BACKOFF_MAX,
+        )
+        print(
+            f"Display configuration monitoring: iteration failed ({failures} in a "
+            f"row), retrying in {delay:.0f} s"
+        )
+        # Back off in short slices, so stopping is not delayed, and keep
+        # noticing an external request to exit (e.g. at logoff)
+        waited = 0.0
+        while self and self.monitoring and waited < delay:
+            if round(waited * 100) % 50 == 0:
+                try:
+                    if self._stop_if_asked_to_exit():
+                        break
+                except Exception as exception:
+                    debug_print("Keep-running check failed:", exception)
+            time.sleep(0.1)
+            waited += 0.1
+        return failures
+
+    def _rearm_display_change_detection(self) -> None:
+        """Make the next monitoring iteration redo display change handling.
+
+        An iteration that failed while handling a display configuration change
+        (or on the first run) may already have recorded the new configuration
+        (e.g. ``_enumerate_monitors`` rebuilds ``_active_displays``) before the
+        error. Without this, the retry would see "no change" and could leave
+        profile associations half-fixed until the next display change.
+        """
+        with self.lock:
+            self._display_changed_event = True
+            self._active_displays = []
+            self._current_display = None
+            self._current_timestamp = 0
 
     def _check_profile_associations(
         self,
@@ -3308,9 +3638,13 @@ class ProfileLoader:
             exception = None
             profile_path = profile_name = None
             try:
-                profile_path = get_display_profile(
-                    i, path_only=True, devicekey=devicekey
-                )
+                # Polled every few seconds: reuse a recently queried per-user
+                # profiles flag (querying it leaks a handle in the WCS worker
+                # process). Invalidated on display or association changes.
+                with cached_per_user_profiles():
+                    profile_path = get_display_profile(
+                        i, path_only=True, devicekey=devicekey
+                    )
             except IndexError:
                 debug_print(f"Display {key} ({display}) no longer present?")
                 self._next = False
@@ -3702,6 +4036,8 @@ class ProfileLoader:
         if not first_run:
             print("A profile change has been detected")
             print(display, "->", desc)
+            # Associations changed: re-query the cached per-user profiles flags
+            invalidate_per_user_profiles_cache()
             device = get_active_display_device(moninfo["Device"])
             if device:
                 display_edid = get_display_name_edid(device, moninfo, i)
@@ -4011,7 +4347,10 @@ class ProfileLoader:
             try:
                 result = self.gdi32.GetDeviceGammaRamp(hdc, ramp)
             except Exception as e:
-                print("Handled exception:", e)
+                # Runs every three seconds: only log an error when it changes
+                if e.args != self._last_exception_args or DEBUG:
+                    self._last_exception_args = e.args
+                    print("Handled exception:", e)
                 # continue
                 return idle, True
             finally:
@@ -4130,18 +4469,24 @@ class ProfileLoader:
         errors: list[str],
         idle: bool,
         profile_associations_changed: bool,
-    ) -> None:
+    ) -> bool:
         """Handle profile updates and notify user.
 
         Args:
             first_run (bool): Indicates if this is the first run.
             apply_profiles (bool): Indicates if profiles should be applied.
-            displaycal_running (bool): Indicates if DisplayCAL is running.
+            displaycal_running (bool): Whether DisplayCAL was running at the
+                previous iteration.
             results (list): List to store result messages.
             errors (list): List to store error messages.
             idle (bool): Indicates if the system is idle.
             profile_associations_changed (bool): Indicates if profile
                 associations changed.
+
+        Returns:
+            bool: Whether DisplayCAL is running now, to be passed in as
+                ``displaycal_running`` at the next iteration (so that its
+                start or exit is reported once, not at every iteration).
         """
         if results or errors:
             if results:
@@ -4184,20 +4529,55 @@ class ProfileLoader:
                 apply_profiles != self.__apply_profiles or profile_associations_changed
             ):
                 self._post_to_gui_thread(self._refresh_visual_state)
+        return displaycal_running
 
     def shutdown(self) -> None:
-        """Shut down the profile loader."""
-        if self._shutdown:
-            return
-        self._shutdown = True
+        """Shut down the profile loader.
+
+        Runs at most once. Stops the display configuration monitoring thread
+        and waits (up to ``MONITOR_JOIN_TIMEOUT`` seconds) for it to exit, so
+        it does not keep running into interpreter finalization, then resets
+        the fixed profile associations, writes the configuration and tears
+        down the UI. Normally called on the GUI thread from the application's
+        exit handlers. The UI is only ever torn down on the GUI thread.
+        """
+        with self._shutdown_lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
         print("Shutting down profile loader")
         if self.monitoring:
             print("Shutting down display configuration monitoring thread")
             self.monitoring = False
+        self._join_monitoring_thread()
         if getcfg("profile_loader.fix_profile_associations"):
-            self._reset_display_profile_associations()
+            try:
+                self._reset_display_profile_associations()
+            except Exception:
+                # Still write the configuration and remove the tray icon
+                traceback.print_exc()
         self.writecfg()
-        self._teardown_ui()
+        if self._is_gui_thread():
+            self._teardown_ui()
+        else:
+            self._post_to_gui_thread(self._teardown_ui)
+
+    def _join_monitoring_thread(self) -> None:
+        """Wait for the display configuration monitoring thread to exit."""
+        thread = getattr(self, "_check_display_conf_thread", None)
+        if (
+            thread is None
+            or thread is threading.current_thread()
+            or not thread.is_alive()
+        ):
+            return
+        thread.join(self.MONITOR_JOIN_TIMEOUT)
+        if thread.is_alive():
+            print(
+                "Display configuration monitoring thread did not exit within",
+                self.MONITOR_JOIN_TIMEOUT,
+                "seconds",
+            )
 
     def _teardown_ui(self) -> None:
         """Tear down this platform/toolkit's persistent UI, if any.
@@ -4383,17 +4763,22 @@ class ProfileLoader:
             hwnd (int): Handle to the window.
             extra (object): Extra parameter (not used).
         """
-        cls = win32gui.GetClassName(hwnd)
-        if cls == "madHcNetQueueWindow" or self._is_known_window_class(cls):
-            try:
-                thread_id, pid = win32process.GetWindowThreadProcessId(hwnd)
-                filename: str = get_process_filename(pid)
-            except pywintypes.error:
+        try:
+            cls = win32gui.GetClassName(hwnd)
+            if not (cls == "madHcNetQueueWindow" or self._is_known_window_class(cls)):
                 return
-            self._hwnds_pids.add((filename, pid, thread_id, hwnd))
-            basename = os.path.basename(filename)
-            if basename.lower() != "madhcctrl.exe" and pid != self._pid:
-                self.__other_component = filename, cls, 0
+            thread_id, pid = win32process.GetWindowThreadProcessId(hwnd)
+            filename: str = get_process_filename(pid)
+        except (pywintypes.error, OSError):
+            # The window or its process went away while we were enumerating.
+            # Note that get_process_filename raises ctypes.WinError (OSError),
+            # e.g. [WinError 31] for a process that has just exited, which is
+            # not a pywintypes.error.
+            return
+        self._hwnds_pids.add((filename, pid, thread_id, hwnd))
+        basename = os.path.basename(filename)
+        if basename.lower() != "madhcctrl.exe" and pid != self._pid:
+            self.__other_component = filename, cls, 0
 
     def _is_known_window_class(self, cls: type) -> bool:
         """Check if the window class is known and should be monitored.
@@ -4454,33 +4839,37 @@ class ProfileLoader:
         """
         if sys.platform != "win32":
             return None
-        self._is_other_running_lock.acquire()
-        if enumerate_windows_and_processes:
-            # At launch, we won't be able to determine if madVR is running via
-            # the callback API, and we can only determine if another
-            # calibration solution is running by enumerating windows and
-            # processes anyway.
-            other_component = self.__other_component
-            self.__other_component = None, None, 0
-            # Look for known window classes
-            # Performance on C2D 3.16 GHz (Win7 x64, ~ 90 processes): ~ 1ms
-            self._hwnds_pids = set()
-            try:
-                win32gui.EnumWindows(self._enumerate_windows_callback, None)
-            except pywintypes.error as exception:
-                print("Enumerating windows failed:", exception)
-            if (
-                not self.__other_component[1]
-                or self.__other_component[1] == "madHcNetQueueWindow"
-            ):
-                self._look_for_known_processes(other_component)
-            if other_component != self.__other_component:
-                self._handle_component_detection(other_component)
-        result = (
-            self.__other_component[0:2] != (None, None)
-            and not self.__other_component[2]
-        )
-        self._is_other_running_lock.release()
+        # Always release the lock, even if enumeration fails: a lock left held
+        # here would deadlock the next caller (the monitoring thread or the
+        # GUI thread, e.g. when the tray menu is opened).
+        with self._is_other_running_lock:
+            if enumerate_windows_and_processes:
+                # At launch, we won't be able to determine if madVR is running
+                # via the callback API, and we can only determine if another
+                # calibration solution is running by enumerating windows and
+                # processes anyway.
+                other_component = self.__other_component
+                self.__other_component = None, None, 0
+                # Look for known window classes
+                # Performance on C2D 3.16 GHz (Win7 x64, ~ 90 processes): ~ 1ms
+                self._hwnds_pids = set()
+                try:
+                    win32gui.EnumWindows(self._enumerate_windows_callback, None)
+                except Exception as exception:
+                    # pywin32 passes exceptions raised in the callback through
+                    # as-is, so this is not necessarily a pywintypes.error
+                    print("Enumerating windows failed:", exception)
+                if (
+                    not self.__other_component[1]
+                    or self.__other_component[1] == "madHcNetQueueWindow"
+                ):
+                    self._look_for_known_processes(other_component)
+                if other_component != self.__other_component:
+                    self._handle_component_detection(other_component)
+            result = (
+                self.__other_component[0:2] != (None, None)
+                and not self.__other_component[2]
+            )
         if self.__other_component[1] == "madHcNetQueueWindow":
             if enumerate_windows_and_processes:
                 # Check if gamma ramps were reset for current display
@@ -4728,7 +5117,9 @@ class ProfileLoader:
                     enable_per_user_profiles(devicekey=devicekey)
                 set_display_profile(profile, devicekey=devicekey)
                 unset_display_profile(current_profile, devicekey=devicekey)
-            except OSError as exception:
+            except Exception as exception:
+                # Not only OSError: the WCS worker process IPC can also raise
+                # e.g. TimeoutError, RuntimeError, ValueError or WCSError
                 print(exception)
 
     def _set_display_profiles(self, dry_run: bool = False) -> None:
@@ -4877,7 +5268,9 @@ class ProfileLoader:
                 set_display_profile(
                     os.path.basename(correct_profile), devicekey=device.DeviceKey
                 )
-            except OSError as exception:
+            except Exception as exception:
+                # Not only OSError: the WCS worker process IPC can also raise
+                # e.g. TimeoutError, RuntimeError, ValueError or WCSError
                 print(exception)
             else:
                 self._fixed_profile_associations.add(device.DeviceKey)
@@ -4982,9 +5375,15 @@ class ProfileLoader:
         Used by :meth:`_check_display_conf` when
         :meth:`_check_keep_running` notices something external (e.g. a
         Windows session shutdown/logoff) asked us to exit. This default (wx)
-        implementation force-closes the persistent frame. Overridden by
-        toolkit subclasses (e.g. the Qt port).
+        implementation shuts down and force-closes the persistent frame.
+        Overridden by toolkit subclasses (e.g. the Qt port).
         """
+        # Shut down right away on the GUI thread (reset profile associations,
+        # write the configuration, remove the tray icon), even if closing the
+        # frame should not end the main loop. This used to happen on the
+        # monitoring thread. The exit handlers' own call of shutdown() is then
+        # a no-op.
+        self.shutdown()
         if self.frame:
             self.frame.Close(force=True)
 
@@ -5025,11 +5424,55 @@ class ProfileLoader:
                     config.getcfg("profile.load_on_login")
                     and (
                         sys.platform != "win32"
-                        or not calibration_management_isenabled()
+                        or not self._calibration_management_isenabled()
                     )
                 )
             )
         )
+
+    def _calibration_management_isenabled(self) -> bool:
+        """Return whether Windows manages display calibration. Never raises.
+
+        The state is queried from the WCS worker process. If that fails (e.g.
+        the worker process is stalled, dead or being restarted), the error is
+        printed and the last known state is returned, so a WCS problem can
+        neither kill the display configuration monitoring thread nor raise
+        into the GUI. On the GUI thread, the last known state (refreshed by
+        the monitoring thread every few seconds) is returned right away
+        instead of waiting for the worker process, so a stalled worker cannot
+        freeze the tray icon or menu either.
+
+        Returns:
+            bool: True if Windows calibration management is enabled.
+        """
+        state = getattr(self, "_calibration_management_state", None)
+        if state is not None and self._is_gui_thread():
+            return state
+        return self._query_calibration_management_state()
+
+    def _query_calibration_management_state(self) -> bool:
+        """Query and remember whether Windows manages display calibration.
+
+        Never raises: on error, the error is printed (each distinct one once)
+        and the last known state is returned.
+
+        Returns:
+            bool: True if Windows calibration management is enabled.
+        """
+        # When the state was last queried (successfully or not), see
+        # _refresh_calibration_management_state
+        self._calibration_management_state_checked = time.perf_counter()
+        try:
+            state = bool(calibration_management_isenabled())
+        except Exception as exception:
+            error = f"{exception.__class__.__name__}: {exception}"
+            if error != getattr(self, "_last_wcs_error", None):
+                self._last_wcs_error = error
+                print("Could not query Windows calibration management state:", error)
+            return bool(getattr(self, "_calibration_management_state", None))
+        self._calibration_management_state = state
+        self._last_wcs_error = None
+        return state
 
     def _toggle_fix_profile_associations(
         self, event: wx.Event, parent: wx.Window = None

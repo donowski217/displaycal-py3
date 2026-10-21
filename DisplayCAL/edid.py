@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import binascii
 import contextlib
+import gc
 import json
 import math
 import os
@@ -150,28 +151,45 @@ def get_edid_windows(display_no: int, device: str) -> bytes:
         return None
 
     device_id = device.DeviceID.split("\\")[1]
-    wmi_connection = None
-    not_main_thread = threading.current_thread() is not threading.main_thread()
 
     if wmi:
-        if not_main_thread:
-            pythoncom.CoInitialize()
-        wmi_connection = wmi.WMI(namespace="WMI")
+        not_main_thread = threading.current_thread() is not threading.main_thread()
+        com_initialized = False
+        wmi_connection = None
+        try:
+            if not_main_thread:
+                pythoncom.CoInitialize()
+                com_initialized = True
+            wmi_connection = wmi.WMI(namespace="WMI")
+            if wmi_connection:
+                return get_edid_windows_wmi(device_id, wmi_connection, not_main_thread)
+        finally:
+            # COM rule: release every COM object (WMI connection, monitor
+            # objects) before uninitializing COM on this thread, and balance
+            # CoInitialize even if creating the WMI connection failed.
+            del wmi_connection
+            gc.collect()
+            if com_initialized:
+                pythoncom.CoUninitialize()
 
-    if wmi_connection:
-        return get_edid_windows_wmi(device_id, wmi_connection, not_main_thread)
     return get_edid_windows_registry(device_id, device)
 
 
 def get_edid_windows_wmi(
-    device_id: str, wmi_connection: wmi.WMI, not_main_thread: bool
+    device_id: str, wmi_connection: wmi.WMI, not_main_thread: bool = False
 ) -> bytes:
     """Get EDID using WMI for Windows Vista/Win7.
+
+    The caller owns the COM apartment (CoInitialize/CoUninitialize) of the
+    current thread. All references to WMI objects obtained here are dropped
+    before returning or raising, so the caller can release the connection and
+    uninitialize COM safely.
 
     Args:
         device_id (str): The device ID.
         wmi_connection (wmi.WMI): The WMI connection.
-        not_main_thread (bool): Whether the current thread is not the main thread.
+        not_main_thread (bool): Unused, kept for backwards compatibility. COM
+            is no longer uninitialized here, see get_edid_windows.
 
     Raises:
         WMIError: If there is an error with WMI.
@@ -180,28 +198,32 @@ def get_edid_windows_wmi(
         bytes: The EDID data.
     """
     edid = None
+    error = None
 
     # http://msdn.microsoft.com/en-us/library/Aa392707
     try:
         msmonitors = wmi_connection.WmiMonitorDescriptorMethods()
     except Exception as exception:
-        if not_main_thread:
-            pythoncom.CoUninitialize()
-        raise WMIError(safe_str(exception)) from exception
+        # Raised below, outside of this block, so that neither the original
+        # exception's traceback nor this frame keep WMI objects alive
+        error = WMIError(safe_str(exception))
+        msmonitors = []
 
     for msmonitor in msmonitors:
         if msmonitor.InstanceName.split("\\")[1] == device_id:
             try:
-                edid = msmonitor.WmiGetMonitorRawEEdidV1Block(0)
+                raw_edid = msmonitor.WmiGetMonitorRawEEdidV1Block(0)
             except Exception:
                 # No EDID entry
                 pass
             else:
-                edid = bytes(edid[0])
+                edid = bytes(raw_edid[0])
                 break
 
-    if not_main_thread:
-        pythoncom.CoUninitialize()
+    # Drop all references to WMI (COM) objects
+    msmonitor = msmonitors = wmi_connection = None
+    if error:
+        raise error
 
     return edid
 
