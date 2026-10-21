@@ -876,8 +876,23 @@ def _flush_repeat_summaries() -> None:
             stream._flush_repeat_summary()
 
 
+def _set_record_time(record: logging.LogRecord, created: float) -> None:
+    """Set the creation time of record, as shown by its timestamp.
+
+    Args:
+        record (logging.LogRecord): The record.
+        created (float): The time, as returned by time.time().
+    """
+    record.relativeCreated += (created - record.created) * 1000
+    record.created = created
+    record.msecs = int((created - int(created)) * 1000) + 0.0
+
+
 def _emit_record(
-    level: int, msg: str, repeat_summary: bool = False, nested: bool = False
+    level: int,
+    msg: str,
+    summary_time: float | None = None,
+    nested: bool = False,
 ) -> logging.LogRecord | None:
     """Emit msg as one record directly to the application log file handlers.
 
@@ -886,7 +901,8 @@ def _emit_record(
     Args:
         level (int): The log level of the record.
         msg (str): The message. May span multiple lines.
-        repeat_summary (bool, optional): Mark the record as a repeat summary.
+        summary_time (float | None, optional): Emit a repeat summary, with
+            this time (that of the last repetition it counts) as timestamp.
         nested (bool, optional): Emit even while this thread emits another
             record (a repeat summary logged by _AppRecordSequencer before
             that record).
@@ -906,8 +922,9 @@ def _emit_record(
         _EMITTING.active = True
         try:
             record = logging.LogRecord(LOGGER.name, level, __file__, 0, msg, None, None)
-            if repeat_summary:
+            if summary_time is not None:
                 setattr(record, _REPEAT_SUMMARY_ATTR, True)
+                _set_record_time(record, summary_time)
             for handler in handlers:
                 if record.levelno >= handler.level:
                     handler.handle(record)
@@ -1134,7 +1151,10 @@ class StdioToLog:
         self._buffers = weakref.WeakSet()
         self._last_line = None
         self._repeat_count = 0
+        # Time of the last record or summary of the repeated line, and of
+        # its last counted repetition (the timestamp of the summary)
         self._repeat_time = 0.0
+        self._repeat_last = 0.0
         # Number of this stream's last line in the log file (None: unknown).
         # Written after emitting, without the lock: a stale value can only
         # make the next line count as not adjacent, i.e. be logged in full.
@@ -1215,11 +1235,11 @@ class StdioToLog:
                 with self._lock:
                     messages = []
                     if self._repeat_count:
-                        messages.append((self._take_repeat_summary(time()), True))
+                        messages.append(self._take_repeat_summary(time()))
                     for buffer in list(self._buffers):
                         pending, buffer.pending = buffer.pending, ""
                         if pending.strip():
-                            messages.append((pending.rstrip(), False))
+                            messages.append((pending.rstrip(), None))
             finally:
                 _BOOKKEEPING.active = False
             self._emit_messages(messages)
@@ -1257,19 +1277,20 @@ class StdioToLog:
             _BOOKKEEPING.active = False
         self._emit_messages(messages)
 
-    def _emit_messages(self, messages: list[tuple[str, bool]]) -> None:
+    def _emit_messages(self, messages: list[tuple[str, float | None]]) -> None:
         """Emit messages and remember the number of the last line.
 
         Must be called while the calling thread holds no StdioToLog lock.
 
         Args:
-            messages (list[tuple[str, bool]]): (message, is repeat summary).
+            messages (list[tuple[str, float | None]]): (message, None) for a
+                line, (message, time) for a repeat summary.
         """
         line_emitted = False
         last_record = None
-        for message, repeat_summary in messages:
-            record = _emit_record(self.level, message, repeat_summary=repeat_summary)
-            if not repeat_summary:
+        for message, summary_time in messages:
+            record = _emit_record(self.level, message, summary_time)
+            if summary_time is None:
                 line_emitted = True
                 last_record = getattr(record, _RECORD_NUMBER_ATTR, None)
         if line_emitted:
@@ -1290,7 +1311,7 @@ class StdioToLog:
         finally:
             _BOOKKEEPING.active = False
         if summary:
-            _emit_record(self.level, summary, repeat_summary=True, nested=True)
+            _emit_record(self.level, *summary, nested=True)
         if not getattr(_EMITTING, "active", False):
             _log_deferred_writes()
 
@@ -1317,7 +1338,7 @@ class StdioToLog:
         buffer.pending = pending
         return lines
 
-    def _collapse(self, lines: list[str], now: float) -> list[tuple[str, bool]]:
+    def _collapse(self, lines: list[str], now: float) -> list[tuple[str, float | None]]:
         """Return the messages to log, collapsing adjacent identical lines.
 
         Must be called with the lock held.
@@ -1327,7 +1348,8 @@ class StdioToLog:
             now (float): The current time.
 
         Returns:
-            list[tuple[str, bool]]: (message, is repeat summary) to log.
+            list[tuple[str, float | None]]: The messages to log: (line, None)
+                or (repeat summary, its time).
         """
         messages = []
         if not lines:
@@ -1339,7 +1361,7 @@ class StdioToLog:
             # it could not (that record interrupted this thread's
             # bookkeeping), log it now. It names its line.
             if self._repeat_count:
-                messages.append((self._take_repeat_summary(now), True))
+                messages.append(self._take_repeat_summary(now))
             self._last_line = None
         for line in lines:
             line = line.rstrip()  # noqa: PLW2901
@@ -1347,18 +1369,19 @@ class StdioToLog:
                 continue
             if line == self._last_line:
                 self._repeat_count += 1
+                self._repeat_last = now
                 if now - self._repeat_time >= self.repeat_summary_interval:
-                    messages.append((self._take_repeat_summary(now), True))
+                    messages.append(self._take_repeat_summary(now))
                 continue
             if self._repeat_count:
-                messages.append((self._take_repeat_summary(now), True))
+                messages.append(self._take_repeat_summary(now))
             self._last_line = line
             self._repeat_time = now
-            messages.append((line, False))
+            messages.append((line, None))
         return messages
 
-    def _take_repeat_summary(self, now: float) -> str:
-        """Return the repeat summary message and reset the repeat count.
+    def _take_repeat_summary(self, now: float) -> tuple[str, float]:
+        """Return the repeat summary and reset the repeat count.
 
         Must be called with the lock held.
 
@@ -1366,7 +1389,9 @@ class StdioToLog:
             now (float): The current time.
 
         Returns:
-            str: The repeat summary message, which quotes the repeated line.
+            tuple[str, float]: The repeat summary message, which quotes the
+                repeated line, and the time of the last repetition it
+                counts, which becomes its timestamp.
         """
         count = self._repeat_count
         self._repeat_count = 0
@@ -1375,7 +1400,7 @@ class StdioToLog:
         if len(line) > self.max_summary_quote_length:
             line = line[: self.max_summary_quote_length] + "..."
         times = "time" if count == 1 else "times"
-        return f'(previous line repeated {count} {times}: "{line}")'
+        return f'(previous line repeated {count} {times}: "{line}")', self._repeat_last
 
 
 def _discards_output(stream: None | TextIO, shim_name: str) -> bool:

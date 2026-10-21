@@ -537,6 +537,35 @@ def test_stdio_to_log_writes_repeat_summary_before_next_record(
     assert [line.split(" ", 2)[2] for line in file_lines] == expected
 
 
+def test_stdio_to_log_repeat_summary_has_time_of_last_repetition(
+    stdio_env: types.SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A summary written later is stamped when the repetition ended.
+
+    So its timestamp says when the line was last repeated, and timestamps
+    never go backwards (a summary written before another record would
+    otherwise be created after that record).
+    """
+    clock = [1000.25]
+    monkeypatch.setattr(log, "time", lambda: clock[0])
+    with _stdio(stdio_env.blackhole, stdio_env.shim):
+        log.redirect_stdio_to_log()
+        for _ in range(3):
+            print("Acquired lock")
+            clock[0] += 1
+        clock[0] += 60
+        print("Display configuration changed")
+
+    records = stdio_env.logger.handlers[0].records
+    assert [r.getMessage() for r in records] == [
+        "Acquired lock",
+        _summary("Acquired lock", 2),
+        "Display configuration changed",
+    ]
+    assert records[1].created == 1002.25
+    assert records[1].msecs == 250.0
+
+
 def test_stdio_to_log_repeat_summary_quotes_long_lines_shortened(
     stdio_env: types.SimpleNamespace,
 ) -> None:
