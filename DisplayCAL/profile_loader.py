@@ -3339,8 +3339,10 @@ class ProfileLoader:
         self._current_display = None
         self._current_timestamp = 0
         self._next = False
+        # Whether DisplayCAL was running at the last iteration, carried over
+        # from one iteration to the next (see _handle_profile_updates)
+        self._displaycal_was_running = False
         first_run = True
-        displaycal_running = False
         failures = 0
         try:
             # Called for its side effect of enumerating windows and processes
@@ -3352,9 +3354,7 @@ class ProfileLoader:
         previous_hwnds_pids = self._hwnds_pids
         while self and self.monitoring:
             try:
-                if not self._run_monitor_iteration(
-                    first_run, displaycal_running, previous_hwnds_pids
-                ):
+                if not self._run_monitor_iteration(first_run, previous_hwnds_pids):
                     # A change in profile associations was detected and we
                     # exited the iteration early: check again right away
                     failures = 0
@@ -3380,14 +3380,15 @@ class ProfileLoader:
     def _run_monitor_iteration(
         self,
         first_run: bool,
-        displaycal_running: bool,
         previous_hwnds_pids: set,
     ) -> bool:
         """Run one display configuration/profile/calibration check.
 
+        Whether DisplayCAL was running at the previous iteration is carried
+        over in ``self._displaycal_was_running``.
+
         Args:
             first_run (bool): Whether this is the first (successful) iteration.
-            displaycal_running (bool): Whether DisplayCAL was running.
             previous_hwnds_pids (set): Windows/processes seen last iteration.
 
         Returns:
@@ -3424,10 +3425,10 @@ class ProfileLoader:
             if timestamp >= midnight:
                 self.reload_count = 0
                 self._timestamp = timestamp
-            self._handle_profile_updates(
+            self._displaycal_was_running = self._handle_profile_updates(
                 first_run,
                 apply_profiles,
-                displaycal_running,
+                self._displaycal_was_running,
                 results,
                 errors,
                 idle,
@@ -4433,18 +4434,24 @@ class ProfileLoader:
         errors: list[str],
         idle: bool,
         profile_associations_changed: bool,
-    ) -> None:
+    ) -> bool:
         """Handle profile updates and notify user.
 
         Args:
             first_run (bool): Indicates if this is the first run.
             apply_profiles (bool): Indicates if profiles should be applied.
-            displaycal_running (bool): Indicates if DisplayCAL is running.
+            displaycal_running (bool): Whether DisplayCAL was running at the
+                previous iteration.
             results (list): List to store result messages.
             errors (list): List to store error messages.
             idle (bool): Indicates if the system is idle.
             profile_associations_changed (bool): Indicates if profile
                 associations changed.
+
+        Returns:
+            bool: Whether DisplayCAL is running now, to be passed in as
+                ``displaycal_running`` at the next iteration (so that its
+                start or exit is reported once, not at every iteration).
         """
         if results or errors:
             if results:
@@ -4487,6 +4494,7 @@ class ProfileLoader:
                 apply_profiles != self.__apply_profiles or profile_associations_changed
             ):
                 self._post_to_gui_thread(self._refresh_visual_state)
+        return displaycal_running
 
     def shutdown(self) -> None:
         """Shut down the profile loader.

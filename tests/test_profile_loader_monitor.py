@@ -81,7 +81,7 @@ class MonitorHarness:
         pl._should_apply_profiles = lambda *args, **kwargs: False
         pl._check_display_changed = lambda first_run=False, dry_run=False: False
         pl._check_profile_associations = self._check_profile_associations
-        pl._handle_profile_updates = lambda *args: None
+        pl._handle_profile_updates = lambda first_run, apply, running, *args: running
         pl._check_keep_running = lambda: True
         pl.shutdown = lambda: self.shutdown_threads.append(threading.current_thread())
         monkeypatch.setattr(profile_loader.time, "sleep", lambda seconds: None)
@@ -369,6 +369,41 @@ def test_identical_tracebacks_are_logged_once(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert captured.err.count("RuntimeError: same") == 1
     assert "same as before" in captured.out
+
+
+def test_displaycal_start_and_exit_are_reported_once(monkeypatch, capsys):
+    """The DisplayCAL-running state is carried from iteration to iteration.
+
+    It used to be reset at every iteration, so while DisplayCAL ran, every
+    iteration logged and notified "calibration loading disabled" again.
+    """
+    harness = MonitorHarness(monkeypatch, [OK, OK, OK, OK, STOP])
+    pl = harness.pl
+    del pl._handle_profile_updates  # the real one
+    monkeypatch.setattr(profile_loader, "lang", _FakeLang(), raising=False)
+    pl._reset_gamma_ramps = False
+    pl._app_detection_msg = None
+    notifications = []
+    pl.notify = lambda msgs, *args, **kwargs: notifications.extend(msgs)
+    running = {"value": False}
+    pl._is_displaycal_running = lambda: running["value"]
+    check_profile_associations = pl._check_profile_associations
+
+    def check_profile_associations_while_displaycal_runs(*args):
+        # DisplayCAL runs during iterations 2 to 4
+        running["value"] = 1 <= harness.calls <= 3
+        return check_profile_associations(*args)
+
+    pl._check_profile_associations = check_profile_associations_while_displaycal_runs
+    harness.run()
+
+    assert harness.calls == 5
+    assert notifications == [
+        "app.detected.calibration_loading_disabled",
+        "app.detection_lost.calibration_loading_enabled",
+    ]
+    out = capsys.readouterr().out
+    assert out.count("app.detected.calibration_loading_disabled") == 1
 
 
 def test_steady_state_iteration_is_quiet(monkeypatch, capsys):
