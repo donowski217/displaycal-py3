@@ -47,8 +47,13 @@ def make_tray_icon(monkeypatch):
     hinstance = win32api.GetModuleHandle(None)
     for icon in icons:
         win32gui.DestroyWindow(icon.hwnd)
-    # OnDestroy posts WM_QUIT when no wx main loop is running: drain it
-    while win32gui.PeekMessage(None, 0, 0, win32con.PM_REMOVE)[0]:
+    # OnDestroy posts WM_QUIT when no wx main loop is running: drain only
+    # that. Removing every queued message of this thread also removes (and
+    # can crash on) messages for other windows, e.g. wx's hidden display
+    # window left behind when an earlier test dropped its wx.App.
+    while win32gui.PeekMessage(
+        None, win32con.WM_QUIT, win32con.WM_QUIT, win32con.PM_REMOVE
+    )[0]:
         pass
     win32gui.UnregisterClass("SysTrayIcon", hinstance)
 
