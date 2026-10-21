@@ -17,6 +17,7 @@ import io
 import locale
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -884,10 +885,29 @@ scenario, log_path, dump_path = sys.argv[1:4]
 dump = open(dump_path, "w", encoding="utf-8")
 faulthandler.dump_traceback_later(20, exit=True, file=dump)
 
+class MemoryFileHandler(logging.FileHandler):
+    # Keeps the formatted records in memory until the end. A buffered file is
+    # not reentrant: a finalizer that logs while the same thread flushes
+    # another record to it loses its record ("reentrant call inside
+    # BufferedWriter", swallowed by handleError). That CPython limitation is
+    # not what the "repeats" scenario counts on.
+
+    def __init__(self, path):
+        super().__init__(path, encoding="utf-8", delay=True)
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(self.format(record))
+
+
 logger = logging.getLogger("gc_finalizer_chain")
 logger.propagate = False
 logger.setLevel(logging.DEBUG)
-logger.addHandler(logging.FileHandler(log_path, encoding="utf-8"))
+if scenario == "repeats":
+    handler = MemoryFileHandler(log_path)
+else:
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+logger.addHandler(handler)
 log.LOGGER = logger
 
 
@@ -918,6 +938,22 @@ class GarbageChain:
         raise RuntimeError(f"chain link {self.remaining}")
 
 
+class LoggingChain:
+    # Like GarbageChain, but its finalizer logs a record, like a finalizer
+    # calling LOG(), possibly while a stream holds its lock with a repeat
+    # count pending.
+
+    def __init__(self, remaining):
+        self.remaining = remaining
+        self.cycle = self
+
+    def __del__(self):
+        if self.remaining and not STOP:
+            LoggingChain(self.remaining - 1)
+        if not self.remaining % 40:
+            log.LOG(f"finalizer record {self.remaining}")
+
+
 def first_write():
     GarbageChain(2000)
     sys.stderr.write("first line of a new thread\\n")
@@ -928,9 +964,19 @@ def flush_at_exit():
     sys.stderr.flush_pending()
 
 
+def repeats():
+    GarbageChain(100)
+    LoggingChain(2000)
+    for _ in range(300):
+        sys.stderr.write("same line\\n")
+    sys.stderr.flush_pending()
+
+
 if scenario == "flush":
     sys.stderr.write("partial line at exit")
     target = flush_at_exit
+elif scenario == "repeats":
+    target = repeats
 else:
     target = first_write
 gc.set_threshold(1)
@@ -941,17 +987,21 @@ STOP = True
 gc.set_threshold(700, 10, 10)
 gc.collect()
 faulthandler.cancel_dump_traceback_later()
+if scenario == "repeats":
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        log_file.write("".join(f"{line}\\n" for line in handler.lines))
 """
 
 
-@pytest.mark.parametrize("scenario", ["first-write", "flush"])
+@pytest.mark.parametrize("scenario", ["first-write", "flush", "repeats"])
 def test_stdio_to_log_survives_gc_finalizers_writing_to_stderr(tmp_path, scenario):
     """The real thing: the default sys.unraisablehook run by the garbage collector.
 
     With gc.set_threshold(1), nearly every allocation can run a finalizer,
     also while the stream holds its lock. Runs in a child process, so a
     deadlock cannot hang the test run (faulthandler ends it after 20 s and
-    dumps the stacks).
+    dumps the stacks). In the "repeats" scenario, finalizers also log
+    records while a line repeats: no repetition may be lost.
     """
     log_path = tmp_path / "app.log"
     dump_path = tmp_path / "stacks.txt"
@@ -977,6 +1027,20 @@ def test_stdio_to_log_survives_gc_finalizers_writing_to_stderr(tmp_path, scenari
     text = log_path.read_text(encoding="utf-8")
     if scenario == "flush":
         assert "partial line at exit" in text
+    elif scenario == "repeats":
+        # Every finalizer record is there (every 40th chain link logs one)
+        records = sorted(
+            int(number)
+            for number in re.findall(r"^finalizer record (\d+)$", text, re.M)
+        )
+        assert records
+        assert records == list(range(records[0], 2001, 40))
+        # No repetition was lost: each was written or counted in a summary
+        written = text.splitlines().count("same line")
+        counted = re.findall(
+            r'^\(previous line repeated (\d+) times?: "same line"\)$', text, re.M
+        )
+        assert written + sum(int(count) for count in counted) == 300
     else:
         assert "first line of a new thread" in text
     assert "Exception ignored in" in text
